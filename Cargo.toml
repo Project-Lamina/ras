@@ -2,5 +2,26 @@
 name = "ras"
 version = "0.1.0"
 edition = "2024"
+authors = ["Eira <eira@nornity.com>"]
+description = "ras - as/GAS alternative. Cross-platform assembler: assembly source (.s) to relocatable object files (.o). Used by Lamina, usable standalone."
+license = "Apache-2.0"
+keywords = ["assembler", "assembly", "object-file", "compiler"]
+categories = ["compilers", "development-tools"]
+
+[[bin]]
+name = "ras"
+path = "src/main.rs"
+
+[lib]
+name = "ras"
+path = "src/lib.rs"
 
 [dependencies]
+lamina-platform = { path = "../lamina-platform" }
+lamina-mir = { path = "../lamina-mir", optional = true }
+lamina-codegen = { path = "../lamina-codegen" }
+libc = "0.2"
+
+[features]
+default = []
+encoder = ["lamina-mir"]
