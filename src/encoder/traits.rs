@@ -9,10 +9,7 @@ pub struct ParsedInstruction {
 }
 
 pub trait InstructionEncoder {
-    fn encode_instruction(
-        &mut self,
-        inst: &ParsedInstruction,
-    ) -> Result<Vec<u8>, RasError>;
+    fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError>;
 
     fn current_position(&self) -> usize;
 }

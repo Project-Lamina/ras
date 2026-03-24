@@ -53,7 +53,10 @@ impl AArch64Encoder {
             "x29" | "w29" | "fp" => Ok(29),
             "x30" | "w30" | "lr" => Ok(30),
             "x31" | "w31" | "sp" | "xzr" | "wzr" => Ok(31),
-            _ => Err(RasError::EncodingError(format!("Unknown register: {}", reg))),
+            _ => Err(RasError::EncodingError(format!(
+                "Unknown register: {}",
+                reg
+            ))),
         }
     }
 
@@ -82,15 +85,21 @@ impl AArch64Encoder {
             Ok(self.encode_u32(inst))
         } else {
             Err(RasError::EncodingError(
-                "Large immediate values require MOVZ+MOVK sequence (not yet implemented)".to_string(),
+                "Large immediate values require MOVZ+MOVK sequence (not yet implemented)"
+                    .to_string(),
             ))
         }
     }
 
     fn encode_add_reg(&self, dst: u8, src1: u8, src2: u8) -> Vec<u8> {
-        let inst = (0b1u32 << 31) | (0b0u32 << 30) | (0b010110u32 << 24)
-            | (0b00u32 << 22) | (0b000000u32 << 16)
-            | ((src2 as u32) << 10) | ((src1 as u32) << 5) | (dst as u32);
+        let inst = (0b1u32 << 31)
+            | (0b0u32 << 30)
+            | (0b010110u32 << 24)
+            | (0b00u32 << 22)
+            | (0b000000u32 << 16)
+            | ((src2 as u32) << 10)
+            | ((src1 as u32) << 5)
+            | (dst as u32);
         self.encode_u32(inst)
     }
 
@@ -109,7 +118,9 @@ impl AArch64Encoder {
 
     fn encode_str(&self, src: u8, base: u8, offset: i32) -> Result<Vec<u8>, RasError> {
         if !(0..=0xFFF).contains(&offset) {
-            return Err(RasError::EncodingError("STR offset must be 0-4095".to_string()));
+            return Err(RasError::EncodingError(
+                "STR offset must be 0-4095".to_string(),
+            ));
         }
         let inst = 0b11_111_0_00_000000000000_00000_00000;
         let inst = inst | (src as u32);
@@ -120,7 +131,9 @@ impl AArch64Encoder {
 
     fn encode_ldr(&self, dst: u8, base: u8, offset: i32) -> Result<Vec<u8>, RasError> {
         if !(0..=0xFFF).contains(&offset) {
-            return Err(RasError::EncodingError("LDR offset must be 0-4095".to_string()));
+            return Err(RasError::EncodingError(
+                "LDR offset must be 0-4095".to_string(),
+            ));
         }
         let inst = 0b11_111_0_01_000000000000_00000_00000;
         let inst = inst | (dst as u32);
@@ -135,24 +148,24 @@ impl AArch64Encoder {
 }
 
 impl InstructionEncoder for AArch64Encoder {
-    fn encode_instruction(
-        &mut self,
-        inst: &ParsedInstruction,
-    ) -> Result<Vec<u8>, RasError> {
+    fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         let opcode = inst.opcode.to_lowercase();
         let mut code = Vec::new();
 
         match opcode.as_str() {
             "mov" | "movz" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("mov requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "mov requires 2 operands".to_string(),
+                    ));
                 }
                 let dst = &inst.operands[0];
                 let src = &inst.operands[1];
                 let dst_reg = self.parse_register(dst)?;
 
                 if src.starts_with('#') {
-                    let imm: u64 = src.trim_start_matches('#')
+                    let imm: u64 = src
+                        .trim_start_matches('#')
                         .parse()
                         .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
                     code.extend_from_slice(&self.encode_mov_imm64(dst_reg, imm)?);
@@ -171,7 +184,9 @@ impl InstructionEncoder for AArch64Encoder {
             }
             "add" => {
                 if inst.operands.len() != 3 {
-                    return Err(RasError::EncodingError("add requires 3 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "add requires 3 operands".to_string(),
+                    ));
                 }
                 let dst = &inst.operands[0];
                 let src1 = &inst.operands[1];
@@ -180,7 +195,8 @@ impl InstructionEncoder for AArch64Encoder {
                 let src1_reg = self.parse_register(src1)?;
 
                 if src2.starts_with('#') {
-                    let imm: u32 = src2.trim_start_matches('#')
+                    let imm: u32 = src2
+                        .trim_start_matches('#')
                         .parse()
                         .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
                     code.extend_from_slice(&self.encode_add_imm(dst_reg, src1_reg, imm)?);
@@ -191,7 +207,9 @@ impl InstructionEncoder for AArch64Encoder {
             }
             "str" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("str requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "str requires 2 operands".to_string(),
+                    ));
                 }
                 let src = &inst.operands[0];
                 let mem = &inst.operands[1];
@@ -202,7 +220,8 @@ impl InstructionEncoder for AArch64Encoder {
                     let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
                     let base_reg = self.parse_register(parts[0])?;
                     let offset = if parts.len() > 1 {
-                        parts[1].trim_start_matches('#')
+                        parts[1]
+                            .trim_start_matches('#')
                             .parse::<i32>()
                             .map_err(|_| RasError::EncodingError("Invalid offset".to_string()))?
                     } else {
@@ -217,7 +236,9 @@ impl InstructionEncoder for AArch64Encoder {
             }
             "ldr" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("ldr requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "ldr requires 2 operands".to_string(),
+                    ));
                 }
                 let dst = &inst.operands[0];
                 let mem = &inst.operands[1];
@@ -228,7 +249,8 @@ impl InstructionEncoder for AArch64Encoder {
                     let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
                     let base_reg = self.parse_register(parts[0])?;
                     let offset = if parts.len() > 1 {
-                        parts[1].trim_start_matches('#')
+                        parts[1]
+                            .trim_start_matches('#')
                             .parse::<i32>()
                             .map_err(|_| RasError::EncodingError("Invalid offset".to_string()))?
                     } else {

@@ -17,7 +17,7 @@ impl ExecutableMemory {
     pub fn allocate_writable(size: usize) -> Result<Self, RasError> {
         #[cfg(unix)]
         {
-            use libc::{mmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+            use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
             use std::ptr;
 
             let aligned_size = (size + 4095) & !4095;
@@ -90,10 +90,14 @@ impl ExecutableMemory {
     pub fn make_executable(&mut self) -> Result<(), RasError> {
         #[cfg(unix)]
         {
-            use libc::{mprotect, PROT_READ, PROT_EXEC};
+            use libc::{PROT_EXEC, PROT_READ, mprotect};
 
             let result = unsafe {
-                mprotect(self.ptr as *mut libc::c_void, self.size, PROT_READ | PROT_EXEC)
+                mprotect(
+                    self.ptr as *mut libc::c_void,
+                    self.size,
+                    PROT_READ | PROT_EXEC,
+                )
             };
 
             if result != 0 {
