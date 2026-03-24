@@ -1,9 +1,9 @@
 //! Object file generation: ELF (Linux/BSD), Mach-O (macOS), COFF/PE (Windows).
 
 use crate::error::RasError;
-use crate::parser::{Section, Symbol};
 #[cfg(test)]
 use crate::parser::SectionFlags;
+use crate::parser::{Section, Symbol};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::io::Write;
 
@@ -132,8 +132,9 @@ impl ObjectWriter for ElfWriter {
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
     ) -> Result<(), RasError> {
-        let e_machine = elf64_e_machine(target_arch)
-            .ok_or_else(|| RasError::ObjectError(format!("ELF does not support arch: {:?}", target_arch)))?;
+        let e_machine = elf64_e_machine(target_arch).ok_or_else(|| {
+            RasError::ObjectError(format!("ELF does not support arch: {:?}", target_arch))
+        })?;
 
         let shoff = ELF64_HEADER_SIZE as u64;
         let text_offset = shoff + 3 * ELF64_SECTION_HEADER_SIZE as u64;
@@ -157,15 +158,7 @@ impl ObjectWriter for ElfWriter {
             code.len() as u64,
             text_align,
         )?;
-        write_elf64_section_header(
-            &mut f,
-            7,
-            SHT_STRTAB,
-            0,
-            shstrtab_offset,
-            shstrtab_size,
-            1,
-        )?;
+        write_elf64_section_header(&mut f, 7, SHT_STRTAB, 0, shstrtab_offset, shstrtab_size, 1)?;
 
         let padding = text_size_aligned as usize - code.len();
         f.write_all(code)
@@ -242,8 +235,15 @@ mod tests {
         let mut w = ElfWriter::new();
         let code = [0xc3u8];
         let path = std::env::temp_dir().join("ras_elf_magic_test.o");
-        w.write_object_file(&path, &code, &[], &[], TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("write");
+        w.write_object_file(
+            &path,
+            &code,
+            &[],
+            &[],
+            TargetArchitecture::X86_64,
+            TargetOperatingSystem::Linux,
+        )
+        .expect("write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);

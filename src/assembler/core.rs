@@ -30,18 +30,12 @@ impl RasAssembler {
     ) -> Result<Self, RasError> {
         // Create encoder based on target architecture
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
-            TargetArchitecture::X86_64 => {
-                Box::new(crate::encoder::x86_64::X86_64Encoder::new())
+            TargetArchitecture::X86_64 => Box::new(crate::encoder::x86_64::X86_64Encoder::new()),
+            TargetArchitecture::Aarch64 => Box::new(crate::encoder::aarch64::AArch64Encoder::new()),
+            TargetArchitecture::Riscv32 => {
+                Box::new(crate::encoder::riscv::RiscVEncoder::new(false))
             }
-            TargetArchitecture::Aarch64 => {
-                Box::new(crate::encoder::aarch64::AArch64Encoder::new())
-            }
-            TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64 => {
-                return Err(RasError::UnsupportedTarget(format!(
-                    "RISC-V binary encoder not yet implemented. {}",
-                    crate::target::unsupported_target_hint(target_arch, target_os)
-                )));
-            }
+            TargetArchitecture::Riscv64 => Box::new(crate::encoder::riscv::RiscVEncoder::new(true)),
             _ => {
                 return Err(RasError::UnsupportedTarget(
                     crate::target::unsupported_target_hint(target_arch, target_os),
@@ -56,15 +50,9 @@ impl RasAssembler {
             | TargetOperatingSystem::OpenBSD
             | TargetOperatingSystem::NetBSD
             | TargetOperatingSystem::DragonFly
-            | TargetOperatingSystem::Redox => {
-                Box::new(crate::object::ElfWriter::new())
-            }
-            TargetOperatingSystem::MacOS => {
-                Box::new(crate::object::MachOWriter::new())
-            }
-            TargetOperatingSystem::Windows => {
-                Box::new(crate::object::CoffWriter::new())
-            }
+            | TargetOperatingSystem::Redox => Box::new(crate::object::ElfWriter::new()),
+            TargetOperatingSystem::MacOS => Box::new(crate::object::MachOWriter::new()),
+            TargetOperatingSystem::Windows => Box::new(crate::object::CoffWriter::new()),
             _ => {
                 return Err(RasError::UnsupportedTarget(format!(
                     "Unsupported OS for cross-compilation: {:?}. {}",
@@ -160,9 +148,9 @@ impl RasAssembler {
         }
 
         for (patch_offset, target) in &patch_points {
-            let target_offset = symbol_offsets.get(target).ok_or_else(|| {
-                RasError::EncodingError(format!("Undefined label: {}", target))
-            })?;
+            let target_offset = symbol_offsets
+                .get(target)
+                .ok_or_else(|| RasError::EncodingError(format!("Undefined label: {}", target)))?;
             let rel32 = (*target_offset as i64) - (*patch_offset as i64 + 4);
             let rel32_bytes = (rel32 as i32).to_le_bytes();
             code[*patch_offset..*patch_offset + 4].copy_from_slice(&rel32_bytes);
@@ -185,20 +173,21 @@ impl RasAssembler {
         #[cfg(unix)]
         {
             use std::ffi::CString;
-            
-            let symbol = CString::new(name).map_err(|e| {
-                RasError::EncodingError(format!("Invalid function name: {}", e))
-            })?;
-            
+
+            let symbol = CString::new(name)
+                .map_err(|e| RasError::EncodingError(format!("Invalid function name: {}", e)))?;
+
             // Try to resolve using RTLD_DEFAULT first (searches already loaded libraries)
             // This is safer and doesn't require opening/closing handles
             let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-            
+
             if ptr.is_null() {
                 // Fallback: try opening libc explicitly
                 // Clear any previous error
-                unsafe { libc::dlerror(); }
-                
+                unsafe {
+                    libc::dlerror();
+                }
+
                 let handle = unsafe { libc::dlopen(std::ptr::null(), libc::RTLD_LAZY) };
                 if handle.is_null() {
                     let err_msg = unsafe {
@@ -211,14 +200,17 @@ impl RasAssembler {
                                 .unwrap_or("unknown error")
                         }
                     };
-                    return Err(RasError::EncodingError(
-                        format!("Failed to open libc: {}", err_msg)
-                    ));
+                    return Err(RasError::EncodingError(format!(
+                        "Failed to open libc: {}",
+                        err_msg
+                    )));
                 }
-                
+
                 // Clear error before dlsym
-                unsafe { libc::dlerror(); }
-                
+                unsafe {
+                    libc::dlerror();
+                }
+
                 let ptr2 = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
                 if ptr2.is_null() {
                     let err_msg = unsafe {
@@ -232,49 +224,52 @@ impl RasAssembler {
                         }
                     };
                     unsafe { libc::dlclose(handle) };
-                    return Err(RasError::EncodingError(
-                        format!("Failed to resolve symbol {}: {}", name, err_msg)
-                    ));
+                    return Err(RasError::EncodingError(format!(
+                        "Failed to resolve symbol {}: {}",
+                        name, err_msg
+                    )));
                 }
-                
+
                 self.function_pointers.insert(name.to_string(), ptr2 as u64);
                 unsafe { libc::dlclose(handle) };
             } else {
                 self.function_pointers.insert(name.to_string(), ptr as u64);
             }
-            
+
             Ok(())
         }
-        
+
         #[cfg(windows)]
         {
-            use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
             use std::ffi::CString;
-            
+            use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+
             let module = unsafe { GetModuleHandleA(b"msvcrt.dll\0".as_ptr() as *const i8) };
             if module.is_null() {
-                return Err(RasError::EncodingError("Failed to get msvcrt.dll handle".to_string()));
-            }
-            
-            let symbol = CString::new(name).map_err(|e| {
-                RasError::EncodingError(format!("Invalid function name: {}", e))
-            })?;
-            
-            let ptr = unsafe { GetProcAddress(module, symbol.as_ptr()) };
-            if ptr.is_null() {
                 return Err(RasError::EncodingError(
-                    format!("Failed to resolve symbol {}", name)
+                    "Failed to get msvcrt.dll handle".to_string(),
                 ));
             }
-            
+
+            let symbol = CString::new(name)
+                .map_err(|e| RasError::EncodingError(format!("Invalid function name: {}", e)))?;
+
+            let ptr = unsafe { GetProcAddress(module, symbol.as_ptr()) };
+            if ptr.is_null() {
+                return Err(RasError::EncodingError(format!(
+                    "Failed to resolve symbol {}",
+                    name
+                )));
+            }
+
             self.function_pointers.insert(name.to_string(), ptr as u64);
             Ok(())
         }
-        
+
         #[cfg(not(any(unix, windows)))]
         {
             Err(RasError::EncodingError(
-                "Runtime function resolution not supported on this platform".to_string()
+                "Runtime function resolution not supported on this platform".to_string(),
             ))
         }
     }
@@ -320,8 +315,3 @@ impl RasAssembler {
         }
     }
 }
-
-
-
-
-

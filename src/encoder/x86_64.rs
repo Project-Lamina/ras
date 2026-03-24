@@ -54,14 +54,20 @@ impl X86_64Encoder {
             "r13" => Ok(13),
             "r14" => Ok(14),
             "r15" => Ok(15),
-            _ => Err(RasError::EncodingError(format!("Unknown register: {}", reg))),
+            _ => Err(RasError::EncodingError(format!(
+                "Unknown register: {}",
+                reg
+            ))),
         }
     }
 
     fn parse_memory(&self, op: &str) -> Result<(i32, u8), RasError> {
         let op = op.trim();
         if !op.contains('(') || !op.contains(')') {
-            return Err(RasError::EncodingError(format!("Invalid memory operand: {}", op)));
+            return Err(RasError::EncodingError(format!(
+                "Invalid memory operand: {}",
+                op
+            )));
         }
         let paren_start = op.find('(').unwrap();
         let paren_end = op.find(')').unwrap();
@@ -71,9 +77,9 @@ impl X86_64Encoder {
         let disp: i32 = if disp_str.is_empty() {
             0
         } else {
-            disp_str
-                .parse()
-                .map_err(|_| RasError::EncodingError(format!("Invalid displacement: {}", disp_str)))?
+            disp_str.parse().map_err(|_| {
+                RasError::EncodingError(format!("Invalid displacement: {}", disp_str))
+            })?
         };
 
         let base = self.parse_register(base_str)?;
@@ -123,23 +129,23 @@ impl X86_64Encoder {
 }
 
 impl InstructionEncoder for X86_64Encoder {
-    fn encode_instruction(
-        &mut self,
-        inst: &ParsedInstruction,
-    ) -> Result<Vec<u8>, RasError> {
+    fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         let opcode = inst.opcode.to_lowercase();
         let mut code = Vec::new();
 
         match opcode.as_str() {
             "movq" | "mov" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("mov requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "mov requires 2 operands".to_string(),
+                    ));
                 }
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
 
                 if a.starts_with('$') && !b.starts_with('$') {
-                    let imm: i64 = a.trim_start_matches('$')
+                    let imm: i64 = a
+                        .trim_start_matches('$')
                         .parse()
                         .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
                     let dst_reg = self.parse_register(b)?;
@@ -147,7 +153,8 @@ impl InstructionEncoder for X86_64Encoder {
                     code.push(0xB8 | (dst_reg & 7));
                     code.extend_from_slice(&imm.to_le_bytes());
                 } else if !a.starts_with('$') && b.starts_with('$') {
-                    let imm: i64 = b.trim_start_matches('$')
+                    let imm: i64 = b
+                        .trim_start_matches('$')
                         .parse()
                         .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
                     let dst_reg = self.parse_register(a)?;
@@ -160,7 +167,11 @@ impl InstructionEncoder for X86_64Encoder {
                 } else if self.is_memory(b) && !self.is_memory(a) {
                     let reg = self.parse_register(a)?;
                     code.extend(self.encode_mov_mem_reg(b, reg, true)?);
-                } else if !a.starts_with('$') && !b.starts_with('$') && !self.is_memory(a) && !self.is_memory(b) {
+                } else if !a.starts_with('$')
+                    && !b.starts_with('$')
+                    && !self.is_memory(a)
+                    && !self.is_memory(b)
+                {
                     let dst_reg = self.parse_register(a)?;
                     let src_reg = self.parse_register(b)?;
                     code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
@@ -175,30 +186,33 @@ impl InstructionEncoder for X86_64Encoder {
             "ret" => code.push(0xC3),
             "addq" | "add" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("add requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "add requires 2 operands".to_string(),
+                    ));
                 }
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
 
-                let (dst_reg, imm_opt) = if a.starts_with('$') {
-                    let imm: i32 = a.trim_start_matches('$')
-                        .parse()
-                        .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
-                    (self.parse_register(b)?, Some(imm))
-                } else if b.starts_with('$') {
-                    let imm: i32 = b.trim_start_matches('$')
-                        .parse()
-                        .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
-                    (self.parse_register(a)?, Some(imm))
-                } else {
-                    let dst_reg = self.parse_register(a)?;
-                    let src_reg = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
-                    code.push(0x01);
-                    code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
-                    self.position += code.len();
-                    return Ok(code);
-                };
+                let (dst_reg, imm_opt) =
+                    if a.starts_with('$') {
+                        let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
+                            RasError::EncodingError("Invalid immediate".to_string())
+                        })?;
+                        (self.parse_register(b)?, Some(imm))
+                    } else if b.starts_with('$') {
+                        let imm: i32 = b.trim_start_matches('$').parse().map_err(|_| {
+                            RasError::EncodingError("Invalid immediate".to_string())
+                        })?;
+                        (self.parse_register(a)?, Some(imm))
+                    } else {
+                        let dst_reg = self.parse_register(a)?;
+                        let src_reg = self.parse_register(b)?;
+                        code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
+                        code.push(0x01);
+                        code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
+                        self.position += code.len();
+                        return Ok(code);
+                    };
 
                 if let Some(imm) = imm_opt {
                     if imm >= -128 && imm <= 127 {
@@ -216,7 +230,9 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "pushq" | "push" => {
                 if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError("push requires 1 operand".to_string()));
+                    return Err(RasError::EncodingError(
+                        "push requires 1 operand".to_string(),
+                    ));
                 }
                 let reg = self.parse_register(&inst.operands[0])?;
                 if reg >= 8 {
@@ -226,7 +242,9 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "popq" | "pop" => {
                 if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError("pop requires 1 operand".to_string()));
+                    return Err(RasError::EncodingError(
+                        "pop requires 1 operand".to_string(),
+                    ));
                 }
                 let reg = self.parse_register(&inst.operands[0])?;
                 if reg >= 8 {
@@ -236,12 +254,16 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "leaq" | "lea" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("lea requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "lea requires 2 operands".to_string(),
+                    ));
                 }
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
                 if !self.is_memory(a) || self.is_memory(b) {
-                    return Err(RasError::EncodingError("lea: first operand must be memory, second register".to_string()));
+                    return Err(RasError::EncodingError(
+                        "lea: first operand must be memory, second register".to_string(),
+                    ));
                 }
                 let reg = self.parse_register(b)?;
                 let bytes = self.encode_mov_mem_reg(a, reg, false)?;
@@ -252,12 +274,16 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "imulq" | "imul" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("imul requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "imul requires 2 operands".to_string(),
+                    ));
                 }
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
                 if self.is_memory(a) || self.is_memory(b) {
-                    return Err(RasError::EncodingError("imul reg,reg only supported".to_string()));
+                    return Err(RasError::EncodingError(
+                        "imul reg,reg only supported".to_string(),
+                    ));
                 }
                 let src_reg = self.parse_register(a)?;
                 let dst_reg = self.parse_register(b)?;
@@ -267,29 +293,32 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "subq" | "sub" => {
                 if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("sub requires 2 operands".to_string()));
+                    return Err(RasError::EncodingError(
+                        "sub requires 2 operands".to_string(),
+                    ));
                 }
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
-                let (dst_reg, imm_opt) = if a.starts_with('$') {
-                    let imm: i32 = a.trim_start_matches('$')
-                        .parse()
-                        .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
-                    (self.parse_register(b)?, Some(imm))
-                } else if b.starts_with('$') {
-                    let imm: i32 = b.trim_start_matches('$')
-                        .parse()
-                        .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
-                    (self.parse_register(a)?, Some(imm))
-                } else {
-                    let dst_reg = self.parse_register(a)?;
-                    let src_reg = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
-                    code.push(0x29);
-                    code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
-                    self.position += code.len();
-                    return Ok(code);
-                };
+                let (dst_reg, imm_opt) =
+                    if a.starts_with('$') {
+                        let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
+                            RasError::EncodingError("Invalid immediate".to_string())
+                        })?;
+                        (self.parse_register(b)?, Some(imm))
+                    } else if b.starts_with('$') {
+                        let imm: i32 = b.trim_start_matches('$').parse().map_err(|_| {
+                            RasError::EncodingError("Invalid immediate".to_string())
+                        })?;
+                        (self.parse_register(a)?, Some(imm))
+                    } else {
+                        let dst_reg = self.parse_register(a)?;
+                        let src_reg = self.parse_register(b)?;
+                        code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
+                        code.push(0x29);
+                        code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
+                        self.position += code.len();
+                        return Ok(code);
+                    };
                 if let Some(imm) = imm_opt {
                     if imm >= -128 && imm <= 127 {
                         code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));

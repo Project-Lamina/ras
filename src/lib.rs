@@ -15,9 +15,7 @@ pub use assembler::RasAssembler;
 pub use error::RasError;
 pub use runtime::{ExecutableMemory, RasRuntime};
 pub use target::{
-    is_assembly_target_supported,
-    is_jit_arch_supported,
-    is_object_file_supported,
+    is_assembly_target_supported, is_jit_arch_supported, is_object_file_supported,
     supported_jit_targets_hint,
 };
 
@@ -43,7 +41,8 @@ impl Ras {
         asm_text: &str,
         output_path: &std::path::Path,
     ) -> Result<(), RasError> {
-        self.assembler.assemble_text_to_object(asm_text, output_path)
+        self.assembler
+            .assemble_text_to_object(asm_text, output_path)
     }
 
     pub fn assemble_file(
@@ -78,8 +77,8 @@ main:
     movq $42, %rax
     ret
 "#;
-        let mut ras = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras new");
+        let mut ras =
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
         let path = std::env::temp_dir().join("ras_gas_style_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");
@@ -104,8 +103,8 @@ main:
     popq %rbp
     ret
 "#;
-        let mut ras = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras new");
+        let mut ras =
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
         let path = std::env::temp_dir().join("ras_mem_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");
@@ -130,8 +129,8 @@ main:
     popq %rbp
     ret
 "#;
-        let mut ras = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
-            .expect("ras new");
+        let mut ras =
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
         let path = std::env::temp_dir().join("ras_jmp_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");

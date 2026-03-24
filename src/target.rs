@@ -2,10 +2,7 @@
 
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
-pub fn is_assembly_target_supported(
-    arch: TargetArchitecture,
-    os: TargetOperatingSystem,
-) -> bool {
+pub fn is_assembly_target_supported(arch: TargetArchitecture, os: TargetOperatingSystem) -> bool {
     if !is_arch_encoded(arch) {
         return false;
     }

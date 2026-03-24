@@ -139,10 +139,10 @@ impl AssemblyParser {
                     self.pending_globals.insert((*name).to_string());
                 }
             }
-            ".section" | ".align" | ".balign" | ".p2align" | ".byte" | ".short"
-            | ".int" | ".long" | ".quad" | ".ascii" | ".asciz" | ".string"
-            | ".zero" | ".space" | ".skip" | ".cfi_startproc" | ".cfi_endproc"
-            | ".cfi_def_cfa" | ".size" | ".type" | ".ident" | ".file" => {}
+            ".section" | ".align" | ".balign" | ".p2align" | ".byte" | ".short" | ".int"
+            | ".long" | ".quad" | ".ascii" | ".asciz" | ".string" | ".zero" | ".space"
+            | ".skip" | ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type"
+            | ".ident" | ".file" => {}
             _ => {}
         }
 

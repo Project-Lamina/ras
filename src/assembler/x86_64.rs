@@ -23,20 +23,22 @@ pub fn compile_mir_x86_64_function(
     let mut code = Vec::new();
     let mut function_offsets: HashMap<String, usize> = HashMap::new();
 
-    let functions_to_compile: Vec<(String, &lamina_mir::Function)> = if let Some(name) = function_name {
-        module
-            .functions
-            .get(name)
-            .map(|f| vec![(name.to_string(), f)])
-            .unwrap_or_default()
-    } else {
-        // Deterministic order for offset stability across runs.
-        let mut names: Vec<String> = module.functions.keys().cloned().collect();
-        names.sort();
-        names.into_iter()
-            .filter_map(|n| module.functions.get(&n).map(|f| (n, f)))
-            .collect()
-    };
+    let functions_to_compile: Vec<(String, &lamina_mir::Function)> =
+        if let Some(name) = function_name {
+            module
+                .functions
+                .get(name)
+                .map(|f| vec![(name.to_string(), f)])
+                .unwrap_or_default()
+        } else {
+            // Deterministic order for offset stability across runs.
+            let mut names: Vec<String> = module.functions.keys().cloned().collect();
+            names.sort();
+            names
+                .into_iter()
+                .filter_map(|n| module.functions.get(&n).map(|f| (n, f)))
+                .collect()
+        };
 
     for (func_name, func) in functions_to_compile {
         // Current x86_64 binary encoder is intentionally minimal.
@@ -121,10 +123,7 @@ pub fn compile_mir_x86_64_function(
                 {
                     if index < arg_regs.len() {
                         // MOV from argument register to stack slot
-                        let mov_bytes = encode_mov_reg_mem_x86_64(
-                            arg_regs[index],
-                            *slot_off,
-                        )?;
+                        let mov_bytes = encode_mov_reg_mem_x86_64(arg_regs[index], *slot_off)?;
                         code.extend_from_slice(&mov_bytes);
                     } else {
                         // Handle stack arguments
@@ -196,10 +195,7 @@ fn encode_epilogue_x86_64() -> Result<Vec<u8>, RasError> {
 }
 
 /// Encode MOV register to memory
-fn encode_mov_reg_mem_x86_64(
-    src_reg: &str,
-    offset: i32,
-) -> Result<Vec<u8>, RasError> {
+fn encode_mov_reg_mem_x86_64(src_reg: &str, offset: i32) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
     let src = parse_register_x86_64(src_reg)?;
     // MOV [rbp+disp], r64: REX.W + 89 /r
@@ -220,10 +216,7 @@ fn encode_mov_reg_mem_x86_64(
 }
 
 /// Encode MOV memory to register
-fn encode_mov_mem_reg_x86_64(
-    offset: i32,
-    dst_reg: &str,
-) -> Result<Vec<u8>, RasError> {
+fn encode_mov_mem_reg_x86_64(offset: i32, dst_reg: &str) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
     let dst = parse_register_x86_64(dst_reg)?;
     // MOV r64, [rbp+disp]: REX.W + 8B /r
@@ -260,7 +253,10 @@ fn parse_register_x86_64(reg: &str) -> Result<u8, RasError> {
         "r13" => Ok(13),
         "r14" => Ok(14),
         "r15" => Ok(15),
-        _ => Err(RasError::EncodingError(format!("Unknown register: {}", reg))),
+        _ => Err(RasError::EncodingError(format!(
+            "Unknown register: {}",
+            reg
+        ))),
     }
 }
 
@@ -306,17 +302,29 @@ fn encode_mir_instruction_x86_64(
         code
     }
 
-    fn load_vreg_to_reg(slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>, v: &lamina_mir::VirtualReg, dst: &str) -> Result<Vec<u8>, RasError> {
+    fn load_vreg_to_reg(
+        slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+        v: &lamina_mir::VirtualReg,
+        dst: &str,
+    ) -> Result<Vec<u8>, RasError> {
         let off = vreg_slot(slots, v)?;
         encode_mov_mem_reg_x86_64(off, dst)
     }
 
-    fn store_reg_to_vreg(slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>, v: &lamina_mir::VirtualReg, src: &str) -> Result<Vec<u8>, RasError> {
+    fn store_reg_to_vreg(
+        slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+        v: &lamina_mir::VirtualReg,
+        src: &str,
+    ) -> Result<Vec<u8>, RasError> {
         let off = vreg_slot(slots, v)?;
         encode_mov_reg_mem_x86_64(src, off)
     }
 
-    fn materialize_operand_to_reg(slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>, op: &Operand, dst_reg: &str) -> Result<Vec<u8>, RasError> {
+    fn materialize_operand_to_reg(
+        slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+        op: &Operand,
+        dst_reg: &str,
+    ) -> Result<Vec<u8>, RasError> {
         match op {
             Operand::Immediate(imm) => {
                 let v = match imm {
@@ -325,7 +333,9 @@ fn encode_mir_instruction_x86_64(
                     Immediate::I32(v) => *v as i64,
                     Immediate::I64(v) => *v,
                     Immediate::F32(_) | Immediate::F64(_) => {
-                        return Err(RasError::EncodingError("float immediates not supported in x86_64 JIT encoder".into()));
+                        return Err(RasError::EncodingError(
+                            "float immediates not supported in x86_64 JIT encoder".into(),
+                        ));
                     }
                 };
                 let reg = parse_register_x86_64(dst_reg)?;
@@ -358,7 +368,9 @@ fn encode_mir_instruction_x86_64(
             }
             Ok(code)
         }
-        lamina_mir::Instruction::IntBinary { op, dst, lhs, rhs, .. } => {
+        lamina_mir::Instruction::IntBinary {
+            op, dst, lhs, rhs, ..
+        } => {
             // rax = lhs; rcx = rhs; rax = op(rax, rcx)
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, lhs, "rax")?);
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, rhs, "rcx")?);
@@ -388,7 +400,9 @@ fn encode_mir_instruction_x86_64(
                 ))
             }
         }
-        lamina_mir::Instruction::IntCmp { op, dst, lhs, rhs, .. } => {
+        lamina_mir::Instruction::IntCmp {
+            op, dst, lhs, rhs, ..
+        } => {
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, lhs, "rax")?);
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, rhs, "rcx")?);
 
@@ -427,6 +441,3 @@ fn encode_mir_instruction_x86_64(
         ))),
     }
 }
-
-
-

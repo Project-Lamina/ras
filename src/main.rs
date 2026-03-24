@@ -42,7 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let output_path = options.output_file.unwrap_or_else(|| PathBuf::from("a.out"));
+    let output_path = options
+        .output_file
+        .unwrap_or_else(|| PathBuf::from("a.out"));
 
     use lamina_platform::Target;
     use std::str::FromStr;
@@ -59,7 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "<stdin>".to_string());
-        println!("[ras] Assembling {} -> {}", input_desc, output_path.display());
+        println!(
+            "[ras] Assembling {} -> {}",
+            input_desc,
+            output_path.display()
+        );
         println!("[ras] Target: {}", target);
     }
 
@@ -137,14 +143,16 @@ fn read_assembly_input(input_file: &Option<PathBuf>) -> Result<String, Box<dyn s
     match input_file {
         None => {
             let mut s = String::new();
-            io::stdin().read_to_string(&mut s)
+            io::stdin()
+                .read_to_string(&mut s)
                 .map_err(|e| format!("Failed to read stdin: {}", e))?;
             Ok(s)
         }
         Some(path) => {
             if path.as_os_str() == OsStr::new("-") {
                 let mut s = String::new();
-                io::stdin().read_to_string(&mut s)
+                io::stdin()
+                    .read_to_string(&mut s)
                     .map_err(|e| format!("Failed to read stdin: {}", e))?;
                 Ok(s)
             } else if path.exists() {
