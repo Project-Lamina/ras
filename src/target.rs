@@ -65,7 +65,7 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
 }
 
 pub fn supported_jit_targets_hint() -> &'static str {
-    "JIT supports x86_64 and AArch64 only."
+    "JIT emits machine code for x86_64 and AArch64 (integer-focused MIR subset; see ras assembler JIT)."
 }
 
 #[cfg(test)]
