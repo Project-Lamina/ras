@@ -253,7 +253,7 @@ impl RiscVEncoder {
         let rd = self.parse_register(&ops[0])?;
         let rs1 = self.parse_register(&ops[1])?;
         let imm = self.parse_imm(&ops[2])? as i32;
-        if imm < -2048 || imm > 2047 {
+        if !(-2048..=2047).contains(&imm) {
             return Err(RasError::EncodingError(format!(
                 "Immediate {} out of 12-bit signed range [-2048, 2047]",
                 imm
@@ -496,7 +496,7 @@ impl InstructionEncoder for RiscVEncoder {
                 }
                 let rd = self.parse_register(&ops[0])?;
                 let imm = self.parse_imm(&ops[1])? as i32;
-                if imm < -2048 || imm > 2047 {
+                if !(-2048..=2047).contains(&imm) {
                     return Err(RasError::EncodingError(format!(
                         "LI pseudo-instruction only supports 12-bit immediates ({} out of range)",
                         imm

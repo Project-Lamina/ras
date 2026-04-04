@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -22,6 +22,103 @@ fn print_usage() {
     eprintln!("  -v, --verbose               Verbose output");
     eprintln!("  --version                   Print version");
     eprintln!("  -h, --help                  This help");
+    eprintln!();
+    eprintln!("GCC driver (ras as assembler, weld as linker):");
+    eprintln!("  mkdir -p toolchain-prefix && ln -sf \"$(command -v ras)\" toolchain-prefix/as");
+    eprintln!("  gcc -B\"$PWD/toolchain-prefix\" -fuse-ld=weld -o prog main.c ...");
+    eprintln!("  (install `weld` on PATH; symlink argv0 `as` enables GNU-style flags from gcc.)");
+}
+
+fn program_name_is_gnu_as(arg0: &str) -> bool {
+    Path::new(arg0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|base| base == "as" || base.ends_with("-as"))
+}
+
+/// When the binary is invoked as `as` (e.g. symlink `as` -> `ras`), accept argv from the GCC driver.
+fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
+    let mut output_file = None;
+    let mut input_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < program_args.len() {
+        let a = program_args[i].as_str();
+        match a {
+            "-o" => {
+                let next = program_args
+                    .get(i + 1)
+                    .ok_or_else(|| "Missing argument for -o".to_string())?;
+                output_file = Some(PathBuf::from(next));
+                i += 2;
+            }
+            "-I" | "-J" | "-arch" => {
+                let _ = program_args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("Missing argument for {}", a))?;
+                i += 2;
+            }
+            "--64"
+            | "--32"
+            | "-n"
+            | "-q"
+            | "-s"
+            | "-g"
+            | "-Z"
+            | "-K"
+            | "-Q"
+            | "-k"
+            | "-v"
+            | "-V"
+            | "-w"
+            | "-d"
+            | "-L" => {
+                i += 1;
+            }
+            a if a.starts_with("-march=")
+                || a.starts_with("-mcpu=")
+                || a.starts_with("-mabi=")
+                || a.starts_with("-mtune=")
+                || a.starts_with("--gdwarf-")
+                || a.starts_with("-debug-prefix-map=")
+                || a.starts_with("-fdebug-prefix-map=")
+                || a.starts_with("-mmacosx-version-min=")
+                || a.starts_with("-mbss-plt")
+                || a.starts_with("-mplt=") =>
+            {
+                i += 1;
+            }
+            a if a.starts_with("-m") && a.len() > 2 => {
+                i += 1;
+            }
+            a if a.starts_with('-') => {
+                i += 1;
+            }
+            "-" => {
+                if input_path.is_some() {
+                    return Err("gnu as compat: multiple input files".to_string());
+                }
+                input_path = Some(PathBuf::from("-"));
+                i += 1;
+            }
+            _ => {
+                if input_path.is_some() {
+                    return Err("gnu as compat: multiple input files".to_string());
+                }
+                input_path = Some(PathBuf::from(a));
+                i += 1;
+            }
+        }
+    }
+
+    let input_file = Some(
+        input_path.ok_or_else(|| "gnu as compat: missing input .s file".to_string())?,
+    );
+    Ok(Options {
+        input_file,
+        output_file,
+        target: None,
+        verbose: false,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,6 +189,11 @@ struct Options {
 
 fn parse_args() -> Result<Options, String> {
     let args: Vec<String> = env::args().collect();
+    let arg0 = args.first().map(String::as_str).unwrap_or("");
+    if program_name_is_gnu_as(arg0) {
+        return parse_gnu_as_invocation(&args[1..]);
+    }
+
     let mut options = Options {
         input_file: None,
         output_file: None,
@@ -162,5 +264,38 @@ fn read_assembly_input(input_file: &Option<PathBuf>) -> Result<String, Box<dyn s
                 Err(format!("Input file '{}' does not exist.", path.display()).into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gnu_as_compat_tests {
+    use super::parse_gnu_as_invocation;
+    use std::path::PathBuf;
+
+    #[test]
+    fn gcc_passes_64_o_and_input() {
+        let args = vec![
+            "--64".to_string(),
+            "-o".to_string(),
+            "out.o".to_string(),
+            "f.s".to_string(),
+        ];
+        let o = parse_gnu_as_invocation(&args).expect("parse");
+        assert_eq!(o.output_file, Some(PathBuf::from("out.o")));
+        assert_eq!(o.input_file, Some(PathBuf::from("f.s")));
+    }
+
+    #[test]
+    fn ignores_include_and_march() {
+        let args = vec![
+            "-I".to_string(),
+            "/tmp".to_string(),
+            "-march=armv8-a".to_string(),
+            "-o".to_string(),
+            "x.o".to_string(),
+            "a.s".to_string(),
+        ];
+        let o = parse_gnu_as_invocation(&args).expect("parse");
+        assert_eq!(o.input_file, Some(PathBuf::from("a.s")));
     }
 }

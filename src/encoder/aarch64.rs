@@ -1,5 +1,13 @@
 //! AArch64 binary instruction encoder
 
+// The binary literals in this file use field-aligned groupings that mirror the
+// AArch64 instruction encoding spec (e.g. op|S|Rn|imm12|Rd).  Reformatting
+// them into standard 4-bit nibble groups would destroy that readability.
+#![allow(clippy::unusual_byte_groupings)]
+// Several field OR expressions have a `| (0 << k)` term for documentation;
+// they are no-ops but make the encoding explicit.
+#![allow(clippy::identity_op)]
+
 use crate::encoder::traits::{InstructionEncoder, ParsedInstruction};
 use crate::error::RasError;
 
@@ -117,29 +125,11 @@ impl AArch64Encoder {
     }
 
     fn encode_str(&self, src: u8, base: u8, offset: i32) -> Result<Vec<u8>, RasError> {
-        if !(0..=0xFFF).contains(&offset) {
-            return Err(RasError::EncodingError(
-                "STR offset must be 0-4095".to_string(),
-            ));
-        }
-        let inst = 0b11_111_0_00_000000000000_00000_00000;
-        let inst = inst | (src as u32);
-        let inst = inst | ((base as u32) << 5);
-        let inst = inst | ((offset as u32 & 0xFFF) << 10);
-        Ok(self.encode_u32(inst))
+        crate::aarch64_ldst_imm64::encode_str_imm64(src, base, offset)
     }
 
     fn encode_ldr(&self, dst: u8, base: u8, offset: i32) -> Result<Vec<u8>, RasError> {
-        if !(0..=0xFFF).contains(&offset) {
-            return Err(RasError::EncodingError(
-                "LDR offset must be 0-4095".to_string(),
-            ));
-        }
-        let inst = 0b11_111_0_01_000000000000_00000_00000;
-        let inst = inst | (dst as u32);
-        let inst = inst | ((base as u32) << 5);
-        let inst = inst | ((offset as u32 & 0xFFF) << 10);
-        Ok(self.encode_u32(inst))
+        crate::aarch64_ldst_imm64::encode_ldr_imm64(dst, base, offset)
     }
 
     fn encode_ret(&self, reg: u8) -> Vec<u8> {
@@ -277,5 +267,70 @@ impl InstructionEncoder for AArch64Encoder {
 
     fn current_position(&self) -> usize {
         self.position
+    }
+}
+
+#[cfg(test)]
+mod aarch64_ldr_str_encoder_tests {
+    use super::AArch64Encoder;
+    use crate::encoder::traits::{InstructionEncoder, ParsedInstruction};
+
+    fn encode_ldr_line(base: &str, dst: &str, offset: i32) -> Vec<u8> {
+        let mem = format!("[{}, #{}]", base, offset);
+        let mut enc = AArch64Encoder::new();
+        enc
+            .encode_instruction(&ParsedInstruction {
+                opcode: "ldr".into(),
+                operands: vec![dst.into(), mem],
+            })
+            .expect("ldr encode")
+    }
+
+    fn encode_str_line(base: &str, src: &str, offset: i32) -> Vec<u8> {
+        let mem = format!("[{}, #{}]", base, offset);
+        let mut enc = AArch64Encoder::new();
+        enc
+            .encode_instruction(&ParsedInstruction {
+                opcode: "str".into(),
+                operands: vec![src.into(), mem],
+            })
+            .expect("str encode")
+    }
+
+    #[test]
+    fn ldr_scaled_1024_byte_offset_uses_imm12_times_eight() {
+        let b = encode_ldr_line("x1", "x0", 1024);
+        assert_eq!(b, vec![0x20, 0x00, 0x42, 0xF9]);
+    }
+
+    #[test]
+    fn str_scaled_512_byte_offset_not_ldur_range() {
+        let b = encode_str_line("x3", "x2", 512);
+        assert_eq!(b, vec![0x62, 0x00, 0x01, 0xF9]);
+    }
+
+    #[test]
+    fn ldr_unscaled_small_positive_uses_ldur() {
+        let b = encode_ldr_line("x5", "x4", 24);
+        assert_eq!(b.len(), 4);
+        assert_eq!(b, vec![0xA4, 0x80, 0x41, 0xF8]);
+    }
+
+    #[test]
+    fn ldr_unaligned_positive_beyond_ldur_range_errors() {
+        let mem = "[x1, #260]";
+        let mut enc = AArch64Encoder::new();
+        let err = enc
+            .encode_instruction(&ParsedInstruction {
+                opcode: "ldr".into(),
+                operands: vec!["x0".into(), mem.into()],
+            })
+            .expect_err("260 not multiple of 8 and > 255");
+        match err {
+            crate::error::RasError::EncodingError(msg) => {
+                assert!(msg.contains("260"), "{}", msg);
+            }
+            _ => panic!("expected EncodingError"),
+        }
     }
 }

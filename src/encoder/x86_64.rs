@@ -101,7 +101,7 @@ impl X86_64Encoder {
             let sib = (2 << 6) | (4 << 3) | (base & 7);
             if disp == 0 {
                 (0, 4, Some(sib), vec![])
-            } else if disp >= -128 && disp <= 127 {
+            } else if (-128..=127).contains(&disp) {
                 (1, 4, Some(sib), vec![disp as u8])
             } else {
                 (2, 4, Some(sib), disp.to_le_bytes().to_vec())
@@ -110,7 +110,7 @@ impl X86_64Encoder {
             (0, base & 7, None, vec![])
         } else if base == 5 && disp == 0 {
             (1, 5, None, vec![0])
-        } else if disp >= -128 && disp <= 127 {
+        } else if (-128..=127).contains(&disp) {
             (1, base & 7, None, vec![disp as u8])
         } else {
             (2, base & 7, None, disp.to_le_bytes().to_vec())
@@ -215,7 +215,7 @@ impl InstructionEncoder for X86_64Encoder {
                     };
 
                 if let Some(imm) = imm_opt {
-                    if imm >= -128 && imm <= 127 {
+                    if (-128..=127).contains(&imm) {
                         code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
                         code.push(0x83);
                         code.push(0xC0 | (dst_reg & 7));
@@ -320,7 +320,7 @@ impl InstructionEncoder for X86_64Encoder {
                         return Ok(code);
                     };
                 if let Some(imm) = imm_opt {
-                    if imm >= -128 && imm <= 127 {
+                    if (-128..=127).contains(&imm) {
                         code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
                         code.push(0x83);
                         code.push(0xE8 | (dst_reg & 7));
