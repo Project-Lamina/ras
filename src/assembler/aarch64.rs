@@ -236,15 +236,27 @@ pub fn compile_mir_aarch64_function(
             match term {
                 lamina_mir::Instruction::Ret { value } => {
                     if let Some(v) = value {
-                        materialize_operand_aarch64(
-                            assembler,
-                            v,
-                            0, // x0
-                            &stack_slots,
-                            &mut reg_alloc,
-                            &mut code,
-                            aligned_stack_size,
-                        )?;
+                        if let Some(rt) = &func.sig.ret_ty {
+                            materialize_return_value_aarch64(
+                                assembler,
+                                v,
+                                rt,
+                                &stack_slots,
+                                &mut reg_alloc,
+                                &mut code,
+                                aligned_stack_size,
+                            )?;
+                        } else {
+                            materialize_operand_aarch64(
+                                assembler,
+                                v,
+                                0,
+                                &stack_slots,
+                                &mut reg_alloc,
+                                &mut code,
+                                aligned_stack_size,
+                            )?;
+                        }
                     }
                     let patch_location = code.len();
                     code.extend_from_slice(&0x1400_0000u32.to_le_bytes()); // B <epilogue> (patched)
@@ -2060,6 +2072,64 @@ fn materialize_scalar_operand_aarch64_int_binary(
         }
     }
     Ok(())
+}
+
+/// Place the return value in `x0` per AAPCS64 (narrow integers are sign-extended in `x0`).
+#[cfg(feature = "encoder")]
+fn materialize_return_value_aarch64(
+    assembler: &mut RasAssembler,
+    op: &lamina_mir::Operand,
+    ret_ty: &lamina_mir::MirType,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    use lamina_mir::{MirType, Operand, Register, ScalarType};
+
+    match op {
+        Operand::Register(Register::Virtual(vreg)) => {
+            let offset = stack_slots.get(vreg).copied().ok_or_else(|| {
+                RasError::EncodingError(format!(
+                    "No stack slot for virtual register: {:?}",
+                    vreg
+                ))
+            })?;
+            match ret_ty {
+                MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
+                    code.extend_from_slice(&encode_ldr_typed_aarch64(
+                        "x0", 29, offset, ret_ty,
+                    )?);
+                }
+                MirType::Scalar(
+                    ScalarType::I32 | ScalarType::I16 | ScalarType::I8 | ScalarType::I1,
+                ) => {
+                    code.extend_from_slice(&encode_ldr_typed_aarch64(
+                        "w0", 29, offset, ret_ty,
+                    )?);
+                    code.extend_from_slice(&encode_sbfm64_aarch64(0, 0, 0, 31));
+                }
+                _ => {
+                    return Err(RasError::EncodingError(format!(
+                        "AArch64 JIT: unsupported return type {:?}",
+                        ret_ty
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Operand::Immediate(_) | Operand::Register(Register::Physical(_)) => {
+            materialize_operand_aarch64(
+                assembler,
+                op,
+                0,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )
+        }
+    }
 }
 
 /// Materialize an operand into a register (AArch64)
