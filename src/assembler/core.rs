@@ -6,7 +6,7 @@
 
 use crate::encoder::traits::InstructionEncoder;
 use crate::error::RasError;
-use crate::object::ObjectWriter;
+use crate::object::{ObjectWriteOptions, ObjectWriter};
 use crate::parser::{AssemblyParser, Line};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
@@ -17,6 +17,7 @@ pub struct RasAssembler {
     pub(crate) target_os: TargetOperatingSystem,
     encoder: Box<dyn InstructionEncoder>,
     object_writer: Box<dyn ObjectWriter>,
+    object_write_options: ObjectWriteOptions,
     pub(crate) function_pointers: std::collections::HashMap<String, u64>, // Function name -> address
     #[cfg(feature = "encoder")]
     pub(crate) current_module: Option<*const lamina_mir::Module>, // Current module being compiled (for internal call detection)
@@ -27,6 +28,14 @@ impl RasAssembler {
     pub fn new(
         target_arch: TargetArchitecture,
         target_os: TargetOperatingSystem,
+    ) -> Result<Self, RasError> {
+        Self::with_object_write_options(target_arch, target_os, ObjectWriteOptions::default())
+    }
+
+    pub fn with_object_write_options(
+        target_arch: TargetArchitecture,
+        target_os: TargetOperatingSystem,
+        object_write_options: ObjectWriteOptions,
     ) -> Result<Self, RasError> {
         // Create encoder based on target architecture
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
@@ -43,17 +52,9 @@ impl RasAssembler {
             }
         };
 
-        // Create object writer based on target OS (cross-compilation: use desired target, not host)
-        let object_writer: Box<dyn ObjectWriter> = match target_os {
-            TargetOperatingSystem::Linux
-            | TargetOperatingSystem::FreeBSD
-            | TargetOperatingSystem::OpenBSD
-            | TargetOperatingSystem::NetBSD
-            | TargetOperatingSystem::DragonFly
-            | TargetOperatingSystem::Redox => Box::new(crate::object::ElfWriter::new()),
-            TargetOperatingSystem::MacOS => Box::new(crate::object::MachOWriter::new()),
-            TargetOperatingSystem::Windows => Box::new(crate::object::CoffWriter::new()),
-            _ => {
+        let object_writer = match crate::object::object_writer_for_os(target_os) {
+            Ok(w) => w,
+            Err(_) => {
                 return Err(RasError::UnsupportedTarget(format!(
                     "Unsupported OS for cross-compilation: {:?}. {}",
                     target_os,
@@ -67,10 +68,15 @@ impl RasAssembler {
             target_os,
             encoder,
             object_writer,
+            object_write_options,
             function_pointers: std::collections::HashMap::new(),
             #[cfg(feature = "encoder")]
             current_module: None,
         })
+    }
+
+    pub fn set_object_write_options(&mut self, opts: ObjectWriteOptions) {
+        self.object_write_options = opts;
     }
 
     /// Assemble assembly text to object file.
@@ -94,6 +100,7 @@ impl RasAssembler {
                 &symbols,
                 self.target_arch,
                 self.target_os,
+                &self.object_write_options,
             )
             .map_err(|e| RasError::ObjectError(e.to_string()))?;
 

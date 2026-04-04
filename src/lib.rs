@@ -3,6 +3,8 @@
 //! Assembly source (.s) to relocatable object files (.o).
 //! Supported: x86_64 and AArch64; ELF on Linux/BSD/Redox.
 
+mod aarch64_ldst_imm64;
+
 pub mod assembler;
 pub mod encoder;
 pub mod error;
@@ -13,6 +15,7 @@ pub mod target;
 
 pub use assembler::RasAssembler;
 pub use error::RasError;
+pub use object::ObjectWriteOptions;
 pub use runtime::{ExecutableMemory, RasRuntime};
 pub use target::{
     is_assembly_target_supported, is_jit_arch_supported, is_object_file_supported,
@@ -31,8 +34,20 @@ impl Ras {
         target_arch: TargetArchitecture,
         target_os: TargetOperatingSystem,
     ) -> Result<Self, RasError> {
+        Self::with_object_write_options(target_arch, target_os, ObjectWriteOptions::default())
+    }
+
+    pub fn with_object_write_options(
+        target_arch: TargetArchitecture,
+        target_os: TargetOperatingSystem,
+        object_write_options: ObjectWriteOptions,
+    ) -> Result<Self, RasError> {
         Ok(Self {
-            assembler: RasAssembler::new(target_arch, target_os)?,
+            assembler: RasAssembler::with_object_write_options(
+                target_arch,
+                target_os,
+                object_write_options,
+            )?,
         })
     }
 

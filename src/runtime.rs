@@ -1,8 +1,10 @@
 //! Runtime compilation (JIT): MIR to executable memory
 
-use crate::assembler::RasAssembler;
 use crate::error::RasError;
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+#[cfg(feature = "encoder")]
+use crate::assembler::RasAssembler;
 
 #[cfg(feature = "encoder")]
 use lamina_mir::Module as MirModule;
@@ -187,6 +189,13 @@ impl ExecutableMemory {
         Ok(())
     }
 
+    /// Return a raw function pointer to the start of the executable region.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointed-to bytes form a valid function
+    /// with the signature implied by `T`, and that this `ExecutableMemory`
+    /// outlives every invocation through the returned pointer.
     pub unsafe fn as_function_ptr<T>(&self) -> *const T {
         self.ptr as *const T
     }
@@ -215,14 +224,23 @@ impl Drop for ExecutableMemory {
 
 /// Runtime compiler: MIR to executable memory
 pub struct RasRuntime {
+    #[cfg(feature = "encoder")]
     target_arch: TargetArchitecture,
+    #[cfg(feature = "encoder")]
     target_os: TargetOperatingSystem,
 }
 
 impl RasRuntime {
-    pub fn new(target_arch: TargetArchitecture, target_os: TargetOperatingSystem) -> Self {
+    pub fn new(
+        #[cfg(feature = "encoder")] target_arch: TargetArchitecture,
+        #[cfg(not(feature = "encoder"))] _target_arch: TargetArchitecture,
+        #[cfg(feature = "encoder")] target_os: TargetOperatingSystem,
+        #[cfg(not(feature = "encoder"))] _target_os: TargetOperatingSystem,
+    ) -> Self {
         Self {
+            #[cfg(feature = "encoder")]
             target_arch,
+            #[cfg(feature = "encoder")]
             target_os,
         }
     }
@@ -250,5 +268,42 @@ impl RasRuntime {
             let ptr: *const unsafe extern "C" fn() -> T = mem.as_function_ptr();
             Ok(*ptr)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+    #[test]
+    fn executable_memory_allocate_and_write() {
+        // Allocate a small writable+executable region and verify the written bytes
+        // can be read back before making the region executable.
+        let mut mem = ExecutableMemory::allocate_writable(4096).expect("alloc failed");
+        let code = [0x90u8, 0x90, 0x90, 0xc3]; // three NOPs + ret (x86_64)
+        mem.write_code(&code).expect("write failed");
+        // After making it executable the pointer should remain non-null.
+        mem.make_executable().expect("make_executable failed");
+        let fn_ptr = unsafe { mem.as_function_ptr::<u8>() };
+        assert!(!fn_ptr.is_null());
+    }
+
+    #[test]
+    fn executable_memory_too_large_returns_error() {
+        // Allocation rounds up to a page (4096 bytes). Use exactly one page so
+        // the next allocation produces a 4096-byte region, then try to write 8192.
+        let mem = ExecutableMemory::allocate_writable(4096).expect("alloc failed");
+        let big = vec![0u8; 8192];
+        let result = { let mut m = mem; m.write_code(&big) };
+        assert!(result.is_err(), "writing beyond capacity should fail");
+    }
+
+    #[test]
+    fn ras_runtime_new_does_not_panic() {
+        let _rt = RasRuntime::new(
+            TargetArchitecture::X86_64,
+            TargetOperatingSystem::Linux,
+        );
     }
 }
