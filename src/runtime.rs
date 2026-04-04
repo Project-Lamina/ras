@@ -180,6 +180,16 @@ impl ExecutableMemory {
         {
             unsafe {
                 unsafe extern "C" {
+                    fn sys_icache_invalidate(start: *mut libc::c_void, size: libc::size_t);
+                }
+                sys_icache_invalidate(self.ptr as *mut libc::c_void, code.len());
+            }
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            unsafe {
+                unsafe extern "C" {
                     fn pthread_jit_write_protect_np(value: libc::c_int);
                 }
                 pthread_jit_write_protect_np(1);
@@ -189,15 +199,26 @@ impl ExecutableMemory {
         Ok(())
     }
 
-    /// Return a raw function pointer to the start of the executable region.
+    pub fn code_start(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// Interprets the first byte of this region as the entry address for a function pointer.
+    ///
+    /// This is **not** a pointer-to-pointer: the mapping begins with machine code, not a stored
+    /// address. Do not use `*const F` to the entry and then dereference; that would load
+    /// instruction bytes as a pointer.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the pointed-to bytes form a valid function
-    /// with the signature implied by `T`, and that this `ExecutableMemory`
-    /// outlives every invocation through the returned pointer.
-    pub unsafe fn as_function_ptr<T>(&self) -> *const T {
-        self.ptr as *const T
+    /// The caller must ensure `F` matches the ABI and signature of the generated code, and that
+    /// this `ExecutableMemory` outlives every call through `F`.
+    pub unsafe fn entry_fn<F: Sized>(&self) -> F {
+        debug_assert_eq!(
+            core::mem::size_of::<F>(),
+            core::mem::size_of::<*mut u8>()
+        );
+        unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 }
 
@@ -257,6 +278,8 @@ impl RasRuntime {
         Ok(mem)
     }
 
+    /// Leaks the executable mapping so the returned pointer stays valid. Prefer
+    /// [`compile_to_memory`](Self::compile_to_memory) and keep the `ExecutableMemory` alive.
     #[cfg(feature = "encoder")]
     pub fn compile_function<T>(
         &mut self,
@@ -264,10 +287,9 @@ impl RasRuntime {
         _function_name: &str,
     ) -> Result<unsafe extern "C" fn() -> T, RasError> {
         let mem = self.compile_to_memory(module)?;
-        unsafe {
-            let ptr: *const unsafe extern "C" fn() -> T = mem.as_function_ptr();
-            Ok(*ptr)
-        }
+        let f: unsafe extern "C" fn() -> T = unsafe { core::mem::transmute(mem.ptr) };
+        std::mem::forget(mem);
+        Ok(f)
     }
 }
 
@@ -285,8 +307,7 @@ mod tests {
         mem.write_code(&code).expect("write failed");
         // After making it executable the pointer should remain non-null.
         mem.make_executable().expect("make_executable failed");
-        let fn_ptr = unsafe { mem.as_function_ptr::<u8>() };
-        assert!(!fn_ptr.is_null());
+        assert!(!mem.code_start().is_null());
     }
 
     #[test]
@@ -305,5 +326,201 @@ mod tests {
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Linux,
         );
+    }
+}
+
+/// Run JIT output on the **host** CPU (x86_64 or aarch64 only). Skips when the host OS string
+/// is not mapped in `TargetOperatingSystem` (e.g. some embedded targets).
+#[cfg(all(test, feature = "encoder"))]
+mod jit_host_exec_tests {
+    use std::str::FromStr;
+
+    use lamina_mir::block::Block;
+    use lamina_mir::function::{Function, Parameter, Signature};
+    use lamina_mir::instruction::{Immediate, Instruction, IntBinOp, Operand};
+    use lamina_mir::module::Module;
+    use lamina_mir::register::{Register, VirtualReg};
+    use lamina_mir::types::{MirType, ScalarType};
+    use lamina_platform::{
+        TargetArchitecture, TargetOperatingSystem, detect_host_architecture_only, detect_host_os,
+    };
+
+    use crate::assembler::core::RasAssembler;
+    use crate::error::RasError;
+    use crate::runtime::ExecutableMemory;
+
+    fn host_jit_pair() -> Option<(TargetArchitecture, TargetOperatingSystem)> {
+        let arch = TargetArchitecture::from_str(detect_host_architecture_only()).ok()?;
+        let os = TargetOperatingSystem::from_str(detect_host_os()).ok()?;
+        match arch {
+            TargetArchitecture::X86_64 | TargetArchitecture::Aarch64 => Some((arch, os)),
+            _ => None,
+        }
+    }
+
+    fn compile_to_executable(
+        arch: TargetArchitecture,
+        os: TargetOperatingSystem,
+        module: &lamina_mir::Module,
+    ) -> Result<ExecutableMemory, RasError> {
+        let mut asm = RasAssembler::new(arch, os)?;
+        let (code, _) = asm.compile_mir_to_binary_function(module, None)?;
+        let mut mem = ExecutableMemory::allocate_writable(code.len())?;
+        mem.write_code(&code)?;
+        mem.make_executable()?;
+        Ok(mem)
+    }
+
+    fn module_i64_binop(
+        op: IntBinOp,
+        lhs: Operand,
+        rhs: Operand,
+    ) -> Module {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let out = Register::Virtual(VirtualReg::gpr(0));
+        let sig = Signature::new("f").with_return(i64_ty.clone());
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::IntBinary {
+            op,
+            ty: i64_ty.clone(),
+            dst: out.clone(),
+            lhs,
+            rhs,
+        });
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(out.clone())),
+        });
+        f.add_block(entry);
+        let mut module = Module::new("exec_i64");
+        module.add_function(f);
+        module
+    }
+
+    fn module_i32_binop(op: IntBinOp, lhs: Operand, rhs: Operand) -> Module {
+        let i32_ty = MirType::Scalar(ScalarType::I32);
+        let out = Register::Virtual(VirtualReg::gpr(0));
+        let sig = Signature::new("f").with_return(i32_ty.clone());
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::IntBinary {
+            op,
+            ty: i32_ty.clone(),
+            dst: out.clone(),
+            lhs,
+            rhs,
+        });
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(out.clone())),
+        });
+        f.add_block(entry);
+        let mut module = Module::new("exec_i32");
+        module.add_function(f);
+        module
+    }
+
+    fn module_i64_add_params() -> Module {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let a = Register::Virtual(VirtualReg::gpr(0));
+        let b = Register::Virtual(VirtualReg::gpr(1));
+        let out = Register::Virtual(VirtualReg::gpr(2));
+        let sig = Signature::new("g")
+            .with_params(vec![
+                Parameter::new(a.clone(), i64_ty.clone()),
+                Parameter::new(b.clone(), i64_ty.clone()),
+            ])
+            .with_return(i64_ty.clone());
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::IntBinary {
+            op: IntBinOp::Add,
+            ty: i64_ty.clone(),
+            dst: out.clone(),
+            lhs: Operand::Register(a.clone()),
+            rhs: Operand::Register(b.clone()),
+        });
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(out.clone())),
+        });
+        f.add_block(entry);
+        let mut module = Module::new("exec_i64_params");
+        module.add_function(f);
+        module
+    }
+
+    #[test]
+    fn jit_host_exec_i64_add_immediates() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_i64_binop(
+            IntBinOp::Add,
+            Operand::Immediate(Immediate::I64(10)),
+            Operand::Immediate(Immediate::I64(32)),
+        );
+        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
+        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i64>() };
+        let got = fptr();
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn jit_host_exec_i64_add_two_arguments() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_i64_add_params();
+        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
+        let fptr = unsafe { mem.entry_fn::<extern "C" fn(i64, i64) -> i64>() };
+        let got = fptr(7, 35);
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_udiv_immediates() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_i32_binop(
+            IntBinOp::UDiv,
+            Operand::Immediate(Immediate::I32(10)),
+            Operand::Immediate(Immediate::I32(3)),
+        );
+        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
+        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
+        let got = fptr();
+        assert_eq!(got, 3);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_sdiv_negative_dividend() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_i32_binop(
+            IntBinOp::SDiv,
+            Operand::Immediate(Immediate::I32(-7)),
+            Operand::Immediate(Immediate::I32(2)),
+        );
+        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
+        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
+        let got = fptr();
+        assert_eq!(got, -3);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_shl_immediates() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_i32_binop(
+            IntBinOp::Shl,
+            Operand::Immediate(Immediate::I32(3)),
+            Operand::Immediate(Immediate::I32(4)),
+        );
+        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
+        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
+        let got = fptr();
+        assert_eq!(got, 48);
     }
 }

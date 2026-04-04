@@ -165,6 +165,7 @@ pub fn compile_mir_x86_64_function(
                     &stack_slots,
                     aligned_stack_size,
                     &func_name,
+                    &func.sig,
                 )?;
                 code.extend_from_slice(&inst_bytes);
             }
@@ -766,6 +767,75 @@ fn emit_int_binop_i32_alu_x86_64(op: lamina_mir::IntBinOp) -> Vec<u8> {
 }
 
 #[cfg(feature = "encoder")]
+/// Place the return value in `rax` per the x86-64 SysV ABI (narrow integers sign- or zero-extended).
+#[cfg(feature = "encoder")]
+fn materialize_return_value_x86_64(
+    slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    op: &lamina_mir::Operand,
+    ret_ty: &lamina_mir::MirType,
+) -> Result<Vec<u8>, RasError> {
+    use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
+
+    match op {
+        Operand::Register(Register::Virtual(vreg)) => {
+            let off = slots.get(vreg).copied().ok_or_else(|| {
+                RasError::EncodingError(format!("Missing stack slot for vreg {:?}", vreg))
+            })?;
+            let mut code = Vec::new();
+            match ret_ty {
+                MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
+                    code.extend_from_slice(&encode_mov_mem_reg_x86_64(off, "rax")?);
+                }
+                MirType::Scalar(ScalarType::I32) => {
+                    code.extend_from_slice(&encode_mov_r32_mem_rbp(0, off)?);
+                    code.extend_from_slice(&[0x48, 0x63, 0xC0]);
+                }
+                MirType::Scalar(ScalarType::I16) => {
+                    code.extend_from_slice(&encode_mov_rexw_secondary_mem_rbp(0, off, 0xBF)?);
+                }
+                MirType::Scalar(ScalarType::I8) => {
+                    code.extend_from_slice(&encode_mov_rexw_secondary_mem_rbp(0, off, 0xBE)?);
+                }
+                MirType::Scalar(ScalarType::I1) => {
+                    code.extend_from_slice(&encode_mov_rexw_secondary_mem_rbp(0, off, 0xB6)?);
+                    code.extend_from_slice(&[0x48, 0x83, 0xE0, 0x01]);
+                }
+                _ => {
+                    return Err(RasError::EncodingError(format!(
+                        "x86_64 JIT: unsupported return type {:?}",
+                        ret_ty
+                    )));
+                }
+            }
+            Ok(code)
+        }
+        Operand::Immediate(imm) => {
+            let v = match imm {
+                Immediate::I8(v) => *v as i64,
+                Immediate::I16(v) => *v as i64,
+                Immediate::I32(v) => *v as i64,
+                Immediate::I64(v) => *v,
+                Immediate::F32(_) | Immediate::F64(_) => {
+                    return Err(RasError::EncodingError(
+                        "x86_64 JIT: float immediates not supported for return".into(),
+                    ));
+                }
+            };
+            Ok(mov_imm64_reg_x86_64(0, v))
+        }
+        Operand::Register(Register::Physical(p)) => {
+            let dst = parse_register_x86_64("rax")?;
+            let src = parse_register_x86_64(p.name)?;
+            if dst == src {
+                Ok(Vec::new())
+            } else {
+                let rex = rex_w_r_b(true, src, dst);
+                Ok(vec![rex, 0x89, modrm(0b11, src & 7, dst & 7)])
+            }
+        }
+    }
+}
+
 fn store_int_binop_result_x86_64(
     slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
     v: &lamina_mir::VirtualReg,
@@ -840,6 +910,7 @@ fn encode_mir_instruction_x86_64(
     stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
     _stack_size: usize,
     _func_name: &str,
+    func_sig: &lamina_mir::Signature,
 ) -> Result<Vec<u8>, RasError> {
     use lamina_mir::{
         AddressMode, Immediate, IntBinOp, IntCmpOp, MirType, Operand, Register, ScalarType,
@@ -939,8 +1010,15 @@ fn encode_mir_instruction_x86_64(
     match inst {
         lamina_mir::Instruction::Ret { value } => {
             if let Some(v) = value {
-                // Move return value into rax.
-                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, v, "rax")?);
+                if let Some(rt) = &func_sig.ret_ty {
+                    code.extend_from_slice(&materialize_return_value_x86_64(
+                        stack_slots,
+                        v,
+                        rt,
+                    )?);
+                } else {
+                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, v, "rax")?);
+                }
             }
             Ok(code)
         }
