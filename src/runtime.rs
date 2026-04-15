@@ -140,6 +140,19 @@ impl ExecutableMemory {
                 return Err(RasError::IoError("VirtualProtect failed".to_string()));
             }
 
+            // On Windows AArch64, flush the instruction cache so the CPU sees
+            // the newly written code after the page protection change.
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use winapi::um::processthreadsapi::GetCurrentProcess;
+                use winapi::um::processthreadsapi::FlushInstructionCache;
+                FlushInstructionCache(
+                    GetCurrentProcess(),
+                    self.ptr as *const winapi::ctypes::c_void,
+                    self.size,
+                );
+            }
+
             Ok(())
         }
 
@@ -337,7 +350,7 @@ mod jit_host_exec_tests {
 
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};
-    use lamina_mir::instruction::{Immediate, Instruction, IntBinOp, Operand};
+    use lamina_mir::instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand};
     use lamina_mir::module::Module;
     use lamina_mir::register::{Register, VirtualReg};
     use lamina_mir::types::{MirType, ScalarType};
@@ -371,19 +384,49 @@ mod jit_host_exec_tests {
         Ok(mem)
     }
 
-    fn module_i64_binop(
+    fn exec_host_i32(module: &Module) -> Option<i32> {
+        let (arch, os) = host_jit_pair()?;
+        let mem = compile_to_executable(arch, os, module).ok()?;
+        let f = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
+        Some(f())
+    }
+
+    fn exec_host_i64(module: &Module) -> Option<i64> {
+        let (arch, os) = host_jit_pair()?;
+        let mem = compile_to_executable(arch, os, module).ok()?;
+        let f = unsafe { mem.entry_fn::<extern "C" fn() -> i64>() };
+        Some(f())
+    }
+
+    fn exec_host_i64_binary(module: &Module, a: i64, b: i64) -> Option<i64> {
+        let (arch, os) = host_jit_pair()?;
+        let mem = compile_to_executable(arch, os, module).ok()?;
+        let f = unsafe { mem.entry_fn::<extern "C" fn(i64, i64) -> i64>() };
+        Some(f(a, b))
+    }
+
+    fn ii32(v: i32) -> Operand {
+        Operand::Immediate(Immediate::I32(v))
+    }
+
+    fn ii64(v: i64) -> Operand {
+        Operand::Immediate(Immediate::I64(v))
+    }
+
+    fn module_scalar_binop(
+        scalar: ScalarType,
         op: IntBinOp,
         lhs: Operand,
         rhs: Operand,
     ) -> Module {
-        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let ty = MirType::Scalar(scalar);
         let out = Register::Virtual(VirtualReg::gpr(0));
-        let sig = Signature::new("f").with_return(i64_ty.clone());
+        let sig = Signature::new("f").with_return(ty.clone());
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op,
-            ty: i64_ty.clone(),
+            ty: ty.clone(),
             dst: out.clone(),
             lhs,
             rhs,
@@ -392,34 +435,12 @@ mod jit_host_exec_tests {
             value: Some(Operand::Register(out.clone())),
         });
         f.add_block(entry);
-        let mut module = Module::new("exec_i64");
+        let mut module = Module::new("host_scalar_binop");
         module.add_function(f);
         module
     }
 
-    fn module_i32_binop(op: IntBinOp, lhs: Operand, rhs: Operand) -> Module {
-        let i32_ty = MirType::Scalar(ScalarType::I32);
-        let out = Register::Virtual(VirtualReg::gpr(0));
-        let sig = Signature::new("f").with_return(i32_ty.clone());
-        let mut f = Function::new(sig);
-        let mut entry = Block::new("entry");
-        entry.push(Instruction::IntBinary {
-            op,
-            ty: i32_ty.clone(),
-            dst: out.clone(),
-            lhs,
-            rhs,
-        });
-        entry.push(Instruction::Ret {
-            value: Some(Operand::Register(out.clone())),
-        });
-        f.add_block(entry);
-        let mut module = Module::new("exec_i32");
-        module.add_function(f);
-        module
-    }
-
-    fn module_i64_add_params() -> Module {
+    fn module_i64_binop_params(op: IntBinOp) -> Module {
         let i64_ty = MirType::Scalar(ScalarType::I64);
         let a = Register::Virtual(VirtualReg::gpr(0));
         let b = Register::Virtual(VirtualReg::gpr(1));
@@ -433,7 +454,7 @@ mod jit_host_exec_tests {
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
-            op: IntBinOp::Add,
+            op,
             ty: i64_ty.clone(),
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
@@ -443,84 +464,237 @@ mod jit_host_exec_tests {
             value: Some(Operand::Register(out.clone())),
         });
         f.add_block(entry);
-        let mut module = Module::new("exec_i64_params");
+        let mut module = Module::new("host_i64_params");
+        module.add_function(f);
+        module
+    }
+
+    fn module_i32_cmp_eq(lhs: Operand, rhs: Operand) -> Module {
+        let i32_ty = MirType::Scalar(ScalarType::I32);
+        let out = Register::Virtual(VirtualReg::gpr(0));
+        let sig = Signature::new("cmp").with_return(i32_ty.clone());
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::IntCmp {
+            op: IntCmpOp::Eq,
+            ty: i32_ty.clone(),
+            dst: out.clone(),
+            lhs,
+            rhs,
+        });
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(out.clone())),
+        });
+        f.add_block(entry);
+        let mut module = Module::new("host_i32_cmp");
         module.add_function(f);
         module
     }
 
     #[test]
     fn jit_host_exec_i64_add_immediates() {
-        let Some((arch, os)) = host_jit_pair() else {
+        let Some(got) = exec_host_i64(&module_scalar_binop(
+            ScalarType::I64,
+            IntBinOp::Add,
+            ii64(10),
+            ii64(32),
+        )) else {
             return;
         };
-        let module = module_i64_binop(
-            IntBinOp::Add,
-            Operand::Immediate(Immediate::I64(10)),
-            Operand::Immediate(Immediate::I64(32)),
-        );
-        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
-        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i64>() };
-        let got = fptr();
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn jit_host_exec_i64_sub_immediates() {
+        let Some(got) = exec_host_i64(&module_scalar_binop(
+            ScalarType::I64,
+            IntBinOp::Sub,
+            ii64(100),
+            ii64(33),
+        )) else {
+            return;
+        };
+        assert_eq!(got, 67);
+    }
+
+    #[test]
+    fn jit_host_exec_i64_mul_immediates() {
+        let Some(got) = exec_host_i64(&module_scalar_binop(
+            ScalarType::I64,
+            IntBinOp::Mul,
+            ii64(6),
+            ii64(7),
+        )) else {
+            return;
+        };
         assert_eq!(got, 42);
     }
 
     #[test]
     fn jit_host_exec_i64_add_two_arguments() {
-        let Some((arch, os)) = host_jit_pair() else {
+        let Some(got) = exec_host_i64_binary(&module_i64_binop_params(IntBinOp::Add), 7, 35) else {
             return;
         };
-        let module = module_i64_add_params();
-        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
-        let fptr = unsafe { mem.entry_fn::<extern "C" fn(i64, i64) -> i64>() };
-        let got = fptr(7, 35);
         assert_eq!(got, 42);
     }
 
     #[test]
-    fn jit_host_exec_i32_udiv_immediates() {
-        let Some((arch, os)) = host_jit_pair() else {
+    fn jit_host_exec_i64_mul_two_arguments() {
+        let Some(got) = exec_host_i64_binary(&module_i64_binop_params(IntBinOp::Mul), 6, 7) else {
             return;
         };
-        let module = module_i32_binop(
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_sub_immediates() {
+        let Some(got) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::Sub,
+            ii32(50),
+            ii32(8),
+        )) else {
+            return;
+        };
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_mul_immediates() {
+        let Some(got) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::Mul,
+            ii32(6),
+            ii32(7),
+        )) else {
+            return;
+        };
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_and_or_xor_immediates() {
+        let Some(a) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::And,
+            ii32(0x0F),
+            ii32(0x33),
+        )) else {
+            return;
+        };
+        assert_eq!(a, 3);
+        let Some(o) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::Or,
+            ii32(8),
+            ii32(2),
+        )) else {
+            return;
+        };
+        assert_eq!(o, 10);
+        let Some(x) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::Xor,
+            ii32(15),
+            ii32(5),
+        )) else {
+            return;
+        };
+        assert_eq!(x, 10);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_udiv_immediates() {
+        let Some(got) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
             IntBinOp::UDiv,
-            Operand::Immediate(Immediate::I32(10)),
-            Operand::Immediate(Immediate::I32(3)),
-        );
-        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
-        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
-        let got = fptr();
+            ii32(10),
+            ii32(3),
+        )) else {
+            return;
+        };
         assert_eq!(got, 3);
     }
 
     #[test]
     fn jit_host_exec_i32_sdiv_negative_dividend() {
-        let Some((arch, os)) = host_jit_pair() else {
+        let Some(got) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::SDiv,
+            ii32(-7),
+            ii32(2),
+        )) else {
             return;
         };
-        let module = module_i32_binop(
-            IntBinOp::SDiv,
-            Operand::Immediate(Immediate::I32(-7)),
-            Operand::Immediate(Immediate::I32(2)),
-        );
-        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
-        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
-        let got = fptr();
         assert_eq!(got, -3);
     }
 
     #[test]
-    fn jit_host_exec_i32_shl_immediates() {
-        let Some((arch, os)) = host_jit_pair() else {
+    fn jit_host_exec_i32_urem_srem_immediates() {
+        let Some(u) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::URem,
+            ii32(10),
+            ii32(3),
+        )) else {
             return;
         };
-        let module = module_i32_binop(
+        assert_eq!(u, 1);
+        let Some(s) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::SRem,
+            ii32(-7),
+            ii32(3),
+        )) else {
+            return;
+        };
+        assert_eq!(s, -1);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_shl_immediates() {
+        let Some(got) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
             IntBinOp::Shl,
-            Operand::Immediate(Immediate::I32(3)),
-            Operand::Immediate(Immediate::I32(4)),
-        );
-        let mem = compile_to_executable(arch, os, &module).expect("compile to executable");
-        let fptr = unsafe { mem.entry_fn::<extern "C" fn() -> i32>() };
-        let got = fptr();
+            ii32(3),
+            ii32(4),
+        )) else {
+            return;
+        };
         assert_eq!(got, 48);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_lshr_ashr_immediates() {
+        let Some(l) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::LShr,
+            ii32(128),
+            ii32(3),
+        )) else {
+            return;
+        };
+        assert_eq!(l, 16);
+        let Some(a) = exec_host_i32(&module_scalar_binop(
+            ScalarType::I32,
+            IntBinOp::AShr,
+            ii32(-16),
+            ii32(2),
+        )) else {
+            return;
+        };
+        assert_eq!(a, -4);
+    }
+
+    #[test]
+    fn jit_host_exec_i32_intcmp_eq_immediates() {
+        let Some(eq) = exec_host_i32(&module_i32_cmp_eq(ii32(9), ii32(9))) else {
+            return;
+        };
+        assert_eq!(eq, 1);
+        let Some(ne) = exec_host_i32(&module_i32_cmp_eq(ii32(2), ii32(3))) else {
+            return;
+        };
+        assert_eq!(ne, 0);
     }
 }
