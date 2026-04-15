@@ -45,6 +45,7 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ET_REL: u16 = 1;
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
+const EM_RISCV: u16 = 243;
 const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
 const SHT_STRTAB: u32 = 3;
@@ -55,6 +56,7 @@ fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
         TargetArchitecture::X86_64 => Some(EM_X86_64),
         TargetArchitecture::Aarch64 => Some(EM_AARCH64),
+        TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64 => Some(EM_RISCV),
         _ => None,
     }
 }

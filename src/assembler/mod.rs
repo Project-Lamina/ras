@@ -9,4 +9,7 @@ pub mod x86_64;
 #[cfg(feature = "encoder")]
 pub mod aarch64;
 
+#[cfg(feature = "encoder")]
+pub mod riscv;
+
 pub use core::RasAssembler;
