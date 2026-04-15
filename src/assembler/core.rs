@@ -315,6 +315,12 @@ impl RasAssembler {
             TargetArchitecture::Aarch64 => {
                 crate::assembler::aarch64::compile_mir_aarch64_function(self, module, function_name)
             }
+            TargetArchitecture::Riscv64 => {
+                crate::assembler::riscv::compile_mir_riscv_function(self, module, function_name, true)
+            }
+            TargetArchitecture::Riscv32 => {
+                crate::assembler::riscv::compile_mir_riscv_function(self, module, function_name, false)
+            }
             _ => Err(RasError::UnsupportedTarget(format!(
                 "MIR compilation not supported for architecture: {:?}",
                 self.target_arch

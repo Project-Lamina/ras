@@ -225,6 +225,7 @@ pub fn compile_mir_aarch64_function(
                     &mut reg_alloc,
                     &stack_slots,
                     aligned_stack_size,
+                    func.sig.ret_ty.as_ref(),
                     func_name,
                     &function_offsets,
                     current_offset,
@@ -778,7 +779,7 @@ fn aarch64_apply_i32_offset_to_reg(
 
 /// MSUB Xd, Xn, Xm, Xa: Xd = Xa - (Xn * Xm)
 fn encode_msub_aarch64(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
-    let w = 0x9B002000u32 | ((rm as u32) << 16) | ((ra as u32) << 10) | ((rn as u32) << 5) | (rd as u32);
+    let w = 0x9B008000u32 | ((rm as u32) << 16) | ((ra as u32) << 10) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
 }
 
@@ -823,7 +824,7 @@ fn encode_shiftv_aarch64(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
 
 /// MSUB Wd, Wn, Wm, Wa
 fn encode_msub_aarch64_w(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
-    let w = 0x1B00_2000u32
+    let w = 0x1B00_8000u32
         | ((rm as u32) << 16)
         | ((ra as u32) << 10)
         | ((rn as u32) << 5)
@@ -1018,6 +1019,7 @@ fn encode_mir_instruction_aarch64(
         reg_alloc,
         stack_slots,
         stack_size,
+        None,
         func_name,
         &std::collections::HashMap::new(),
         0,
@@ -1032,6 +1034,7 @@ fn encode_mir_instruction_aarch64_with_context(
     reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
     stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
     stack_size: usize,
+    fn_ret_ty: Option<&lamina_mir::MirType>,
     _func_name: &str,
     function_offsets: &std::collections::HashMap<String, usize>,
     current_offset: usize,
@@ -1043,19 +1046,28 @@ fn encode_mir_instruction_aarch64_with_context(
     match inst {
         lamina_mir::Instruction::Ret { value } => {
             if let Some(v) = value {
-                // Load return value to x0 (return value register)
-                materialize_operand_aarch64(
-                    assembler,
-                    v,
-                    0,
-                    stack_slots,
-                    reg_alloc,
-                    &mut code,
-                    stack_size,
-                )?;
+                if let Some(rt) = fn_ret_ty {
+                    materialize_return_value_aarch64(
+                        assembler,
+                        v,
+                        rt,
+                        stack_slots,
+                        reg_alloc,
+                        &mut code,
+                        stack_size,
+                    )?;
+                } else {
+                    materialize_operand_aarch64(
+                        assembler,
+                        v,
+                        0,
+                        stack_slots,
+                        reg_alloc,
+                        &mut code,
+                        stack_size,
+                    )?;
+                }
             }
-            // Don't emit RET here - it will be emitted after the epilogue at function end
-            // Just fall through to the epilogue
         }
         lamina_mir::Instruction::IntBinary {
             op,
@@ -1709,16 +1721,22 @@ fn encode_mir_instruction_aarch64_with_context(
                 IntCmpOp::SGe => 0b1010u32,
             };
             let inv_cond = cond_code ^ 1;
-            let cset_inst = 0x9A9F_07E0u32 | (inv_cond << 12) | (dst_reg as u32);
+            let cset_base = if use_subs_w32 {
+                0x1A9F_07E0u32
+            } else {
+                0x9A9F_07E0u32
+            };
+            let cset_inst = cset_base | (inv_cond << 12) | (dst_reg as u32);
             code.extend_from_slice(&cset_inst.to_le_bytes());
 
             if let Register::Virtual(vreg) = dst
                 && let Some(offset) = stack_slots.get(vreg)
             {
-                code.extend_from_slice(&encode_str_aarch64(
+                code.extend_from_slice(&encode_str_typed_aarch64(
                     dst_reg_str,
                     29,
                     *offset,
+                    &ty,
                 )?);
             }
 
@@ -2516,7 +2534,6 @@ mod aarch64_jit_tail_call_tests {
     #[test]
     fn compile_mir_aarch64_intcmp_i32_encodes() {
         let i32_ty = MirType::Scalar(ScalarType::I32);
-        let i64_ty = MirType::Scalar(ScalarType::I64);
         let a = Register::Virtual(VirtualReg::gpr(0));
         let b = Register::Virtual(VirtualReg::gpr(1));
         let out = Register::Virtual(VirtualReg::gpr(2));
@@ -2525,7 +2542,7 @@ mod aarch64_jit_tail_call_tests {
                 Parameter::new(a.clone(), i32_ty.clone()),
                 Parameter::new(b.clone(), i32_ty.clone()),
             ])
-            .with_return(i64_ty.clone());
+            .with_return(i32_ty.clone());
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntCmp {
@@ -2553,6 +2570,14 @@ mod aarch64_jit_tail_call_tests {
             code.len() > 40,
             "expected prologue + 32-bit subs/cset + epilogue, got {} bytes",
             code.len()
+        );
+        assert!(
+            subslice_present(&code, &[0x3f, 0x01, 0x0a, 0x6b]),
+            "subs wzr,w9,w10"
+        );
+        assert!(
+            subslice_present(&code, &[0xeb, 0x17, 0x9f, 0x1a]),
+            "cset w11,eq (CSINC w form)"
         );
     }
 
@@ -2604,6 +2629,13 @@ mod aarch64_jit_tail_call_tests {
     fn jit_a64_i32_udiv_w_encoding_present() {
         let code = compile_single_i32_binop_a64(IntBinOp::UDiv);
         assert!(subslice_present(&code, &[0x2B, 0x09, 0xCA, 0x1A]));
+    }
+
+    #[test]
+    fn jit_a64_i32_urem_w_udiv_then_msub_encoding_present() {
+        let code = compile_single_i32_binop_a64(IntBinOp::URem);
+        assert!(subslice_present(&code, &[0x2c, 0x09, 0xca, 0x1a]));
+        assert!(subslice_present(&code, &[0x8b, 0xa5, 0x0a, 0x1b]));
     }
 
     #[test]
