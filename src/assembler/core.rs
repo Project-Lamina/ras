@@ -23,6 +23,25 @@ pub struct RasAssembler {
     pub(crate) current_module: Option<*const lamina_mir::Module>, // Current module being compiled (for internal call detection)
 }
 
+enum PatchPoint {
+    X86Rel32 {
+        offset: usize,
+        target: String,
+    },
+    Arx64Jal {
+        offset: usize,
+        target: String,
+        rd: u8,
+    },
+    Arx64Branch {
+        offset: usize,
+        target: String,
+        rs1: u8,
+        rs2: u8,
+        funct3: u8,
+    },
+}
+
 impl RasAssembler {
     /// Create a new assembler
     pub fn new(
@@ -41,6 +60,7 @@ impl RasAssembler {
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
             TargetArchitecture::X86_64 => Box::new(crate::encoder::x86_64::X86_64Encoder::new()),
             TargetArchitecture::Aarch64 => Box::new(crate::encoder::aarch64::AArch64Encoder::new()),
+            TargetArchitecture::Arx64 => Box::new(crate::encoder::arx64::Arx64Encoder::new()),
             TargetArchitecture::Riscv32 => {
                 Box::new(crate::encoder::riscv::RiscVEncoder::new(false))
             }
@@ -112,7 +132,7 @@ impl RasAssembler {
         lines: &[Line],
     ) -> Result<(Vec<u8>, Vec<crate::parser::Symbol>), RasError> {
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
-        let mut patch_points: Vec<(usize, String)> = Vec::new();
+        let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
         let mut current_offset = 0usize;
 
@@ -125,6 +145,17 @@ impl RasAssembler {
                     let opcode = inst.opcode.to_lowercase();
                     let is_jmp_call = opcode == "jmp" || opcode == "jmpq" || opcode == "call";
 
+                    if self.target_arch == TargetArchitecture::Arx64 {
+                        if let Some(patch) =
+                            arx64_label_patch(&opcode, &inst.operands, current_offset)?
+                        {
+                            code.extend_from_slice(&[0u8; 4]);
+                            patch_points.push(patch);
+                            current_offset += 4;
+                            continue;
+                        }
+                    }
+
                     if is_jmp_call && inst.operands.len() == 1 {
                         let target = inst.operands[0].trim();
                         if self.target_arch == lamina_platform::TargetArchitecture::X86_64 {
@@ -132,7 +163,10 @@ impl RasAssembler {
                             let opcode_byte: u8 = if is_call { 0xe8 } else { 0xe9 };
                             code.push(opcode_byte);
                             code.extend_from_slice(&[0u8; 4]);
-                            patch_points.push((current_offset + 1, target.to_string()));
+                            patch_points.push(PatchPoint::X86Rel32 {
+                                offset: current_offset + 1,
+                                target: target.to_string(),
+                            });
                             current_offset += 5;
                         } else {
                             let bytes = self
@@ -154,13 +188,38 @@ impl RasAssembler {
             }
         }
 
-        for (patch_offset, target) in &patch_points {
+        for patch in &patch_points {
+            let target = match patch {
+                PatchPoint::X86Rel32 { target, .. }
+                | PatchPoint::Arx64Jal { target, .. }
+                | PatchPoint::Arx64Branch { target, .. } => target,
+            };
             let target_offset = symbol_offsets
                 .get(target)
                 .ok_or_else(|| RasError::EncodingError(format!("Undefined label: {}", target)))?;
-            let rel32 = (*target_offset as i64) - (*patch_offset as i64 + 4);
-            let rel32_bytes = (rel32 as i32).to_le_bytes();
-            code[*patch_offset..*patch_offset + 4].copy_from_slice(&rel32_bytes);
+            match patch {
+                PatchPoint::X86Rel32 { offset, .. } => {
+                    let rel32 = (*target_offset as i64) - (*offset as i64 + 4);
+                    let rel32_bytes = (rel32 as i32).to_le_bytes();
+                    code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
+                }
+                PatchPoint::Arx64Jal { offset, rd, .. } => {
+                    let rel = (*target_offset as i64) - (*offset as i64);
+                    let word = arx64_j_type(rel as i32, *rd);
+                    code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                PatchPoint::Arx64Branch {
+                    offset,
+                    rs1,
+                    rs2,
+                    funct3,
+                    ..
+                } => {
+                    let rel = (*target_offset as i64) - (*offset as i64);
+                    let word = arx64_b_type(rel as i32, *rs2, *rs1, *funct3);
+                    code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
         }
 
         let symbols = lines
@@ -315,16 +374,124 @@ impl RasAssembler {
             TargetArchitecture::Aarch64 => {
                 crate::assembler::aarch64::compile_mir_aarch64_function(self, module, function_name)
             }
-            TargetArchitecture::Riscv64 => {
-                crate::assembler::riscv::compile_mir_riscv_function(self, module, function_name, true)
-            }
-            TargetArchitecture::Riscv32 => {
-                crate::assembler::riscv::compile_mir_riscv_function(self, module, function_name, false)
-            }
+            TargetArchitecture::Riscv64 => crate::assembler::riscv::compile_mir_riscv_function(
+                self,
+                module,
+                function_name,
+                true,
+            ),
+            TargetArchitecture::Riscv32 => crate::assembler::riscv::compile_mir_riscv_function(
+                self,
+                module,
+                function_name,
+                false,
+            ),
             _ => Err(RasError::UnsupportedTarget(format!(
                 "MIR compilation not supported for architecture: {:?}",
                 self.target_arch
             ))),
         }
     }
+}
+
+fn arx64_label_patch(
+    opcode: &str,
+    operands: &[String],
+    offset: usize,
+) -> Result<Option<PatchPoint>, RasError> {
+    match opcode {
+        "j" if operands.len() == 1 && !is_numeric(&operands[0]) => Ok(Some(PatchPoint::Arx64Jal {
+            offset,
+            target: operands[0].trim().to_string(),
+            rd: 0,
+        })),
+        "call" if operands.len() == 1 && !is_numeric(&operands[0]) => {
+            Ok(Some(PatchPoint::Arx64Jal {
+                offset,
+                target: operands[0].trim().to_string(),
+                rd: 1,
+            }))
+        }
+        "jal" if operands.len() == 2 && !is_numeric(&operands[1]) => {
+            Ok(Some(PatchPoint::Arx64Jal {
+                offset,
+                target: operands[1].trim().to_string(),
+                rd: parse_arx64_reg(&operands[0])?,
+            }))
+        }
+        "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+            if operands.len() == 3 && !is_numeric(&operands[2]) =>
+        {
+            Ok(Some(PatchPoint::Arx64Branch {
+                offset,
+                target: operands[2].trim().to_string(),
+                rs1: parse_arx64_reg(&operands[0])?,
+                rs2: parse_arx64_reg(&operands[1])?,
+                funct3: match opcode {
+                    "beq" => 0x0,
+                    "bne" => 0x1,
+                    "blt" => 0x4,
+                    "bge" => 0x5,
+                    "bltu" => 0x6,
+                    "bgeu" => 0x7,
+                    _ => unreachable!(),
+                },
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_numeric(value: &str) -> bool {
+    let value = value.trim();
+    value.parse::<i64>().is_ok()
+        || value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .is_some_and(|hex| i64::from_str_radix(hex, 16).is_ok())
+}
+
+fn parse_arx64_reg(value: &str) -> Result<u8, RasError> {
+    let value = value.trim().trim_start_matches('%');
+    let raw = match value {
+        "zero" => 0,
+        "ra" | "lr" => 1,
+        "sp" => 2,
+        _ => value
+            .strip_prefix('r')
+            .or_else(|| value.strip_prefix('x'))
+            .ok_or_else(|| RasError::EncodingError(format!("Unknown ARX64 register: {}", value)))?
+            .parse::<u8>()
+            .map_err(|_| RasError::EncodingError(format!("Unknown ARX64 register: {}", value)))?,
+    };
+    if raw < 32 {
+        Ok(raw)
+    } else {
+        Err(RasError::EncodingError(format!(
+            "ARX64 register out of range: {}",
+            value
+        )))
+    }
+}
+
+fn arx64_j_type(offset: i32, rd: u8) -> u32 {
+    let o = offset as u32;
+    (((o >> 20) & 0x1) << 31)
+        | (((o >> 1) & 0x03ff) << 21)
+        | (((o >> 11) & 0x1) << 20)
+        | (((o >> 12) & 0xff) << 12)
+        | ((rd as u32) << 7)
+        | 0x6f
+}
+
+fn arx64_b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8) -> u32 {
+    let o = offset as u32;
+    (((o >> 12) & 0x1) << 31)
+        | (((o >> 5) & 0x3f) << 25)
+        | ((rs2 as u32) << 20)
+        | ((rs1 as u32) << 15)
+        | ((funct3 as u32) << 12)
+        | (((o >> 1) & 0x0f) << 8)
+        | (((o >> 11) & 0x1) << 7)
+        | 0x63
 }

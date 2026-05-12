@@ -57,21 +57,8 @@ fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
                     .ok_or_else(|| format!("Missing argument for {}", a))?;
                 i += 2;
             }
-            "--64"
-            | "--32"
-            | "-n"
-            | "-q"
-            | "-s"
-            | "-g"
-            | "-Z"
-            | "-K"
-            | "-Q"
-            | "-k"
-            | "-v"
-            | "-V"
-            | "-w"
-            | "-d"
-            | "-L" => {
+            "--64" | "--32" | "-n" | "-q" | "-s" | "-g" | "-Z" | "-K" | "-Q" | "-k" | "-v"
+            | "-V" | "-w" | "-d" | "-L" => {
                 i += 1;
             }
             a if a.starts_with("-march=")
@@ -110,9 +97,8 @@ fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
         }
     }
 
-    let input_file = Some(
-        input_path.ok_or_else(|| "gnu as compat: missing input .s file".to_string())?,
-    );
+    let input_file =
+        Some(input_path.ok_or_else(|| "gnu as compat: missing input .s file".to_string())?);
     Ok(Options {
         input_file,
         output_file,
