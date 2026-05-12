@@ -278,23 +278,21 @@ mod aarch64_ldr_str_encoder_tests {
     fn encode_ldr_line(base: &str, dst: &str, offset: i32) -> Vec<u8> {
         let mem = format!("[{}, #{}]", base, offset);
         let mut enc = AArch64Encoder::new();
-        enc
-            .encode_instruction(&ParsedInstruction {
-                opcode: "ldr".into(),
-                operands: vec![dst.into(), mem],
-            })
-            .expect("ldr encode")
+        enc.encode_instruction(&ParsedInstruction {
+            opcode: "ldr".into(),
+            operands: vec![dst.into(), mem],
+        })
+        .expect("ldr encode")
     }
 
     fn encode_str_line(base: &str, src: &str, offset: i32) -> Vec<u8> {
         let mem = format!("[{}, #{}]", base, offset);
         let mut enc = AArch64Encoder::new();
-        enc
-            .encode_instruction(&ParsedInstruction {
-                opcode: "str".into(),
-                operands: vec![src.into(), mem],
-            })
-            .expect("str encode")
+        enc.encode_instruction(&ParsedInstruction {
+            opcode: "str".into(),
+            operands: vec![src.into(), mem],
+        })
+        .expect("str encode")
     }
 
     #[test]

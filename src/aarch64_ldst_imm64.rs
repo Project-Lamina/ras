@@ -104,10 +104,7 @@ pub fn encode_ldr_scalar(
                 offset
             )));
         }
-        let sub_inst = SUB_IMM_BASE
-            | ((abs_offset & 0xFFF) << 10)
-            | ((rn as u32) << 5)
-            | TEMP_RN;
+        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
         code.extend_from_slice(&sub_inst.to_le_bytes());
         let ldur = ldur_simm9_base(kind) | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&ldur.to_le_bytes());
@@ -152,10 +149,7 @@ pub fn encode_str_scalar(
                 offset
             )));
         }
-        let sub_inst = SUB_IMM_BASE
-            | ((abs_offset & 0xFFF) << 10)
-            | ((rn as u32) << 5)
-            | TEMP_RN;
+        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
         code.extend_from_slice(&sub_inst.to_le_bytes());
         let stur = stur_simm9_base(kind) | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&stur.to_le_bytes());
@@ -178,8 +172,7 @@ pub fn encode_str_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
     }
     if (0..=(0xFFF * 8)).contains(&offset) && (offset % 8 == 0) {
         let imm12 = (offset as u32) / 8;
-        let inst =
-            STR_SCALED_BASE | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
+        let inst = STR_SCALED_BASE | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
         code.extend_from_slice(&inst.to_le_bytes());
         return Ok(code);
     }
@@ -191,10 +184,7 @@ pub fn encode_str_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
                 offset
             )));
         }
-        let sub_inst = SUB_IMM_BASE
-            | ((abs_offset & 0xFFF) << 10)
-            | ((rn as u32) << 5)
-            | TEMP_RN;
+        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
         code.extend_from_slice(&sub_inst.to_le_bytes());
         let stur = STUR_BASE | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&stur.to_le_bytes());
@@ -217,8 +207,7 @@ pub fn encode_ldr_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
     }
     if (0..=(0xFFF * 8)).contains(&offset) && (offset % 8 == 0) {
         let imm12 = (offset as u32) / 8;
-        let inst =
-            LDR_SCALED_BASE | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
+        let inst = LDR_SCALED_BASE | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
         code.extend_from_slice(&inst.to_le_bytes());
         return Ok(code);
     }
@@ -230,10 +219,7 @@ pub fn encode_ldr_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
                 offset
             )));
         }
-        let sub_inst = SUB_IMM_BASE
-            | ((abs_offset & 0xFFF) << 10)
-            | ((rn as u32) << 5)
-            | TEMP_RN;
+        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
         code.extend_from_slice(&sub_inst.to_le_bytes());
         let ldur = LDUR_BASE | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&ldur.to_le_bytes());
@@ -248,8 +234,8 @@ pub fn encode_ldr_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
 #[cfg(test)]
 mod aarch64_ldst_imm64_tests {
     use super::{
-        encode_ldr_imm64, encode_ldr_scalar, encode_str_imm64, encode_str_scalar,
-        AArch64ScalarLdKind, AArch64ScalarStKind,
+        AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
+        encode_str_imm64, encode_str_scalar,
     };
 
     #[test]
