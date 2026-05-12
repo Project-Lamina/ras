@@ -46,6 +46,7 @@ const ET_REL: u16 = 1;
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
+const EM_ARX64: u16 = 0xa064;
 const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
 const SHT_STRTAB: u32 = 3;
@@ -56,6 +57,7 @@ fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
         TargetArchitecture::X86_64 => Some(EM_X86_64),
         TargetArchitecture::Aarch64 => Some(EM_AARCH64),
+        TargetArchitecture::Arx64 => Some(EM_ARX64),
         TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64 => Some(EM_RISCV),
         _ => None,
     }
@@ -311,15 +313,7 @@ impl ObjectWriter for ElfWriter {
                 info_b.len() as u64,
                 1,
             )?;
-            write_elf64_section_header(
-                &mut f,
-                45,
-                SHT_STRTAB,
-                0,
-                shstrtab_off,
-                shstrtab_size,
-                1,
-            )?;
+            write_elf64_section_header(&mut f, 45, SHT_STRTAB, 0, shstrtab_off, shstrtab_size, 1)?;
 
             let pad = text_size_aligned as usize - code.len();
             f.write_all(code)

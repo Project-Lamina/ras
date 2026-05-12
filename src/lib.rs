@@ -153,4 +153,26 @@ main:
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
+
+    #[test]
+    fn test_assemble_arx64_label_resolution_to_elf() {
+        let asm = r#"
+.text
+.globl main
+main:
+    addi r5, r0, 1
+    j done
+    addi r5, r0, 2
+done:
+    ret
+"#;
+        let mut ras =
+            Ras::new(TargetArchitecture::Arx64, TargetOperatingSystem::Linux).expect("ras new");
+        let path = std::env::temp_dir().join("ras_arx64_label_test.o");
+        ras.assemble(asm, &path).expect("assemble");
+        let buf = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert!(buf.len() >= 64);
+        assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
+    }
 }
