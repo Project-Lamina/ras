@@ -615,9 +615,9 @@ fn imm_as_i64_for_intcmp(imm: &lamina_mir::Immediate) -> Result<i64, RasError> {
         lamina_mir::Immediate::I16(v) => Ok(*v as i64),
         lamina_mir::Immediate::I32(v) => Ok(*v as i64),
         lamina_mir::Immediate::I64(v) => Ok(*v),
-        lamina_mir::Immediate::F32(_) | lamina_mir::Immediate::F64(_) => Err(RasError::EncodingError(
-            "x86_64 JIT IntCmp: floating-point immediate".into(),
-        )),
+        lamina_mir::Immediate::F32(_) | lamina_mir::Immediate::F64(_) => Err(
+            RasError::EncodingError("x86_64 JIT IntCmp: floating-point immediate".into()),
+        ),
     }
 }
 
@@ -630,11 +630,7 @@ fn narrow_imm_i64(bits: u8, raw: i64, signed_style: bool) -> i64 {
     let v = raw & mask;
     if signed_style {
         let sign_bit = 1i64 << (bits_u - 1);
-        if (v & sign_bit) != 0 {
-            v | !mask
-        } else {
-            v
-        }
+        if (v & sign_bit) != 0 { v | !mask } else { v }
     } else {
         v
     }
@@ -684,11 +680,19 @@ fn materialize_int_binop_operand_x86_64(
                 }
                 MirType::Scalar(ScalarType::I32) => encode_mov_r32_mem_rbp(dst_reg_enc, off),
                 MirType::Scalar(ScalarType::I16) => {
-                    let opc = if signed_integral_extend { 0xBFu8 } else { 0xB7u8 };
+                    let opc = if signed_integral_extend {
+                        0xBFu8
+                    } else {
+                        0xB7u8
+                    };
                     encode_mov_rexw_secondary_mem_rbp(dst_reg_enc, off, opc)
                 }
                 MirType::Scalar(ScalarType::I8) => {
-                    let opc = if signed_integral_extend { 0xBEu8 } else { 0xB6u8 };
+                    let opc = if signed_integral_extend {
+                        0xBEu8
+                    } else {
+                        0xB6u8
+                    };
                     encode_mov_rexw_secondary_mem_rbp(dst_reg_enc, off, opc)
                 }
                 MirType::Scalar(ScalarType::I1) => {
@@ -842,13 +846,12 @@ fn store_int_binop_result_x86_64(
     ty: &lamina_mir::MirType,
 ) -> Result<Vec<u8>, RasError> {
     use lamina_mir::{MirType, ScalarType};
-    let off = slots.get(v).copied().ok_or_else(|| {
-        RasError::EncodingError(format!("Missing stack slot for vreg {:?}", v))
-    })?;
+    let off = slots
+        .get(v)
+        .copied()
+        .ok_or_else(|| RasError::EncodingError(format!("Missing stack slot for vreg {:?}", v)))?;
     match ty {
-        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
-            encode_mov_reg_mem_x86_64("rax", off)
-        }
+        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => encode_mov_reg_mem_x86_64("rax", off),
         MirType::Scalar(ScalarType::I32) => encode_mov_r32_reg_mem_rbp(0, off),
         MirType::Scalar(ScalarType::I16) => encode_mov_r16_reg_mem_rbp(0, off),
         MirType::Scalar(ScalarType::I8 | ScalarType::I1) => encode_mov_r8_reg_mem_rbp(0, off),
@@ -1011,11 +1014,7 @@ fn encode_mir_instruction_x86_64(
         lamina_mir::Instruction::Ret { value } => {
             if let Some(v) = value {
                 if let Some(rt) = &func_sig.ret_ty {
-                    code.extend_from_slice(&materialize_return_value_x86_64(
-                        stack_slots,
-                        v,
-                        rt,
-                    )?);
+                    code.extend_from_slice(&materialize_return_value_x86_64(stack_slots, v, rt)?);
                 } else {
                     code.extend_from_slice(&materialize_operand_to_reg(stack_slots, v, "rax")?);
                 }
@@ -1030,8 +1029,7 @@ fn encode_mir_instruction_x86_64(
             ty,
         } => {
             if let Register::Virtual(v) = dst {
-                let unsigned_div_like =
-                    matches!(op, IntBinOp::UDiv | IntBinOp::URem);
+                let unsigned_div_like = matches!(op, IntBinOp::UDiv | IntBinOp::URem);
                 match ty {
                     MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
                         code.extend_from_slice(&materialize_operand_to_reg(
@@ -1077,10 +1075,7 @@ fn encode_mir_instruction_x86_64(
                         code.extend_from_slice(&store_reg_to_vreg(stack_slots, v, "rax")?);
                     }
                     MirType::Scalar(
-                        ScalarType::I32
-                        | ScalarType::I16
-                        | ScalarType::I8
-                        | ScalarType::I1,
+                        ScalarType::I32 | ScalarType::I16 | ScalarType::I8 | ScalarType::I1,
                     ) => {
                         code.extend_from_slice(&materialize_int_binop_operand_x86_64(
                             stack_slots,
@@ -1100,11 +1095,7 @@ fn encode_mir_instruction_x86_64(
                         if matches!(ty, MirType::Scalar(ScalarType::I1)) {
                             code.extend_from_slice(&[0x83, 0xE0, 0x01]);
                         }
-                        code.extend_from_slice(&store_int_binop_result_x86_64(
-                            stack_slots,
-                            v,
-                            ty,
-                        )?);
+                        code.extend_from_slice(&store_int_binop_result_x86_64(stack_slots, v, ty)?);
                     }
                     MirType::Scalar(ScalarType::F32 | ScalarType::F64) => {
                         return Err(RasError::EncodingError(
@@ -1125,11 +1116,7 @@ fn encode_mir_instruction_x86_64(
                 ))
             }
         }
-        lamina_mir::Instruction::Lea {
-            dst,
-            base,
-            offset,
-        } => {
+        lamina_mir::Instruction::Lea { dst, base, offset } => {
             let Register::Virtual(dst_v) = dst else {
                 return Err(RasError::EncodingError(
                     "x86_64 JIT encoder: physical dst for Lea not supported".into(),
@@ -1171,12 +1158,7 @@ fn encode_mir_instruction_x86_64(
         lamina_mir::Instruction::Comment { .. }
         | lamina_mir::Instruction::StackMap { .. }
         | lamina_mir::Instruction::PatchPoint { .. } => Ok(Vec::new()),
-        lamina_mir::Instruction::Load {
-            dst,
-            addr,
-            ty,
-            ..
-        } => {
+        lamina_mir::Instruction::Load { dst, addr, ty, .. } => {
             use lamina_mir::{MirType, ScalarType};
             let Register::Virtual(dst_v) = dst else {
                 return Err(RasError::EncodingError(
@@ -1240,12 +1222,7 @@ fn encode_mir_instruction_x86_64(
             }
             Ok(code)
         }
-        lamina_mir::Instruction::Store {
-            src,
-            addr,
-            ty,
-            ..
-        } => {
+        lamina_mir::Instruction::Store { src, addr, ty, .. } => {
             let st_kind = mir_ty_x86_gp_store_kind(ty)?;
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rbx")?);
             match addr {
@@ -1337,11 +1314,7 @@ fn encode_mir_instruction_x86_64(
                                     }
                                 };
                                 let opc = if bits == 16 {
-                                    if signed_rel {
-                                        0xBFu8
-                                    } else {
-                                        0xB7u8
-                                    }
+                                    if signed_rel { 0xBFu8 } else { 0xB7u8 }
                                 } else if signed_rel {
                                     0xBEu8
                                 } else {
@@ -1465,7 +1438,7 @@ fn encode_mir_instruction_x86_64(
 #[cfg(all(test, feature = "encoder"))]
 mod x86_64_jit_inst_tests {
     use super::compile_mir_x86_64_function;
-    use super::{encode_gp_store_membase_x86_64, encode_mov_r8_reg_mem_rbp, X86GpStoreToMemKind};
+    use super::{X86GpStoreToMemKind, encode_gp_store_membase_x86_64, encode_mov_r8_reg_mem_rbp};
     use crate::assembler::core::RasAssembler;
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};
@@ -1505,11 +1478,8 @@ mod x86_64_jit_inst_tests {
         f.add_block(entry);
         let mut module = Module::new("t");
         module.add_function(f);
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         compile_mir_x86_64_function(&mut asm, &module, None)
             .expect("compile")
             .0
@@ -1541,11 +1511,8 @@ mod x86_64_jit_inst_tests {
         f.add_block(entry);
         let mut module = Module::new("t");
         module.add_function(f);
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         compile_mir_x86_64_function(&mut asm, &module, None)
             .expect("compile")
             .0
@@ -1604,11 +1571,8 @@ mod x86_64_jit_inst_tests {
         let mut module = Module::new("x86_lea_sel");
         module.add_function(f);
 
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         let (code, _) = compile_mir_x86_64_function(&mut asm, &module, None).expect("compile");
         assert!(
             code.len() > 24,
@@ -1630,11 +1594,8 @@ mod x86_64_jit_inst_tests {
         let mut module = Module::new("x86_ud2");
         module.add_function(f);
 
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         let (code, _) = compile_mir_x86_64_function(&mut asm, &module, None).expect("compile");
         assert!(
             code.ends_with(&[0x0F, 0x0B]),
@@ -1676,11 +1637,8 @@ mod x86_64_jit_inst_tests {
         let mut module = Module::new("cmp32_x86");
         module.add_function(f);
 
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         let (code, _) = compile_mir_x86_64_function(&mut asm, &module, None).expect("compile");
         assert!(
             code.len() > 32,
@@ -1719,11 +1677,8 @@ mod x86_64_jit_inst_tests {
         let mut module = Module::new("add32_x86");
         module.add_function(f);
 
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         let (code, _) = compile_mir_x86_64_function(&mut asm, &module, None).expect("compile");
         assert!(
             code.len() >= 32,
@@ -1742,7 +1697,10 @@ mod x86_64_jit_inst_tests {
     #[test]
     fn jit_x86_i32_urem_emits_div_then_mov_eax_edx() {
         let code = compile_single_i32_binop(IntBinOp::URem);
-        assert!(subslice_present(&code, &[0x31, 0xD2, 0xF7, 0xF1, 0x89, 0xD0]));
+        assert!(subslice_present(
+            &code,
+            &[0x31, 0xD2, 0xF7, 0xF1, 0x89, 0xD0]
+        ));
     }
 
     #[test]
@@ -1808,15 +1766,11 @@ mod x86_64_jit_inst_tests {
         f.add_block(entry);
         let mut module = Module::new("add8_x86");
         module.add_function(f);
-        let mut asm = RasAssembler::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        )
-        .expect("assembler");
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
         let (code, _) = compile_mir_x86_64_function(&mut asm, &module, None).expect("compile");
         assert!(
-            subslice_present(&code, &[0x88, 0x45])
-                || subslice_present(&code, &[0x88, 0x85]),
+            subslice_present(&code, &[0x88, 0x45]) || subslice_present(&code, &[0x88, 0x85]),
             "expected 8-bit store 88 /rbp, al in {:?}",
             code
         );

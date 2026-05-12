@@ -333,6 +333,357 @@ impl InstructionEncoder for X86_64Encoder {
                     }
                 }
             }
+            // REX.W 0x99: sign-extend rax into rdx:rax (needed before idivq)
+            "cqto" | "cqo" => {
+                code.push(0x48); // REX.W
+                code.push(0x99);
+            }
+            // REX.W 0x99 for 32-bit sign-extend eax into edx:eax
+            "cdq" => {
+                code.push(0x99);
+            }
+            // idivq %reg: REX.W F7 /7
+            "idivq" | "idiv" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "idivq requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                code.push(self.encode_rex(true, 0, 0, reg >> 3));
+                code.push(0xF7);
+                code.push(0xF8 | (reg & 7)); // ModRM: /7 = 111, mod=11
+            }
+            // divq %reg: REX.W F7 /6 (unsigned divide)
+            "divq" | "div" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "divq requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                code.push(self.encode_rex(true, 0, 0, reg >> 3));
+                code.push(0xF7);
+                code.push(0xF0 | (reg & 7)); // ModRM: /6 = 110, mod=11
+            }
+            // xorq reg, reg
+            "xorq" | "xor" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "xorq requires 2 operands".to_string(),
+                    ));
+                }
+                let dst = self.parse_register(&inst.operands[0])?;
+                let src = self.parse_register(&inst.operands[1])?;
+                code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                code.push(0x31);
+                code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
+            }
+            // andq reg/imm, reg
+            "andq" | "and" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "andq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let b = &inst.operands[1];
+                if a.starts_with('$') {
+                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for andq".to_string())
+                    })?;
+                    let dst = self.parse_register(b)?;
+                    if (-128..=127).contains(&imm) {
+                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                        code.push(0x83);
+                        code.push(0xE0 | (dst & 7)); // /4
+                        code.push(imm as u8);
+                    } else {
+                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                        code.push(0x81);
+                        code.push(0xE0 | (dst & 7));
+                        code.extend_from_slice(&imm.to_le_bytes());
+                    }
+                } else {
+                    let dst = self.parse_register(a)?;
+                    let src = self.parse_register(b)?;
+                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                    code.push(0x21);
+                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
+                }
+            }
+            // orq reg/imm, reg
+            "orq" | "or" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "orq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let b = &inst.operands[1];
+                if a.starts_with('$') {
+                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for orq".to_string())
+                    })?;
+                    let dst = self.parse_register(b)?;
+                    if (-128..=127).contains(&imm) {
+                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                        code.push(0x83);
+                        code.push(0xC8 | (dst & 7)); // /1
+                        code.push(imm as u8);
+                    } else {
+                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                        code.push(0x81);
+                        code.push(0xC8 | (dst & 7));
+                        code.extend_from_slice(&imm.to_le_bytes());
+                    }
+                } else {
+                    let dst = self.parse_register(a)?;
+                    let src = self.parse_register(b)?;
+                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                    code.push(0x09);
+                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
+                }
+            }
+            // sarq / salq / shrq / shlq (shift instructions)
+            "sarq" | "sar" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "sarq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let dst = self.parse_register(&inst.operands[1])?;
+                if a.starts_with('$') {
+                    let imm: u8 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for sarq".to_string())
+                    })?;
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xC1);
+                    code.push(0xF8 | (dst & 7)); // /7
+                    code.push(imm);
+                } else if a == "%cl" || a == "cl" {
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xD3);
+                    code.push(0xF8 | (dst & 7));
+                } else {
+                    return Err(RasError::EncodingError(
+                        "sarq: unsupported shift source".to_string(),
+                    ));
+                }
+            }
+            "shlq" | "salq" | "shl" | "sal" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "shlq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let dst = self.parse_register(&inst.operands[1])?;
+                if a.starts_with('$') {
+                    let imm: u8 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for shlq".to_string())
+                    })?;
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xC1);
+                    code.push(0xE0 | (dst & 7)); // /4
+                    code.push(imm);
+                } else if a == "%cl" || a == "cl" {
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xD3);
+                    code.push(0xE0 | (dst & 7));
+                } else {
+                    return Err(RasError::EncodingError(
+                        "shlq: unsupported shift source".to_string(),
+                    ));
+                }
+            }
+            "shrq" | "shr" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "shrq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let dst = self.parse_register(&inst.operands[1])?;
+                if a.starts_with('$') {
+                    let imm: u8 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for shrq".to_string())
+                    })?;
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xC1);
+                    code.push(0xE8 | (dst & 7)); // /5
+                    code.push(imm);
+                } else if a == "%cl" || a == "cl" {
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xD3);
+                    code.push(0xE8 | (dst & 7));
+                } else {
+                    return Err(RasError::EncodingError(
+                        "shrq: unsupported shift source".to_string(),
+                    ));
+                }
+            }
+            // cmpq: compare two values (sets flags)
+            "cmpq" | "cmp" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "cmpq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let b = &inst.operands[1];
+                let dst = self.parse_register(b)?;
+                if a.starts_with('$') {
+                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for cmpq".to_string())
+                    })?;
+                    if (-128..=127).contains(&imm) {
+                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                        code.push(0x83);
+                        code.push(0xF8 | (dst & 7)); // /7
+                        code.push(imm as u8);
+                    } else {
+                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                        code.push(0x81);
+                        code.push(0xF8 | (dst & 7));
+                        code.extend_from_slice(&imm.to_le_bytes());
+                    }
+                } else {
+                    let src = self.parse_register(a)?;
+                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                    code.push(0x3B);
+                    code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
+                }
+            }
+            // testq: bitwise AND without storing result (sets flags)
+            "testq" | "test" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "testq requires 2 operands".to_string(),
+                    ));
+                }
+                let a = &inst.operands[0];
+                let b = &inst.operands[1];
+                if a.starts_with('$') {
+                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
+                        RasError::EncodingError("Invalid immediate for testq".to_string())
+                    })?;
+                    let dst = self.parse_register(b)?;
+                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
+                    code.push(0xF7);
+                    code.push(0xC0 | (dst & 7)); // /0
+                    code.extend_from_slice(&imm.to_le_bytes());
+                } else {
+                    let dst = self.parse_register(a)?;
+                    let src = self.parse_register(b)?;
+                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                    code.push(0x85);
+                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
+                }
+            }
+            // SETcc instructions (byte result from flags)
+            "sete" | "setz" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "sete requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                } // REX prefix for spl/bpl/sil/dil and r8b-r15b
+                code.push(0x0F);
+                code.push(0x94);
+                code.push(0xC0 | (reg & 7));
+            }
+            "setne" | "setnz" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "setne requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
+                code.push(0x0F);
+                code.push(0x95);
+                code.push(0xC0 | (reg & 7));
+            }
+            "setl" | "setnge" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "setl requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
+                code.push(0x0F);
+                code.push(0x9C);
+                code.push(0xC0 | (reg & 7));
+            }
+            "setle" | "setng" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "setle requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
+                code.push(0x0F);
+                code.push(0x9E);
+                code.push(0xC0 | (reg & 7));
+            }
+            "setg" | "setnle" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "setg requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
+                code.push(0x0F);
+                code.push(0x9F);
+                code.push(0xC0 | (reg & 7));
+            }
+            "setge" | "setnl" => {
+                if inst.operands.len() != 1 {
+                    return Err(RasError::EncodingError(
+                        "setge requires 1 operand".to_string(),
+                    ));
+                }
+                let reg = self.parse_register(&inst.operands[0])?;
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
+                code.push(0x0F);
+                code.push(0x9D);
+                code.push(0xC0 | (reg & 7));
+            }
+            // movzbq: zero-extend byte to 64-bit
+            "movzbq" | "movzbl" | "movzx" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "movzbq requires 2 operands".to_string(),
+                    ));
+                }
+                let src_str = &inst.operands[0];
+                let dst_str = &inst.operands[1];
+                let src = self.parse_register(src_str)?;
+                let dst = self.parse_register(dst_str)?;
+                // REX.W 0F B6 /r
+                code.push(self.encode_rex(true, dst >> 3, 0, src >> 3));
+                code.push(0x0F);
+                code.push(0xB6);
+                code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
+            }
             _ => {
                 return Err(RasError::EncodingError(format!(
                     "Unsupported instruction: {}",
