@@ -6,6 +6,17 @@ pub fn is_assembly_target_supported(arch: TargetArchitecture, os: TargetOperatin
     if !is_arch_encoded(arch) {
         return false;
     }
+    if arch == TargetArchitecture::Arx64 {
+        return matches!(
+            os,
+            TargetOperatingSystem::Linux
+                | TargetOperatingSystem::FreeBSD
+                | TargetOperatingSystem::OpenBSD
+                | TargetOperatingSystem::NetBSD
+                | TargetOperatingSystem::DragonFly
+                | TargetOperatingSystem::Redox
+        );
+    }
     matches!(
         os,
         TargetOperatingSystem::Linux
@@ -23,8 +34,22 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
     if !is_arch_encoded(arch) {
         return false;
     }
+    if arch == TargetArchitecture::Arx64 {
+        return matches!(
+            os,
+            TargetOperatingSystem::Linux
+                | TargetOperatingSystem::FreeBSD
+                | TargetOperatingSystem::OpenBSD
+                | TargetOperatingSystem::NetBSD
+                | TargetOperatingSystem::DragonFly
+                | TargetOperatingSystem::Redox
+        );
+    }
     // RISC-V is only relevant on Linux/BSD (no macOS/Windows RISC-V targets)
-    if matches!(arch, TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64) {
+    if matches!(
+        arch,
+        TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+    ) {
         return matches!(
             os,
             TargetOperatingSystem::Linux
@@ -51,9 +76,7 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
 pub fn is_jit_arch_supported(arch: TargetArchitecture) -> bool {
     matches!(
         arch,
-        TargetArchitecture::X86_64
-            | TargetArchitecture::Aarch64
-            | TargetArchitecture::Riscv64
+        TargetArchitecture::X86_64 | TargetArchitecture::Aarch64 | TargetArchitecture::Riscv64
     )
 }
 
@@ -62,6 +85,7 @@ fn is_arch_encoded(arch: TargetArchitecture) -> bool {
         arch,
         TargetArchitecture::X86_64
             | TargetArchitecture::Aarch64
+            | TargetArchitecture::Arx64
             | TargetArchitecture::Riscv32
             | TargetArchitecture::Riscv64
     )
@@ -74,6 +98,12 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
             arch
         )
     } else if !is_assembly_target_supported(arch, os) {
+        if arch == TargetArchitecture::Arx64 {
+            return format!(
+                "OS {:?} not supported for ARX64 ras output. Supported: Linux, FreeBSD, OpenBSD, NetBSD, DragonFly, Redox.",
+                os
+            );
+        }
         format!(
             "OS {:?} not supported. Supported: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, Redox.",
             os
@@ -84,7 +114,7 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
 }
 
 pub fn supported_jit_targets_hint() -> &'static str {
-    "JIT emits machine code for x86_64, AArch64, and RISC-V 64 (integer-focused MIR subset; see ras assembler JIT)."
+    "JIT emits machine code for x86_64, AArch64, and RISC-V 64 (integer-focused MIR subset; see ras assembler JIT). ARX64 supports assembly/object emission only."
 }
 
 #[cfg(test)]
