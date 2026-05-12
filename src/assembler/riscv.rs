@@ -312,7 +312,11 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
 
         // Lower 32 into rd
         let lo_lower = lo32 & 0xFFF;
-        let lo_lower_sext = if lo_lower >= 2048 { lo_lower - 4096 } else { lo_lower };
+        let lo_lower_sext = if lo_lower >= 2048 {
+            lo_lower - 4096
+        } else {
+            lo_lower
+        };
         let lo_upper = (lo32 - lo_lower_sext + (1 << 11)) >> 12;
         if lo_upper != 0 {
             code.extend_from_slice(&emit_lui(rd, lo_upper));
@@ -325,7 +329,11 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
 
         // Upper 32 into t2 (x7)
         let hi_lower = hi32 & 0xFFF;
-        let hi_lower_sext = if hi_lower >= 2048 { hi_lower - 4096 } else { hi_lower };
+        let hi_lower_sext = if hi_lower >= 2048 {
+            hi_lower - 4096
+        } else {
+            hi_lower
+        };
         let hi_upper = (hi32 - hi_lower_sext + (1 << 11)) >> 12;
         if hi_upper != 0 {
             code.extend_from_slice(&emit_lui(REG_T2, hi_upper));
@@ -338,8 +346,8 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
 
         // rd = (t2 << 32) | rd
         // slli t2, t2, 32
-        let slli_w: u32 = ((32u32) << 20) | ((REG_T2 as u32) << 15) | (0x1 << 12)
-            | ((REG_T2 as u32) << 7) | 0x13;
+        let slli_w: u32 =
+            ((32u32) << 20) | ((REG_T2 as u32) << 15) | (0x1 << 12) | ((REG_T2 as u32) << 7) | 0x13;
         code.extend_from_slice(&slli_w.to_le_bytes());
         code.extend_from_slice(&emit_or(rd, REG_T2, rd));
     }
@@ -544,7 +552,13 @@ fn encode_instruction(
 
     match inst {
         // ---- IntBinary ----
-        Instruction::IntBinary { op, ty, dst, lhs, rhs } => {
+        Instruction::IntBinary {
+            op,
+            ty,
+            dst,
+            lhs,
+            rhs,
+        } => {
             let is_i32 = matches!(ty, MirType::Scalar(ScalarType::I32));
 
             materialize_operand(code, lhs, REG_T0, stack_slots, rv64)?;
@@ -606,7 +620,13 @@ fn encode_instruction(
         }
 
         // ---- IntCmp ----
-        Instruction::IntCmp { op, ty: _, dst, lhs, rhs } => {
+        Instruction::IntCmp {
+            op,
+            ty: _,
+            dst,
+            lhs,
+            rhs,
+        } => {
             materialize_operand(code, lhs, REG_T0, stack_slots, rv64)?;
             materialize_operand(code, rhs, REG_T1, stack_slots, rv64)?;
 
@@ -692,7 +712,11 @@ fn encode_instruction(
         }
 
         // ---- Br ----
-        Instruction::Br { cond, true_target, false_target } => {
+        Instruction::Br {
+            cond,
+            true_target,
+            false_target,
+        } => {
             // Load condition register into t0
             use lamina_mir::Operand as Op;
             let cond_operand = Op::Register(cond.clone());
@@ -738,8 +762,7 @@ fn encode_instruction(
             for (i, arg) in args.iter().enumerate() {
                 if i >= ARG_REGS.len() {
                     return Err(RasError::EncodingError(
-                        "RISC-V JIT: more than 8 tail-call arguments not yet supported"
-                            .to_string(),
+                        "RISC-V JIT: more than 8 tail-call arguments not yet supported".to_string(),
                     ));
                 }
                 materialize_operand(code, arg, ARG_REGS[i], stack_slots, rv64)?;
@@ -778,9 +801,9 @@ fn encode_instruction(
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BranchFixupOp {
-    Jal,    // JAL x0, offset  (unconditional, offset in J-type)
-    JalRa,  // JAL ra, offset  (call, offset in J-type)
-    Bne,    // BNE rs1, x0, offset  (rs1 already baked in the placeholder)
+    Jal,   // JAL x0, offset  (unconditional, offset in J-type)
+    JalRa, // JAL ra, offset  (call, offset in J-type)
+    Bne,   // BNE rs1, x0, offset  (rs1 already baked in the placeholder)
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +844,11 @@ pub fn compile_mir_riscv_function(
     let reserve: usize = functions_to_compile
         .iter()
         .map(|(_, f)| {
-            128 + f.blocks.iter().map(|b| b.instructions.len() * 12).sum::<usize>()
+            128 + f
+                .blocks
+                .iter()
+                .map(|b| b.instructions.len() * 12)
+                .sum::<usize>()
         })
         .sum::<usize>()
         .max(256);

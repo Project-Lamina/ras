@@ -144,8 +144,8 @@ impl ExecutableMemory {
             // the newly written code after the page protection change.
             #[cfg(target_arch = "aarch64")]
             unsafe {
-                use winapi::um::processthreadsapi::GetCurrentProcess;
                 use winapi::um::processthreadsapi::FlushInstructionCache;
+                use winapi::um::processthreadsapi::GetCurrentProcess;
                 FlushInstructionCache(
                     GetCurrentProcess(),
                     self.ptr as *const winapi::ctypes::c_void,
@@ -227,10 +227,7 @@ impl ExecutableMemory {
     /// The caller must ensure `F` matches the ABI and signature of the generated code, and that
     /// this `ExecutableMemory` outlives every call through `F`.
     pub unsafe fn entry_fn<F: Sized>(&self) -> F {
-        debug_assert_eq!(
-            core::mem::size_of::<F>(),
-            core::mem::size_of::<*mut u8>()
-        );
+        debug_assert_eq!(core::mem::size_of::<F>(), core::mem::size_of::<*mut u8>());
         unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 }
@@ -329,16 +326,16 @@ mod tests {
         // the next allocation produces a 4096-byte region, then try to write 8192.
         let mem = ExecutableMemory::allocate_writable(4096).expect("alloc failed");
         let big = vec![0u8; 8192];
-        let result = { let mut m = mem; m.write_code(&big) };
+        let result = {
+            let mut m = mem;
+            m.write_code(&big)
+        };
         assert!(result.is_err(), "writing beyond capacity should fail");
     }
 
     #[test]
     fn ras_runtime_new_does_not_panic() {
-        let _rt = RasRuntime::new(
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-        );
+        let _rt = RasRuntime::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux);
     }
 }
 
@@ -413,12 +410,7 @@ mod jit_host_exec_tests {
         Operand::Immediate(Immediate::I64(v))
     }
 
-    fn module_scalar_binop(
-        scalar: ScalarType,
-        op: IntBinOp,
-        lhs: Operand,
-        rhs: Operand,
-    ) -> Module {
+    fn module_scalar_binop(scalar: ScalarType, op: IntBinOp, lhs: Operand, rhs: Operand) -> Module {
         let ty = MirType::Scalar(scalar);
         let out = Register::Virtual(VirtualReg::gpr(0));
         let sig = Signature::new("f").with_return(ty.clone());
