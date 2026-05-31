@@ -11,6 +11,16 @@ use crate::parser::{AssemblyParser, Line};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
 
+#[cfg(windows)]
+mod windows_loader {
+    use std::ffi::{c_char, c_void};
+
+    unsafe extern "system" {
+        pub fn GetModuleHandleA(module_name: *const c_char) -> *mut c_void;
+        pub fn GetProcAddress(module: *mut c_void, proc_name: *const c_char) -> *mut c_void;
+    }
+}
+
 /// Assembler: converts assembly text to object files
 pub struct RasAssembler {
     pub(crate) target_arch: TargetArchitecture,
@@ -308,7 +318,7 @@ impl RasAssembler {
         #[cfg(windows)]
         {
             use std::ffi::CString;
-            use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+            use windows_loader::{GetModuleHandleA, GetProcAddress};
 
             let module = unsafe { GetModuleHandleA(b"msvcrt.dll\0".as_ptr() as *const i8) };
             if module.is_null() {

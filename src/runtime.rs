@@ -3,6 +3,42 @@
 use crate::error::RasError;
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
+#[cfg(windows)]
+mod windows_memory {
+    use std::ffi::c_void;
+
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RELEASE: u32 = 0x8000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const PAGE_EXECUTE_READ: u32 = 0x20;
+    pub const PAGE_READWRITE: u32 = 0x04;
+
+    unsafe extern "system" {
+        pub fn VirtualAlloc(
+            address: *mut c_void,
+            size: usize,
+            allocation_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        pub fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+        pub fn VirtualProtect(
+            address: *mut c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+
+        #[cfg(target_arch = "aarch64")]
+        pub fn FlushInstructionCache(
+            process: *mut c_void,
+            base_address: *const c_void,
+            size: usize,
+        ) -> i32;
+        #[cfg(target_arch = "aarch64")]
+        pub fn GetCurrentProcess() -> *mut c_void;
+    }
+}
+
 #[cfg(feature = "encoder")]
 use crate::assembler::RasAssembler;
 
@@ -59,8 +95,9 @@ impl ExecutableMemory {
 
         #[cfg(windows)]
         {
-            use winapi::um::memoryapi::VirtualAlloc;
-            use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+            use crate::runtime::windows_memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
 
             let ptr = unsafe {
                 VirtualAlloc(
@@ -123,13 +160,12 @@ impl ExecutableMemory {
 
         #[cfg(windows)]
         {
-            use winapi::um::memoryapi::VirtualProtect;
-            use winapi::um::winnt::PAGE_EXECUTE_READ;
+            use crate::runtime::windows_memory::{PAGE_EXECUTE_READ, VirtualProtect};
 
-            let mut old_protect: winapi::um::winnt::DWORD = 0;
+            let mut old_protect = 0;
             let result = unsafe {
                 VirtualProtect(
-                    self.ptr as *mut winapi::um::winnt::c_void,
+                    self.ptr.cast(),
                     self.size,
                     PAGE_EXECUTE_READ,
                     &mut old_protect,
@@ -144,11 +180,10 @@ impl ExecutableMemory {
             // the newly written code after the page protection change.
             #[cfg(target_arch = "aarch64")]
             unsafe {
-                use winapi::um::processthreadsapi::FlushInstructionCache;
-                use winapi::um::processthreadsapi::GetCurrentProcess;
+                use crate::runtime::windows_memory::{FlushInstructionCache, GetCurrentProcess};
                 FlushInstructionCache(
                     GetCurrentProcess(),
-                    self.ptr as *const winapi::ctypes::c_void,
+                    self.ptr.cast(),
                     self.size,
                 );
             }
@@ -244,10 +279,9 @@ impl Drop for ExecutableMemory {
 
         #[cfg(windows)]
         {
-            use winapi::um::memoryapi::VirtualFree;
-            use winapi::um::winnt::MEM_RELEASE;
+            use crate::runtime::windows_memory::{MEM_RELEASE, VirtualFree};
             unsafe {
-                VirtualFree(self.ptr as *mut winapi::um::winnt::c_void, 0, MEM_RELEASE);
+                VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);
             }
         }
     }
