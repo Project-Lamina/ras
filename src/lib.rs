@@ -155,6 +155,29 @@ main:
     }
 
     #[test]
+    fn test_assemble_rip_relative_lea_label() {
+        // Verify that `leaq label(%rip), %reg` with an .asciz data label assembles
+        // without error and that the RIP-relative displacement is correct.
+        let asm = r#"
+.section .rodata
+.L_fmt: .asciz "%lld\n"
+.text
+.globl get_fmt
+get_fmt:
+    leaq .L_fmt(%rip), %rax
+    ret
+"#;
+        let mut ras =
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
+        let path = std::env::temp_dir().join("ras_rip_rel_test.o");
+        ras.assemble(asm, &path).expect("assemble should succeed");
+        let buf = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        // Must be a valid ELF file
+        assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
+    }
+
+    #[test]
     fn test_assemble_arx64_label_resolution_to_elf() {
         let asm = r#"
 .text

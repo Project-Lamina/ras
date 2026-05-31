@@ -38,6 +38,10 @@ enum PatchPoint {
         offset: usize,
         target: String,
     },
+    X86RipRel32 {
+        offset: usize,
+        target: String,
+    },
     Arx64Jal {
         offset: usize,
         target: String,
@@ -151,6 +155,10 @@ impl RasAssembler {
                 Line::Label(sym) => {
                     symbol_offsets.insert(sym.name.clone(), current_offset);
                 }
+                Line::Data(bytes) => {
+                    code.extend_from_slice(bytes);
+                    current_offset += bytes.len();
+                }
                 Line::Instruction(inst) => {
                     let opcode = inst.opcode.to_lowercase();
                     let is_jmp_call = opcode == "jmp" || opcode == "jmpq" || opcode == "call";
@@ -164,6 +172,28 @@ impl RasAssembler {
                             current_offset += 4;
                             continue;
                         }
+
+                    // Handle leaq/lea with RIP-relative label: "leaq label(%rip), %reg"
+                    if self.target_arch == TargetArchitecture::X86_64
+                        && (opcode == "leaq" || opcode == "lea")
+                        && inst.operands.len() == 2
+                    {
+                        if let Some(label) = extract_rip_label(inst.operands[0].trim()) {
+                            let reg = parse_x86_reg(inst.operands[1].trim()).map_err(|e| {
+                                RasError::EncodingError(e.to_string())
+                            })?;
+                            // REX.W=1, REX.R set if reg>=8; opcode=0x8D; ModRM Mod=00 R/M=101(RIP-rel)
+                            let rex: u8 = 0x48 | ((reg >> 3) << 2);
+                            let modrm: u8 = ((reg & 7) << 3) | 5;
+                            code.extend_from_slice(&[rex, 0x8D, modrm, 0, 0, 0, 0]);
+                            patch_points.push(PatchPoint::X86RipRel32 {
+                                offset: current_offset + 3,
+                                target: label.to_string(),
+                            });
+                            current_offset += 7;
+                            continue;
+                        }
+                    }
 
                     if is_jmp_call && inst.operands.len() == 1 {
                         let target = inst.operands[0].trim();
@@ -200,6 +230,7 @@ impl RasAssembler {
         for patch in &patch_points {
             let target = match patch {
                 PatchPoint::X86Rel32 { target, .. }
+                | PatchPoint::X86RipRel32 { target, .. }
                 | PatchPoint::Arx64Jal { target, .. }
                 | PatchPoint::Arx64Branch { target, .. } => target,
             };
@@ -207,7 +238,7 @@ impl RasAssembler {
                 .get(target)
                 .ok_or_else(|| RasError::EncodingError(format!("Undefined label: {}", target)))?;
             match patch {
-                PatchPoint::X86Rel32 { offset, .. } => {
+                PatchPoint::X86Rel32 { offset, .. } | PatchPoint::X86RipRel32 { offset, .. } => {
                     let rel32 = (*target_offset as i64) - (*offset as i64 + 4);
                     let rel32_bytes = (rel32 as i32).to_le_bytes();
                     code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
@@ -508,4 +539,49 @@ fn arx64_b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8) -> u32 {
         | (((o >> 1) & 0x0f) << 8)
         | (((o >> 11) & 0x1) << 7)
         | 0x63
+}
+
+/// Returns the label name if `op` has the form `label(%rip)` (RIP-relative addressing).
+fn extract_rip_label(op: &str) -> Option<&str> {
+    let paren = op.find('(')?;
+    let close = op.find(')')?;
+    if close <= paren {
+        return None;
+    }
+    let base = op[paren + 1..close].trim().trim_start_matches('%');
+    if !base.eq_ignore_ascii_case("rip") {
+        return None;
+    }
+    let label = op[..paren].trim();
+    // Must be a non-empty label name (not a numeric displacement)
+    if label.is_empty() || label.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+        return None;
+    }
+    Some(label)
+}
+
+fn parse_x86_reg(s: &str) -> Result<u8, crate::error::RasError> {
+    let s = s.trim().trim_start_matches('%');
+    match s {
+        "rax" | "eax" => Ok(0),
+        "rcx" | "ecx" => Ok(1),
+        "rdx" | "edx" => Ok(2),
+        "rbx" | "ebx" => Ok(3),
+        "rsp" | "esp" => Ok(4),
+        "rbp" | "ebp" => Ok(5),
+        "rsi" | "esi" => Ok(6),
+        "rdi" | "edi" => Ok(7),
+        "r8" => Ok(8),
+        "r9" => Ok(9),
+        "r10" => Ok(10),
+        "r11" => Ok(11),
+        "r12" => Ok(12),
+        "r13" => Ok(13),
+        "r14" => Ok(14),
+        "r15" => Ok(15),
+        _ => Err(crate::error::RasError::EncodingError(format!(
+            "Unknown x86 register: {}",
+            s
+        ))),
+    }
 }
