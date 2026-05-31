@@ -155,8 +155,8 @@ impl RasAssembler {
                     let opcode = inst.opcode.to_lowercase();
                     let is_jmp_call = opcode == "jmp" || opcode == "jmpq" || opcode == "call";
 
-                    if self.target_arch == TargetArchitecture::Arx64 {
-                        if let Some(patch) =
+                    if self.target_arch == TargetArchitecture::Arx64
+                        && let Some(patch) =
                             arx64_label_patch(&opcode, &inst.operands, current_offset)?
                         {
                             code.extend_from_slice(&[0u8; 4]);
@@ -164,7 +164,6 @@ impl RasAssembler {
                             current_offset += 4;
                             continue;
                         }
-                    }
 
                     if is_jmp_call && inst.operands.len() == 1 {
                         let target = inst.operands[0].trim();
@@ -325,7 +324,7 @@ impl RasAssembler {
             use std::ffi::CString;
             use windows_loader::{GetModuleHandleA, GetProcAddress};
 
-            let module = unsafe { GetModuleHandleA(b"msvcrt.dll\0".as_ptr() as *const i8) };
+            let module = unsafe { GetModuleHandleA(c"msvcrt.dll".as_ptr() as *const i8) };
             if module.is_null() {
                 return Err(RasError::EncodingError(
                     "Failed to get msvcrt.dll handle".to_string(),

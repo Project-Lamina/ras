@@ -760,7 +760,7 @@ fn aarch64_apply_i32_offset_to_reg(
         code.extend_from_slice(&inst.to_le_bytes());
         return Ok(());
     }
-    if o < 0 && o >= -4096 {
+    if (-4096..0).contains(&o) {
         let imm = (-o) as u32;
         let inst =
             0xD100_0000u32 | ((imm & 0xFFF) << 10) | ((base_reg as u32) << 5) | (base_reg as u32);
@@ -1697,7 +1697,7 @@ fn encode_mir_instruction_aarch64_with_context(
             if let Register::Virtual(vreg) = dst
                 && let Some(offset) = stack_slots.get(vreg)
             {
-                code.extend_from_slice(&encode_str_typed_aarch64(dst_reg_str, 29, *offset, &ty)?);
+                code.extend_from_slice(&encode_str_typed_aarch64(dst_reg_str, 29, *offset, ty)?);
             }
 
             reg_alloc.free_scratch(lhs_reg_str);
