@@ -3,7 +3,7 @@
 use crate::error::RasError;
 #[cfg(test)]
 use crate::parser::SectionFlags;
-use crate::parser::{Section, Symbol};
+use crate::parser::Section;
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::io::Write;
 
@@ -25,6 +25,16 @@ impl Default for ObjectWriteOptions {
     }
 }
 
+/// A symbol with its resolved offset within its defining section, ready for the
+/// object file symbol table. Built by the assembler after two-pass resolution.
+#[derive(Debug, Clone)]
+pub struct ObjectSymbol {
+    pub name: String,
+    pub global: bool,
+    pub section: String,
+    pub value: u64,
+}
+
 pub trait ObjectWriter {
     #[allow(clippy::too_many_arguments)]
     fn write_object_file(
@@ -32,7 +42,7 @@ pub trait ObjectWriter {
         path: &std::path::Path,
         code: &[u8],
         sections: &[Section],
-        symbols: &[Symbol],
+        symbols: &[ObjectSymbol],
         target_arch: TargetArchitecture,
         target_os: TargetOperatingSystem,
         opts: &ObjectWriteOptions,
@@ -49,9 +59,15 @@ const EM_RISCV: u16 = 243;
 const EM_ARX64: u16 = 0xa064;
 const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
+const ELF64_SYM_SIZE: u64 = 24;
+const STB_LOCAL: u8 = 0;
+const STB_GLOBAL: u8 = 1;
+const STT_FUNC: u8 = 2;
+const TEXT_SECTION_INDEX: u16 = 1;
 
 fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
@@ -221,6 +237,107 @@ fn write_elf64_section_header<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_elf64_section_header_full<W: Write>(
+    w: &mut W,
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+) -> Result<(), RasError> {
+    let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
+    w.write_all(&sh_name.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_type.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_flags.to_le_bytes()).map_err(map)?;
+    w.write_all(&0u64.to_le_bytes()).map_err(map)?; // sh_addr
+    w.write_all(&sh_offset.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_size.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_link.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_info.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_addralign.to_le_bytes()).map_err(map)?;
+    w.write_all(&sh_entsize.to_le_bytes()).map_err(map)?;
+    Ok(())
+}
+
+fn write_elf64_symbol<W: Write>(
+    w: &mut W,
+    name_offset: u32,
+    bind: u8,
+    sym_type: u8,
+    section_index: u16,
+    value: u64,
+) -> Result<(), RasError> {
+    let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
+    w.write_all(&name_offset.to_le_bytes()).map_err(map)?;
+    w.write_all(&[(bind << 4) | (sym_type & 0xf)]).map_err(map)?;
+    w.write_all(&[0u8]).map_err(map)?; // st_other
+    w.write_all(&section_index.to_le_bytes()).map_err(map)?;
+    w.write_all(&value.to_le_bytes()).map_err(map)?;
+    w.write_all(&0u64.to_le_bytes()).map_err(map)?; // st_size
+    Ok(())
+}
+
+/// Symbols defined in `.text` that should appear in the object symbol table.
+/// Assembler-internal labels (`.L*`) are dropped, matching gas behavior.
+/// Locals are returned before globals so the symbol table satisfies the ELF
+/// requirement that `sh_info` marks the first global symbol.
+fn linkable_text_symbols(symbols: &[ObjectSymbol]) -> (Vec<&ObjectSymbol>, Vec<&ObjectSymbol>) {
+    let mut locals = Vec::new();
+    let mut globals = Vec::new();
+    for symbol in symbols {
+        if symbol.section != ".text" || symbol.name.starts_with(".L") {
+            continue;
+        }
+        if symbol.global {
+            globals.push(symbol);
+        } else {
+            locals.push(symbol);
+        }
+    }
+    (locals, globals)
+}
+
+/// Builds the `.symtab` bytes (leading null entry + locals + globals) and the
+/// matching `.strtab`. Returns the byte buffers and the index of the first
+/// global symbol for the section header's `sh_info`.
+fn build_symtab_and_strtab(symbols: &[ObjectSymbol]) -> (Vec<u8>, Vec<u8>, u32) {
+    let (locals, globals) = linkable_text_symbols(symbols);
+
+    let mut strtab = vec![0u8];
+    let mut symtab = vec![0u8; ELF64_SYM_SIZE as usize]; // null symbol
+
+    let push_symbol = |symtab: &mut Vec<u8>, strtab: &mut Vec<u8>, sym: &ObjectSymbol, bind: u8| {
+        let name_offset = strtab.len() as u32;
+        strtab.extend_from_slice(sym.name.as_bytes());
+        strtab.push(0);
+        let mut entry = Vec::new();
+        let _ = write_elf64_symbol(
+            &mut entry,
+            name_offset,
+            bind,
+            STT_FUNC,
+            TEXT_SECTION_INDEX,
+            sym.value,
+        );
+        symtab.extend_from_slice(&entry);
+    };
+
+    for sym in &locals {
+        push_symbol(&mut symtab, &mut strtab, sym, STB_LOCAL);
+    }
+    let first_global_index = 1 + locals.len() as u32;
+    for sym in &globals {
+        push_symbol(&mut symtab, &mut strtab, sym, STB_GLOBAL);
+    }
+
+    (symtab, strtab, first_global_index)
+}
+
 pub struct ElfWriter;
 
 impl Default for ElfWriter {
@@ -241,7 +358,7 @@ impl ObjectWriter for ElfWriter {
         path: &std::path::Path,
         code: &[u8],
         _sections: &[Section],
-        _symbols: &[Symbol],
+        symbols: &[ObjectSymbol],
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         opts: &ObjectWriteOptions,
@@ -333,26 +450,74 @@ impl ObjectWriter for ElfWriter {
             return Ok(());
         }
 
+        // Section layout: [0] NULL, [1] .text, [2] .symtab, [3] .strtab, [4] .shstrtab.
+        let (symtab_bytes, strtab_bytes, first_global_index) = build_symtab_and_strtab(symbols);
+
+        const SHSTRTAB: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+        const NAME_TEXT: u32 = 1;
+        const NAME_SYMTAB: u32 = 7;
+        const NAME_STRTAB: u32 = 15;
+        const NAME_SHSTRTAB: u32 = 23;
+        const STRTAB_SECTION_INDEX: u32 = 3;
+
+        let section_count = 5u16;
+        let shstrtab_index = 4u16;
         let shoff = ELF64_HEADER_SIZE as u64;
-        let text_offset = shoff + 3 * ELF64_SECTION_HEADER_SIZE as u64;
+        let text_offset = shoff + u64::from(section_count) * ELF64_SECTION_HEADER_SIZE as u64;
         let text_align = 16u64;
         let text_size_aligned = (code.len() as u64 + text_align - 1) & !(text_align - 1);
-        let shstrtab_offset = text_offset + text_size_aligned;
-        const SHSTRTAB: &[u8] = b"\0.text\0.shstrtab\0";
+        let symtab_offset = text_offset + text_size_aligned;
+        let strtab_offset = symtab_offset + symtab_bytes.len() as u64;
+        let shstrtab_offset = strtab_offset + strtab_bytes.len() as u64;
         let shstrtab_size = SHSTRTAB.len() as u64;
 
-        write_elf64_header_with_shnum(&mut f, e_machine, 3, 2)?;
+        write_elf64_header_with_shnum(&mut f, e_machine, section_count, shstrtab_index)?;
         write_elf64_section_header(&mut f, 0, SHT_NULL, 0, 0, 0, 0)?;
         write_elf64_section_header(
             &mut f,
-            1,
+            NAME_TEXT,
             SHT_PROGBITS,
             SHF_ALLOC | SHF_EXECINSTR,
             text_offset,
             code.len() as u64,
             text_align,
         )?;
-        write_elf64_section_header(&mut f, 7, SHT_STRTAB, 0, shstrtab_offset, shstrtab_size, 1)?;
+        write_elf64_section_header_full(
+            &mut f,
+            NAME_SYMTAB,
+            SHT_SYMTAB,
+            0,
+            symtab_offset,
+            symtab_bytes.len() as u64,
+            STRTAB_SECTION_INDEX,
+            first_global_index,
+            8,
+            ELF64_SYM_SIZE,
+        )?;
+        write_elf64_section_header_full(
+            &mut f,
+            NAME_STRTAB,
+            SHT_STRTAB,
+            0,
+            strtab_offset,
+            strtab_bytes.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        )?;
+        write_elf64_section_header_full(
+            &mut f,
+            NAME_SHSTRTAB,
+            SHT_STRTAB,
+            0,
+            shstrtab_offset,
+            shstrtab_size,
+            0,
+            0,
+            1,
+            0,
+        )?;
 
         let padding = text_size_aligned as usize - code.len();
         f.write_all(code)
@@ -361,6 +526,10 @@ impl ObjectWriter for ElfWriter {
             f.write_all(&vec![0u8; padding])
                 .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
         }
+        f.write_all(&symtab_bytes)
+            .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
+        f.write_all(&strtab_bytes)
+            .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
         f.write_all(SHSTRTAB)
             .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
 
@@ -388,7 +557,7 @@ impl ObjectWriter for MachOWriter {
         _path: &std::path::Path,
         _code: &[u8],
         _sections: &[Section],
-        _symbols: &[Symbol],
+        _symbols: &[ObjectSymbol],
         _target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         _opts: &ObjectWriteOptions,
@@ -426,7 +595,7 @@ impl ObjectWriter for CoffWriter {
         path: &std::path::Path,
         code: &[u8],
         _sections: &[Section],
-        _symbols: &[Symbol],
+        _symbols: &[ObjectSymbol],
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         _opts: &ObjectWriteOptions,
@@ -545,6 +714,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn symtab_includes_globals_and_skips_local_temporaries() {
+        let symbols = vec![
+            ObjectSymbol {
+                name: "main".to_string(),
+                global: true,
+                section: ".text".to_string(),
+                value: 0,
+            },
+            ObjectSymbol {
+                name: ".L_main_entry".to_string(),
+                global: false,
+                section: ".text".to_string(),
+                value: 16,
+            },
+            ObjectSymbol {
+                name: "helper".to_string(),
+                global: false,
+                section: ".text".to_string(),
+                value: 32,
+            },
+        ];
+
+        let (symtab, strtab, first_global) = build_symtab_and_strtab(&symbols);
+
+        // Null entry + one local (helper) + one global (main); `.L` is dropped.
+        assert_eq!(symtab.len(), 3 * ELF64_SYM_SIZE as usize);
+        assert_eq!(first_global, 2);
+        assert!(strtab.windows(4).any(|w| w == b"main"));
+        assert!(strtab.windows(6).any(|w| w == b"helper"));
+        assert!(!strtab.windows(2).any(|w| w == b".L"));
+    }
+
+    #[test]
+    fn symtab_drops_symbols_outside_text() {
+        let symbols = vec![ObjectSymbol {
+            name: "data_label".to_string(),
+            global: true,
+            section: ".data".to_string(),
+            value: 0,
+        }];
+
+        let (symtab, _strtab, first_global) = build_symtab_and_strtab(&symbols);
+
+        assert_eq!(symtab.len(), ELF64_SYM_SIZE as usize);
+        assert_eq!(first_global, 1);
+    }
+
+    #[test]
     fn test_elf64_x86_64_write() {
         let mut w = ElfWriter::new();
         let code = [0xc3u8];
@@ -556,7 +773,7 @@ mod tests {
                 write: false,
             },
         }];
-        let symbols: Vec<Symbol> = vec![];
+        let symbols: Vec<ObjectSymbol> = vec![];
         let path = std::env::temp_dir().join("ras_elf_test_x86_64.o");
         let opts = ObjectWriteOptions::default();
         let result = w.write_object_file(
@@ -584,7 +801,7 @@ mod tests {
                 write: false,
             },
         }];
-        let symbols: Vec<Symbol> = vec![];
+        let symbols: Vec<ObjectSymbol> = vec![];
         let path = std::env::temp_dir().join("ras_elf_test_aarch64.o");
         let opts = ObjectWriteOptions::default();
         let result = w.write_object_file(
