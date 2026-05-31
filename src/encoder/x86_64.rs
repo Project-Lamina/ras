@@ -172,11 +172,13 @@ impl InstructionEncoder for X86_64Encoder {
                     && !self.is_memory(a)
                     && !self.is_memory(b)
                 {
-                    let dst_reg = self.parse_register(a)?;
-                    let src_reg = self.parse_register(b)?;
+                    // AT&T order: `mov src, dst`. 0x89 is MOV r/m64, r64 where
+                    // the reg field is the source and r/m is the destination.
+                    let src_reg = self.parse_register(a)?;
+                    let dst_reg = self.parse_register(b)?;
                     code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
                     code.push(0x89);
-                    code.push(0xC0 | (src_reg << 3) | (dst_reg & 7));
+                    code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
                 } else {
                     return Err(RasError::EncodingError(
                         "mov: one operand must be a register".to_string(),
@@ -205,8 +207,10 @@ impl InstructionEncoder for X86_64Encoder {
                         })?;
                         (self.parse_register(a)?, Some(imm))
                     } else {
-                        let dst_reg = self.parse_register(a)?;
-                        let src_reg = self.parse_register(b)?;
+                        // AT&T order: `add src, dst`. 0x01 is ADD r/m64, r64
+                        // (reg = source added into r/m = destination).
+                        let src_reg = self.parse_register(a)?;
+                        let dst_reg = self.parse_register(b)?;
                         code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
                         code.push(0x01);
                         code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
@@ -285,11 +289,13 @@ impl InstructionEncoder for X86_64Encoder {
                         "imul reg,reg only supported".to_string(),
                     ));
                 }
+                // AT&T order: `imul src, dst`. 0F AF is IMUL r64, r/m64 where
+                // the reg field is the destination and r/m is the source.
                 let src_reg = self.parse_register(a)?;
                 let dst_reg = self.parse_register(b)?;
-                code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
+                code.push(self.encode_rex(true, dst_reg >> 3, 0, src_reg >> 3));
                 code.extend_from_slice(&[0x0F, 0xAF]);
-                code.push(0xC0 | (src_reg << 3) | (dst_reg & 7));
+                code.push(0xC0 | ((dst_reg & 7) << 3) | (src_reg & 7));
             }
             "subq" | "sub" => {
                 if inst.operands.len() != 2 {
@@ -311,8 +317,10 @@ impl InstructionEncoder for X86_64Encoder {
                         })?;
                         (self.parse_register(a)?, Some(imm))
                     } else {
-                        let dst_reg = self.parse_register(a)?;
-                        let src_reg = self.parse_register(b)?;
+                        // AT&T order: `sub src, dst`. 0x29 is SUB r/m64, r64
+                        // (r/m = destination, reg = subtracted source).
+                        let src_reg = self.parse_register(a)?;
+                        let dst_reg = self.parse_register(b)?;
                         code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
                         code.push(0x29);
                         code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
@@ -373,8 +381,10 @@ impl InstructionEncoder for X86_64Encoder {
                         "xorq requires 2 operands".to_string(),
                     ));
                 }
-                let dst = self.parse_register(&inst.operands[0])?;
-                let src = self.parse_register(&inst.operands[1])?;
+                // AT&T order: `xor src, dst`. 0x31 is XOR r/m64, r64
+                // (r/m = destination, reg = source).
+                let src = self.parse_register(&inst.operands[0])?;
+                let dst = self.parse_register(&inst.operands[1])?;
                 code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
                 code.push(0x31);
                 code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
@@ -405,8 +415,10 @@ impl InstructionEncoder for X86_64Encoder {
                         code.extend_from_slice(&imm.to_le_bytes());
                     }
                 } else {
-                    let dst = self.parse_register(a)?;
-                    let src = self.parse_register(b)?;
+                    // AT&T order: `and src, dst`. 0x21 is AND r/m64, r64
+                    // (r/m = destination, reg = source).
+                    let src = self.parse_register(a)?;
+                    let dst = self.parse_register(b)?;
                     code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
                     code.push(0x21);
                     code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
@@ -438,8 +450,10 @@ impl InstructionEncoder for X86_64Encoder {
                         code.extend_from_slice(&imm.to_le_bytes());
                     }
                 } else {
-                    let dst = self.parse_register(a)?;
-                    let src = self.parse_register(b)?;
+                    // AT&T order: `or src, dst`. 0x09 is OR r/m64, r64
+                    // (r/m = destination, reg = source).
+                    let src = self.parse_register(a)?;
+                    let dst = self.parse_register(b)?;
                     code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
                     code.push(0x09);
                     code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
@@ -550,8 +564,10 @@ impl InstructionEncoder for X86_64Encoder {
                         code.extend_from_slice(&imm.to_le_bytes());
                     }
                 } else {
+                    // AT&T order: `cmp src, dst` computes dst - src. 0x3B is
+                    // CMP r64, r/m64 (reg = dst, r/m = src).
                     let src = self.parse_register(a)?;
-                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                    code.push(self.encode_rex(true, dst >> 3, 0, src >> 3));
                     code.push(0x3B);
                     code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
                 }
