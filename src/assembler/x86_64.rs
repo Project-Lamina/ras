@@ -770,7 +770,6 @@ fn emit_int_binop_i32_alu_x86_64(op: lamina_mir::IntBinOp) -> Vec<u8> {
     code
 }
 
-#[cfg(feature = "encoder")]
 /// Place the return value in `rax` per the x86-64 SysV ABI (narrow integers sign- or zero-extended).
 #[cfg(feature = "encoder")]
 fn materialize_return_value_x86_64(

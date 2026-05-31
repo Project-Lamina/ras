@@ -237,30 +237,36 @@ fn write_elf64_section_header<W: Write>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Full ELF64 section header fields. `sh_addr` is always zero for relocatable
+/// objects, so it is not exposed. Unset fields default to zero.
+#[derive(Default)]
+struct Elf64SectionHeader {
+    name: u32,
+    section_type: u32,
+    flags: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    addralign: u64,
+    entsize: u64,
+}
+
 fn write_elf64_section_header_full<W: Write>(
     w: &mut W,
-    sh_name: u32,
-    sh_type: u32,
-    sh_flags: u64,
-    sh_offset: u64,
-    sh_size: u64,
-    sh_link: u32,
-    sh_info: u32,
-    sh_addralign: u64,
-    sh_entsize: u64,
+    header: &Elf64SectionHeader,
 ) -> Result<(), RasError> {
     let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
-    w.write_all(&sh_name.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_type.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_flags.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.name.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.section_type.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.flags.to_le_bytes()).map_err(map)?;
     w.write_all(&0u64.to_le_bytes()).map_err(map)?; // sh_addr
-    w.write_all(&sh_offset.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_size.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_link.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_info.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_addralign.to_le_bytes()).map_err(map)?;
-    w.write_all(&sh_entsize.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.offset.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.size.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.link.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.info.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.addralign.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.entsize.to_le_bytes()).map_err(map)?;
     Ok(())
 }
 
@@ -484,39 +490,39 @@ impl ObjectWriter for ElfWriter {
         )?;
         write_elf64_section_header_full(
             &mut f,
-            NAME_SYMTAB,
-            SHT_SYMTAB,
-            0,
-            symtab_offset,
-            symtab_bytes.len() as u64,
-            STRTAB_SECTION_INDEX,
-            first_global_index,
-            8,
-            ELF64_SYM_SIZE,
+            &Elf64SectionHeader {
+                name: NAME_SYMTAB,
+                section_type: SHT_SYMTAB,
+                offset: symtab_offset,
+                size: symtab_bytes.len() as u64,
+                link: STRTAB_SECTION_INDEX,
+                info: first_global_index,
+                addralign: 8,
+                entsize: ELF64_SYM_SIZE,
+                ..Default::default()
+            },
         )?;
         write_elf64_section_header_full(
             &mut f,
-            NAME_STRTAB,
-            SHT_STRTAB,
-            0,
-            strtab_offset,
-            strtab_bytes.len() as u64,
-            0,
-            0,
-            1,
-            0,
+            &Elf64SectionHeader {
+                name: NAME_STRTAB,
+                section_type: SHT_STRTAB,
+                offset: strtab_offset,
+                size: strtab_bytes.len() as u64,
+                addralign: 1,
+                ..Default::default()
+            },
         )?;
         write_elf64_section_header_full(
             &mut f,
-            NAME_SHSTRTAB,
-            SHT_STRTAB,
-            0,
-            shstrtab_offset,
-            shstrtab_size,
-            0,
-            0,
-            1,
-            0,
+            &Elf64SectionHeader {
+                name: NAME_SHSTRTAB,
+                section_type: SHT_STRTAB,
+                offset: shstrtab_offset,
+                size: shstrtab_size,
+                addralign: 1,
+                ..Default::default()
+            },
         )?;
 
         let padding = text_size_aligned as usize - code.len();
