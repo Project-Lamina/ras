@@ -6,7 +6,7 @@
 
 use crate::encoder::traits::InstructionEncoder;
 use crate::error::RasError;
-use crate::object::{ObjectWriteOptions, ObjectWriter};
+use crate::object::{ObjectSymbol, ObjectWriteOptions, ObjectWriter};
 use crate::parser::{AssemblyParser, Line};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
@@ -140,7 +140,7 @@ impl RasAssembler {
     fn encode_lines_two_pass(
         &mut self,
         lines: &[Line],
-    ) -> Result<(Vec<u8>, Vec<crate::parser::Symbol>), RasError> {
+    ) -> Result<(Vec<u8>, Vec<ObjectSymbol>), RasError> {
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
         let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
@@ -235,7 +235,12 @@ impl RasAssembler {
         let symbols = lines
             .iter()
             .filter_map(|l| match l {
-                Line::Label(s) => Some(s.clone()),
+                Line::Label(s) => Some(ObjectSymbol {
+                    name: s.name.clone(),
+                    global: s.global,
+                    section: s.section.clone(),
+                    value: symbol_offsets.get(&s.name).copied().unwrap_or(0) as u64,
+                }),
                 _ => None,
             })
             .collect();
