@@ -680,12 +680,11 @@ fn encode_instruction(
 
         // ---- Ret ----
         Instruction::Ret { value } => {
-            if let Some(v) = value {
-                if ret_ty.is_some() {
+            if let Some(v) = value
+                && ret_ty.is_some() {
                     // Move return value into a0 (x10)
                     materialize_operand(code, v, ARG_REGS[0], stack_slots, rv64)?;
                 }
-            }
             let epilogue = encode_epilogue(frame_size, rv64)?;
             code.extend_from_slice(&epilogue);
         }
@@ -908,14 +907,12 @@ pub fn compile_mir_riscv_function(
 
         // --- Spill function parameters (a0–a7 → stack slots) ---
         for (i, param) in func.sig.params.iter().enumerate() {
-            if let Register::Virtual(vreg) = &param.reg {
-                if let Some(slot) = stack_slots.get(vreg) {
-                    if i < ARG_REGS.len() {
+            if let Register::Virtual(vreg) = &param.reg
+                && let Some(slot) = stack_slots.get(vreg)
+                    && i < ARG_REGS.len() {
                         emit_store_to_fp(&mut code, ARG_REGS[i], *slot, rv64);
                     }
                     // Stack args beyond 8 not yet supported
-                }
-            }
         }
 
         // --- Compile blocks ---
