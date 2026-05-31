@@ -17,9 +17,9 @@ name = "ras"
 path = "src/lib.rs"
 
 [dependencies]
-lamina-platform = { path = "../lamina-platform" }
-lamina-mir = { path = "../lamina-mir", optional = true }
-lamina-codegen = { path = "../lamina-codegen" }
+lamina-platform = { path = "../lamina-platform", version = "0.1.0" }
+lamina-mir = { path = "../lamina-mir", version = "0.1.0", optional = true }
+lamina-codegen = { path = "../lamina-codegen", version = "0.1.0" }
 libc = "0.2"
 
 [features]
