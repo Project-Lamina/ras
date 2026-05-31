@@ -601,7 +601,7 @@ impl ObjectWriter for CoffWriter {
         path: &std::path::Path,
         code: &[u8],
         _sections: &[Section],
-        _symbols: &[ObjectSymbol],
+        symbols: &[ObjectSymbol],
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         _opts: &ObjectWriteOptions,
@@ -613,6 +613,53 @@ impl ObjectWriter for CoffWriter {
             )));
         }
 
+        // Collect global (exported) symbols — these need entries in the COFF symbol table
+        // so the linker can resolve external references (e.g. `main`).
+        // Local `.L*` labels are assembler-internal and not exported.
+        let exported: Vec<&ObjectSymbol> = symbols
+            .iter()
+            .filter(|s| s.global && !s.name.starts_with(".L"))
+            .collect();
+
+        // Build COFF string table: 4-byte size header + null-terminated strings for names
+        // longer than 8 bytes. Short names (≤8 bytes) are stored inline in the symbol entry.
+        let mut strtab: Vec<u8> = vec![0u8; 4]; // placeholder for table size
+        let mut sym_bytes: Vec<u8> = Vec::new();
+
+        // Section symbol for .text (always present, static)
+        let text_name = b".text\0\0\0";
+        let mut sec_sym = [0u8; 18];
+        sec_sym[0..8].copy_from_slice(text_name);
+        sec_sym[12..14].copy_from_slice(&1i16.to_le_bytes()); // SectionNumber = 1
+        sec_sym[16] = IMAGE_SYM_CLASS_STATIC;
+        sym_bytes.extend_from_slice(&sec_sym);
+
+        // One symbol entry per exported function.
+        for sym in &exported {
+            let mut entry = [0u8; 18];
+            let name = sym.name.as_bytes();
+            if name.len() <= 8 {
+                entry[..name.len()].copy_from_slice(name);
+            } else {
+                // Long name: first 4 bytes zero, next 4 bytes = offset into string table
+                let offset = strtab.len() as u32;
+                entry[4..8].copy_from_slice(&offset.to_le_bytes());
+                strtab.extend_from_slice(name);
+                strtab.push(0);
+            }
+            entry[8..12].copy_from_slice(&(sym.value as u32).to_le_bytes()); // offset in section
+            entry[12..14].copy_from_slice(&1i16.to_le_bytes()); // SectionNumber = 1 (.text)
+            entry[14..16].copy_from_slice(&0x20u16.to_le_bytes()); // Type = function
+            entry[16] = 2; // IMAGE_SYM_CLASS_EXTERNAL
+            sym_bytes.extend_from_slice(&entry);
+        }
+
+        // Patch string table size (includes the 4-byte size field itself)
+        let strtab_size = strtab.len() as u32;
+        strtab[0..4].copy_from_slice(&strtab_size.to_le_bytes());
+
+        let total_syms = (1 + exported.len()) as u32; // .text section symbol + function symbols
+
         let hdr_sz = 20usize;
         let sec_hdr_sz = 40usize;
         let raw_off = hdr_sz + sec_hdr_sz;
@@ -620,73 +667,48 @@ impl ObjectWriter for CoffWriter {
         let padded_len = (code.len().div_ceil(align) * align) as u32;
         let sym_off = raw_off + padded_len as usize;
 
-        let text_name = b".text\0\0\0";
         let sec_flags = IMAGE_SCN_CNT_CODE
             | IMAGE_SCN_ALIGN_16BYTES
             | IMAGE_SCN_MEM_EXECUTE
             | IMAGE_SCN_MEM_READ;
 
-        let mut sym = [0u8; 18];
-        sym[0..8].copy_from_slice(text_name);
-        sym[8..12].copy_from_slice(&0u32.to_le_bytes());
-        sym[12..14].copy_from_slice(&1i16.to_le_bytes());
-        sym[14..16].copy_from_slice(&0u16.to_le_bytes());
-        sym[16] = IMAGE_SYM_CLASS_STATIC;
-        sym[17] = 0;
-
-        let strtbl = [4u8, 0, 0, 0];
-
+        let map = |e: std::io::Error| RasError::ObjectError(format!("COFF write: {}", e));
         let mut f = std::fs::File::create(path)
             .map_err(|e| RasError::ObjectError(format!("Failed to create COFF file: {}", e)))?;
 
-        f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&1u16.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u32.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&(sym_off as u32).to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&1u32.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u16.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u16.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
+        // COFF file header (20 bytes)
+        f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes()).map_err(map)?;
+        f.write_all(&1u16.to_le_bytes()).map_err(map)?;          // NumberOfSections
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // TimeDateStamp
+        f.write_all(&(sym_off as u32).to_le_bytes()).map_err(map)?; // PointerToSymbolTable
+        f.write_all(&total_syms.to_le_bytes()).map_err(map)?;    // NumberOfSymbols
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // SizeOfOptionalHeader
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // Characteristics
 
-        f.write_all(text_name)
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u32.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u32.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&padded_len.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&(raw_off as u32).to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u32.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u32.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u16.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&0u16.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&sec_flags.to_le_bytes())
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
+        // .text section header (40 bytes)
+        f.write_all(text_name).map_err(map)?;                    // Name[8]
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // VirtualSize
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // VirtualAddress
+        f.write_all(&padded_len.to_le_bytes()).map_err(map)?;    // SizeOfRawData
+        f.write_all(&(raw_off as u32).to_le_bytes()).map_err(map)?; // PointerToRawData
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // PointerToRelocations
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // PointerToLinenumbers
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // NumberOfRelocations
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // NumberOfLinenumbers
+        f.write_all(&sec_flags.to_le_bytes()).map_err(map)?;     // Characteristics
 
-        f.write_all(code)
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
+        // Section raw data (code + padding)
+        f.write_all(code).map_err(map)?;
         let pad = padded_len as usize - code.len();
         if pad > 0 {
-            f.write_all(&vec![0u8; pad])
-                .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
+            f.write_all(&vec![0u8; pad]).map_err(map)?;
         }
 
-        f.write_all(&sym)
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
-        f.write_all(&strtbl)
-            .map_err(|e| RasError::ObjectError(format!("COFF write: {}", e)))?;
+        // Symbol table
+        f.write_all(&sym_bytes).map_err(map)?;
+
+        // String table
+        f.write_all(&strtab).map_err(map)?;
 
         Ok(())
     }

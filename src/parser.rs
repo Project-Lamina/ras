@@ -32,6 +32,7 @@ pub struct Symbol {
 pub enum Line {
     Label(Symbol),
     Instruction(ParsedInstruction),
+    Data(Vec<u8>),
 }
 
 pub struct ParsedAssembly {
@@ -75,17 +76,33 @@ impl AssemblyParser {
                 continue;
             }
 
-            if line.ends_with(':') {
-                let label = line.trim_end_matches(':').trim();
-                let global = self.pending_globals.remove(label);
-                let sym = Symbol {
-                    name: label.to_string(),
-                    global,
-                    section: self.current_section.clone(),
-                };
-                self.symbols.push(sym.clone());
-                self.lines.push(Line::Label(sym));
-            } else if line.starts_with('.') {
+            // Handle "label:" and "label: directive/instruction" forms.
+            // A label token has no internal whitespace and ends with ':'.
+            if let Some(colon_pos) = line.find(':') {
+                let before = &line[..colon_pos];
+                if !before.is_empty() && !before.contains(char::is_whitespace) {
+                    let label = before.trim();
+                    let global = self.pending_globals.remove(label);
+                    let sym = Symbol {
+                        name: label.to_string(),
+                        global,
+                        section: self.current_section.clone(),
+                    };
+                    self.symbols.push(sym.clone());
+                    self.lines.push(Line::Label(sym));
+                    let rest = line[colon_pos + 1..].trim();
+                    if !rest.is_empty() {
+                        if rest.starts_with('.') {
+                            self.parse_directive(rest)?;
+                        } else {
+                            self.parse_instruction(rest)?;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if line.starts_with('.') {
                 self.parse_directive(line)?;
             } else {
                 self.parse_instruction(line)?;
@@ -139,8 +156,20 @@ impl AssemblyParser {
                     self.pending_globals.insert((*name).to_string());
                 }
             }
+            ".asciz" | ".string" => {
+                let rest = line[parts[0].len()..].trim();
+                if let Some(bytes) = parse_quoted_string_bytes(rest, true) {
+                    self.lines.push(Line::Data(bytes));
+                }
+            }
+            ".ascii" => {
+                let rest = line[parts[0].len()..].trim();
+                if let Some(bytes) = parse_quoted_string_bytes(rest, false) {
+                    self.lines.push(Line::Data(bytes));
+                }
+            }
             ".section" | ".align" | ".balign" | ".p2align" | ".byte" | ".short" | ".int"
-            | ".long" | ".quad" | ".ascii" | ".asciz" | ".string" | ".zero" | ".space"
+            | ".long" | ".quad" | ".zero" | ".space"
             | ".skip" | ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type"
             | ".ident" | ".file" => {}
             _ => {}
@@ -171,6 +200,32 @@ impl AssemblyParser {
         self.lines.push(Line::Instruction(inst));
         Ok(())
     }
+}
+
+fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
+    let s = s.trim();
+    let s = s.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = Vec::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                'n' => out.push(b'\n'),
+                'r' => out.push(b'\r'),
+                't' => out.push(b'\t'),
+                '0' => out.push(0),
+                '"' => out.push(b'"'),
+                '\\' => out.push(b'\\'),
+                c => out.push(c as u8),
+            }
+        } else {
+            out.push(c as u8);
+        }
+    }
+    if null_terminate {
+        out.push(0);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -283,5 +338,30 @@ mod tests {
         let asm = parse(".global a b\na:\nb:");
         assert!(asm.symbols.iter().all(|s| s.global));
         assert_eq!(asm.symbols.len(), 2);
+    }
+
+    #[test]
+    fn inline_label_with_asciz_emits_label_and_data() {
+        let asm = parse(".L_fmt: .asciz \"%lld\\n\"");
+        assert_eq!(asm.symbols.len(), 1);
+        assert_eq!(asm.symbols[0].name, ".L_fmt");
+        assert!(matches!(&asm.lines[0], Line::Label(s) if s.name == ".L_fmt"));
+        let data_line = &asm.lines[1];
+        match data_line {
+            Line::Data(bytes) => {
+                assert_eq!(bytes, b"%lld\n\0");
+            }
+            _ => panic!("expected Line::Data, got {:?}", data_line),
+        }
+    }
+
+    #[test]
+    fn asciz_standalone_emits_data() {
+        let asm = parse(".asciz \"hello\"");
+        assert_eq!(asm.lines.len(), 1);
+        match &asm.lines[0] {
+            Line::Data(bytes) => assert_eq!(bytes, b"hello\0"),
+            _ => panic!("expected Line::Data"),
+        }
     }
 }
