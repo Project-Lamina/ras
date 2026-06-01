@@ -355,11 +355,11 @@ pub fn compile_mir_aarch64_function(
                             aligned_stack_size,
                         )?;
                     }
-                    for j in 8..args.len() {
-                        let caller_off = 16i32 + (j as i32 - 8) * 8;
+                    for (i, arg) in args.iter().enumerate().skip(8) {
+                        let caller_off = 16i32 + (i as i32 - 8) * 8;
                         materialize_operand_aarch64(
                             assembler,
-                            &args[j],
+                            arg,
                             11,
                             &stack_slots,
                             &mut reg_alloc,
