@@ -70,13 +70,18 @@ const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
+const SHF_INFO_LINK: u64 = 0x40;
 const ELF64_SYM_SIZE: u64 = 24;
+const ELF64_RELA_SIZE: u64 = 24;
 const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
 const STT_FUNC: u8 = 2;
 const TEXT_SECTION_INDEX: u16 = 1;
+const R_X86_64_PLT32: u64 = 4;
+const R_AARCH64_CALL26: u64 = 283;
 
 fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
@@ -353,6 +358,97 @@ fn build_symtab_and_strtab(symbols: &[ObjectSymbol]) -> (Vec<u8>, Vec<u8>, u32) 
     (symtab, strtab, first_global_index)
 }
 
+/// Like `build_symtab_and_strtab` but also appends undefined external symbols.
+/// Returns (symtab_bytes, strtab_bytes, first_global_index, extern_base_index).
+/// `extern_base_index` is the symbol-table index of the first external symbol.
+fn build_symtab_with_externals(
+    symbols: &[ObjectSymbol],
+    extern_names: &[&str],
+) -> (Vec<u8>, Vec<u8>, u32, u32) {
+    let (locals, globals) = linkable_text_symbols(symbols);
+
+    let mut strtab = vec![0u8];
+    let mut symtab = vec![0u8; ELF64_SYM_SIZE as usize]; // null symbol
+
+    // Dedup extern names while preserving order
+    let mut seen = std::collections::HashSet::new();
+    let unique_externs: Vec<&str> = extern_names
+        .iter()
+        .copied()
+        .filter(|&n| seen.insert(n))
+        .collect();
+
+    // Local defined symbols
+    for sym in &locals {
+        let name_off = strtab.len() as u32;
+        strtab.extend_from_slice(sym.name.as_bytes());
+        strtab.push(0);
+        let mut e = Vec::new();
+        let _ = write_elf64_symbol(&mut e, name_off, STB_LOCAL, STT_FUNC, TEXT_SECTION_INDEX, sym.value);
+        symtab.extend_from_slice(&e);
+    }
+
+    let first_global_index = 1 + locals.len() as u32;
+
+    // Global defined symbols
+    for sym in &globals {
+        let name_off = strtab.len() as u32;
+        strtab.extend_from_slice(sym.name.as_bytes());
+        strtab.push(0);
+        let mut e = Vec::new();
+        let _ = write_elf64_symbol(&mut e, name_off, STB_GLOBAL, STT_FUNC, TEXT_SECTION_INDEX, sym.value);
+        symtab.extend_from_slice(&e);
+    }
+
+    let extern_base_index = first_global_index + globals.len() as u32;
+
+    // Undefined external symbols (STB_GLOBAL, SHN_UNDEF=0, value=0)
+    for name in &unique_externs {
+        let name_off = strtab.len() as u32;
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+        let mut e = Vec::new();
+        let _ = write_elf64_symbol(&mut e, name_off, STB_GLOBAL, 0, 0, 0); // SHN_UNDEF = 0
+        symtab.extend_from_slice(&e);
+    }
+
+    (symtab, strtab, first_global_index, extern_base_index)
+}
+
+/// Build the raw bytes for a `.rela.text` section.
+fn build_rela_text(
+    relocations: &[ExternalReloc],
+    extern_names: &[&str],
+    extern_base_index: u32,
+    e_machine: u16,
+) -> Vec<u8> {
+    // Deduplicated extern name → symbol table index
+    let mut seen: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    let mut next_idx = extern_base_index;
+    for name in extern_names {
+        seen.entry(name).or_insert_with(|| {
+            let idx = next_idx;
+            next_idx += 1;
+            idx
+        });
+    }
+
+    let rel_type: u64 = match e_machine {
+        183 => R_AARCH64_CALL26, // EM_AARCH64
+        _ => R_X86_64_PLT32,
+    };
+
+    let mut out = Vec::with_capacity(relocations.len() * 24);
+    for reloc in relocations {
+        let sym_idx = *seen.get(reloc.symbol.as_str()).unwrap_or(&0) as u64;
+        let r_info = (sym_idx << 32) | rel_type;
+        out.extend_from_slice(&(reloc.offset as u64).to_le_bytes()); // r_offset
+        out.extend_from_slice(&r_info.to_le_bytes());                // r_info
+        out.extend_from_slice(&(-4i64).to_le_bytes());               // r_addend = -4
+    }
+    out
+}
+
 pub struct ElfWriter;
 
 impl Default for ElfWriter {
@@ -374,7 +470,7 @@ impl ObjectWriter for ElfWriter {
         code: &[u8],
         _sections: &[Section],
         symbols: &[ObjectSymbol],
-        _relocations: &[ExternalReloc],
+        relocations: &[ExternalReloc],
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         opts: &ObjectWriteOptions,
@@ -466,56 +562,100 @@ impl ObjectWriter for ElfWriter {
             return Ok(());
         }
 
-        // Section layout: [0] NULL, [1] .text, [2] .symtab, [3] .strtab, [4] .shstrtab.
-        let (symtab_bytes, strtab_bytes, first_global_index) = build_symtab_and_strtab(symbols);
+        // Build symtab including undefined external symbols (so weld/ld can resolve them).
+        let extern_names: Vec<&str> = relocations.iter().map(|r| r.symbol.as_str()).collect();
+        let (symtab_bytes, strtab_bytes, first_global_index, extern_sym_base) =
+            build_symtab_with_externals(symbols, &extern_names);
 
-        const SHSTRTAB: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
-        const NAME_TEXT: u32 = 1;
-        const NAME_SYMTAB: u32 = 7;
-        const NAME_STRTAB: u32 = 15;
-        const NAME_SHSTRTAB: u32 = 23;
-        const STRTAB_SECTION_INDEX: u32 = 3;
+        // Build .rela.text entries for each external relocation.
+        // R_X86_64_PLT32 / R_AARCH64_CALL26 with addend = -4.
+        let rela_bytes = if !relocations.is_empty() {
+            build_rela_text(relocations, &extern_names, extern_sym_base, e_machine)
+        } else {
+            Vec::new()
+        };
+        let has_rela = !rela_bytes.is_empty();
 
-        let section_count = 5u16;
-        let shstrtab_index = 4u16;
+        // Section layout:
+        //   Without rela: [0] NULL  [1] .text  [2] .symtab  [3] .strtab  [4] .shstrtab
+        //   With rela:    [0] NULL  [1] .text  [2] .rela.text  [3] .symtab  [4] .strtab  [5] .shstrtab
+        const SHSTRTAB_NO_RELA: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+        const SHSTRTAB_RELA: &[u8] =
+            b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0";
+
+        let (shstrtab, name_text, name_rela_text, name_symtab, name_strtab, name_shstrtab,
+             section_count, shstrtab_index, symtab_section_index, strtab_section_index) =
+        if has_rela {
+            (SHSTRTAB_RELA,
+             1u32, 7u32, 18u32, 26u32, 34u32,
+             6u16, 5u16, 3u32, 4u32)
+        } else {
+            (SHSTRTAB_NO_RELA,
+             1u32, 0u32, 7u32, 15u32, 23u32,
+             5u16, 4u16, 2u32, 3u32)
+        };
+
         let shoff = ELF64_HEADER_SIZE as u64;
         let text_offset = shoff + u64::from(section_count) * ELF64_SECTION_HEADER_SIZE as u64;
         let text_align = 16u64;
         let text_size_aligned = (code.len() as u64 + text_align - 1) & !(text_align - 1);
-        let symtab_offset = text_offset + text_size_aligned;
+        let rela_offset = text_offset + text_size_aligned;
+        let rela_size = rela_bytes.len() as u64;
+        let symtab_offset = rela_offset + rela_size;
         let strtab_offset = symtab_offset + symtab_bytes.len() as u64;
         let shstrtab_offset = strtab_offset + strtab_bytes.len() as u64;
-        let shstrtab_size = SHSTRTAB.len() as u64;
 
         write_elf64_header_with_shnum(&mut f, e_machine, section_count, shstrtab_index)?;
+        // [0] NULL
         write_elf64_section_header(&mut f, 0, SHT_NULL, 0, 0, 0, 0)?;
+        // [1] .text
         write_elf64_section_header(
             &mut f,
-            NAME_TEXT,
+            name_text,
             SHT_PROGBITS,
             SHF_ALLOC | SHF_EXECINSTR,
             text_offset,
             code.len() as u64,
             text_align,
         )?;
+        // [2] .rela.text (only when needed)
+        if has_rela {
+            write_elf64_section_header_full(
+                &mut f,
+                &Elf64SectionHeader {
+                    name: name_rela_text,
+                    section_type: SHT_RELA,
+                    flags: SHF_INFO_LINK,
+                    offset: rela_offset,
+                    size: rela_size,
+                    link: symtab_section_index,    // points to .symtab
+                    info: TEXT_SECTION_INDEX as u32, // relocates .text
+                    addralign: 8,
+                    entsize: ELF64_RELA_SIZE,
+                    ..Default::default()
+                },
+            )?;
+        }
+        // .symtab
         write_elf64_section_header_full(
             &mut f,
             &Elf64SectionHeader {
-                name: NAME_SYMTAB,
+                name: name_symtab,
                 section_type: SHT_SYMTAB,
                 offset: symtab_offset,
                 size: symtab_bytes.len() as u64,
-                link: STRTAB_SECTION_INDEX,
+                link: strtab_section_index,
                 info: first_global_index,
                 addralign: 8,
                 entsize: ELF64_SYM_SIZE,
                 ..Default::default()
             },
         )?;
+        // .strtab
         write_elf64_section_header_full(
             &mut f,
             &Elf64SectionHeader {
-                name: NAME_STRTAB,
+                name: name_strtab,
                 section_type: SHT_STRTAB,
                 offset: strtab_offset,
                 size: strtab_bytes.len() as u64,
@@ -523,31 +663,31 @@ impl ObjectWriter for ElfWriter {
                 ..Default::default()
             },
         )?;
+        // .shstrtab
         write_elf64_section_header_full(
             &mut f,
             &Elf64SectionHeader {
-                name: NAME_SHSTRTAB,
+                name: name_shstrtab,
                 section_type: SHT_STRTAB,
                 offset: shstrtab_offset,
-                size: shstrtab_size,
+                size: shstrtab.len() as u64,
                 addralign: 1,
                 ..Default::default()
             },
         )?;
 
+        let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
         let padding = text_size_aligned as usize - code.len();
-        f.write_all(code)
-            .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
+        f.write_all(code).map_err(map)?;
         if padding > 0 {
-            f.write_all(&vec![0u8; padding])
-                .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
+            f.write_all(&vec![0u8; padding]).map_err(map)?;
         }
-        f.write_all(&symtab_bytes)
-            .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-        f.write_all(&strtab_bytes)
-            .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-        f.write_all(SHSTRTAB)
-            .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
+        if has_rela {
+            f.write_all(&rela_bytes).map_err(map)?;
+        }
+        f.write_all(&symtab_bytes).map_err(map)?;
+        f.write_all(&strtab_bytes).map_err(map)?;
+        f.write_all(shstrtab).map_err(map)?;
 
         Ok(())
     }
