@@ -242,8 +242,6 @@ fn encode_mov_reg_membase_x86_64(dst: u8, base: u8, disp: i32) -> Result<Vec<u8>
 
     let (mod_bits, disp_bytes): (u8, Vec<u8>) = if base_low == 5 && disp == 0 {
         (0b01, vec![0])
-    } else if need_sib && disp == 0 {
-        (0b00, vec![])
     } else if disp == 0 {
         (0b00, vec![])
     } else if (-128..=127).contains(&disp) {
@@ -272,8 +270,6 @@ fn encode_lea_reg_membase_x86_64(dst: u8, base: u8, disp: i32) -> Result<Vec<u8>
 
     let (mod_bits, disp_bytes): (u8, Vec<u8>) = if base_low == 5 && disp == 0 {
         (0b01, vec![0])
-    } else if need_sib && disp == 0 {
-        (0b00, vec![])
     } else if disp == 0 {
         (0b00, vec![])
     } else if (-128..=127).contains(&disp) {
@@ -361,8 +357,6 @@ fn encode_gp_load_membase_x86_64(
 
     let (mod_bits, disp_bytes): (u8, Vec<u8>) = if base_low == 5 && disp == 0 {
         (0b01, vec![0])
-    } else if need_sib && disp == 0 {
-        (0b00, vec![])
     } else if disp == 0 {
         (0b00, vec![])
     } else if (-128..=127).contains(&disp) {
@@ -415,8 +409,6 @@ fn encode_gp_store_membase_x86_64(
 
     let (mod_bits, disp_bytes): (u8, Vec<u8>) = if base_low == 5 && disp == 0 {
         (0b01, vec![0])
-    } else if need_sib && disp == 0 {
-        (0b00, vec![])
     } else if disp == 0 {
         (0b00, vec![])
     } else if (-128..=127).contains(&disp) {
@@ -466,8 +458,6 @@ fn encode_mov_membase_reg_x86_64(src: u8, base: u8, disp: i32) -> Result<Vec<u8>
 
     let (mod_bits, disp_bytes): (u8, Vec<u8>) = if base_low == 5 && disp == 0 {
         (0b01, vec![0])
-    } else if need_sib && disp == 0 {
-        (0b00, vec![])
     } else if disp == 0 {
         (0b00, vec![])
     } else if (-128..=127).contains(&disp) {

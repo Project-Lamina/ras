@@ -6,10 +6,13 @@
 
 use crate::encoder::traits::InstructionEncoder;
 use crate::error::RasError;
-use crate::object::{ObjectSymbol, ObjectWriteOptions, ObjectWriter};
+use crate::object::{ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter};
 use crate::parser::{AssemblyParser, Line};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
+
+/// Return type of the two-pass encoding pass.
+type EncodeResult = Result<(Vec<u8>, Vec<ObjectSymbol>, Vec<ExternalReloc>), RasError>;
 
 #[cfg(windows)]
 mod windows_loader {
@@ -57,7 +60,7 @@ enum PatchPoint {
 }
 
 impl RasAssembler {
-    /// Create a new assembler
+    /// Create a new assembler for the given target architecture and OS.
     pub fn new(
         target_arch: TargetArchitecture,
         target_os: TargetOperatingSystem,
@@ -65,6 +68,7 @@ impl RasAssembler {
         Self::with_object_write_options(target_arch, target_os, ObjectWriteOptions::default())
     }
 
+    /// Create a new assembler with custom object-file write options.
     pub fn with_object_write_options(
         target_arch: TargetArchitecture,
         target_os: TargetOperatingSystem,
@@ -109,12 +113,15 @@ impl RasAssembler {
         })
     }
 
+    /// Replace the object-file write options used by subsequent assembly calls.
     pub fn set_object_write_options(&mut self, opts: ObjectWriteOptions) {
         self.object_write_options = opts;
     }
 
-    /// Assemble assembly text to object file.
-    /// Uses two-pass assembly for jmp/call with label resolution (x86_64).
+    /// Assemble `asm_text` and write a relocatable object file to `output_path`.
+    ///
+    /// Uses two-pass assembly for `jmp`/`call` instructions with forward label
+    /// resolution.
     pub fn assemble_text_to_object(
         &mut self,
         asm_text: &str,
@@ -129,23 +136,22 @@ impl RasAssembler {
         self.object_writer
             .write_object_file(
                 output_path,
-                &code,
-                &parsed.sections,
-                &symbols,
-                &relocs,
-                self.target_arch,
-                self.target_os,
-                &self.object_write_options,
+                &ObjectWriteRequest {
+                    code: &code,
+                    sections: &parsed.sections,
+                    symbols: &symbols,
+                    relocations: &relocs,
+                    target_arch: self.target_arch,
+                    target_os: self.target_os,
+                    opts: &self.object_write_options,
+                },
             )
             .map_err(|e| RasError::ObjectError(e.to_string()))?;
 
         Ok(())
     }
 
-    fn encode_lines_two_pass(
-        &mut self,
-        lines: &[Line],
-    ) -> Result<(Vec<u8>, Vec<ObjectSymbol>, Vec<crate::object::ExternalReloc>), RasError> {
+    fn encode_lines_two_pass(&mut self, lines: &[Line]) -> EncodeResult {
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
         let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
@@ -178,38 +184,36 @@ impl RasAssembler {
                     if self.target_arch == TargetArchitecture::X86_64
                         && (opcode == "leaq" || opcode == "lea")
                         && inst.operands.len() == 2
+                        && let Some(label) = extract_rip_label(inst.operands[0].trim())
                     {
-                        if let Some(label) = extract_rip_label(inst.operands[0].trim()) {
-                            let reg = parse_x86_reg(inst.operands[1].trim()).map_err(|e| {
-                                RasError::EncodingError(e.to_string())
-                            })?;
-                            // REX.W=1, REX.R set if reg>=8; opcode=0x8D; ModRM Mod=00 R/M=101(RIP-rel)
-                            let rex: u8 = 0x48 | ((reg >> 3) << 2);
-                            let modrm: u8 = ((reg & 7) << 3) | 5;
-                            code.extend_from_slice(&[rex, 0x8D, modrm, 0, 0, 0, 0]);
-                            patch_points.push(PatchPoint::X86RipRel32 {
-                                offset: current_offset + 3,
-                                target: label.to_string(),
-                            });
-                            current_offset += 7;
-                            continue;
-                        }
+                        let reg = parse_x86_reg(inst.operands[1].trim()).map_err(|e| {
+                            RasError::EncodingError(e.to_string())
+                        })?;
+                        // REX.W=1, REX.R set if reg>=8; opcode=0x8D; ModRM Mod=00 R/M=101(RIP-rel)
+                        let rex: u8 = 0x48 | ((reg >> 3) << 2);
+                        let modrm: u8 = ((reg & 7) << 3) | 5;
+                        code.extend_from_slice(&[rex, 0x8D, modrm, 0, 0, 0, 0]);
+                        patch_points.push(PatchPoint::X86RipRel32 {
+                            offset: current_offset + 3,
+                            target: label.to_string(),
+                        });
+                        current_offset += 7;
+                        continue;
                     }
 
                     // x86_64 conditional jumps: 2-byte opcode (0x0F 8x) + rel32
                     if self.target_arch == TargetArchitecture::X86_64
                         && inst.operands.len() == 1
+                        && let Some(cc_byte) = x86_cond_jmp_byte(&opcode)
                     {
-                        if let Some(cc_byte) = x86_cond_jmp_byte(&opcode) {
-                            let target = inst.operands[0].trim();
-                            code.extend_from_slice(&[0x0F, cc_byte, 0, 0, 0, 0]);
-                            patch_points.push(PatchPoint::X86Rel32 {
-                                offset: current_offset + 2,
-                                target: target.to_string(),
-                            });
-                            current_offset += 6;
-                            continue;
-                        }
+                        let target = inst.operands[0].trim();
+                        code.extend_from_slice(&[0x0F, cc_byte, 0, 0, 0, 0]);
+                        patch_points.push(PatchPoint::X86Rel32 {
+                            offset: current_offset + 2,
+                            target: target.to_string(),
+                        });
+                        current_offset += 6;
+                        continue;
                     }
 
                     if is_jmp_call && inst.operands.len() == 1 {
@@ -244,7 +248,7 @@ impl RasAssembler {
             }
         }
 
-        let mut external_relocs: Vec<crate::object::ExternalReloc> = Vec::new();
+        let mut external_relocs: Vec<ExternalReloc> = Vec::new();
 
         for patch in &patch_points {
             let target = match patch {
@@ -283,7 +287,7 @@ impl RasAssembler {
                 match patch {
                     PatchPoint::X86Rel32 { offset, target }
                     | PatchPoint::X86RipRel32 { offset, target } => {
-                        external_relocs.push(crate::object::ExternalReloc {
+                        external_relocs.push(ExternalReloc {
                             offset: *offset,
                             symbol: target.clone(),
                         });
@@ -314,8 +318,10 @@ impl RasAssembler {
         Ok((code, symbols, external_relocs))
     }
 
-    /// Register a function pointer for runtime calls
-    /// This resolves the function using dlsym (on Unix) or GetProcAddress (on Windows)
+    /// Register a function pointer for runtime calls.
+    ///
+    /// Resolves the named symbol using `dlsym` (Unix) or `GetProcAddress` (Windows)
+    /// and stores its address for use in generated code.
     pub fn register_function(&mut self, name: &str) -> Result<(), RasError> {
         #[cfg(unix)]
         {
@@ -421,12 +427,12 @@ impl RasAssembler {
         }
     }
 
-    /// Compile MIR module directly to binary (for runtime compilation)
+    /// Compile all functions in a MIR module to machine code and return the raw bytes.
     ///
-    /// This method reuses code from lamina's mir_codegen but generates binary
-    /// instead of assembly text. It's used for runtime compilation (JIT).
+    /// Equivalent to calling [`compile_mir_to_binary_function`] with `function_name = None`.
+    /// Requires the `encoder` feature.
     ///
-    /// Requires the `mir` feature to be enabled.
+    /// [`compile_mir_to_binary_function`]: Self::compile_mir_to_binary_function
     #[cfg(feature = "encoder")]
     pub fn compile_mir_to_binary(
         &mut self,
@@ -436,9 +442,11 @@ impl RasAssembler {
         Ok(code)
     }
 
-    /// Compile a specific function from MIR module to binary
-    /// If function_name is None, compiles all functions
-    /// Returns (binary code, function_offsets map)
+    /// Compile a specific function from a MIR module to binary.
+    ///
+    /// If `function_name` is `None`, all functions in the module are compiled.
+    /// Returns `(binary_code, function_offsets)` where `function_offsets` maps
+    /// each function name to its byte offset within `binary_code`.
     #[cfg(feature = "encoder")]
     pub fn compile_mir_to_binary_function(
         &mut self,

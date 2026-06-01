@@ -397,13 +397,7 @@ pub fn compile_mir_aarch64_function(
             let from_pc = fix.patch_location;
             let to_pc = match &fix.kind {
                 BranchFixupKind::BToEpilogue => epilogue_offset,
-                BranchFixupKind::B { target } => *block_offsets.get(target).ok_or_else(|| {
-                    RasError::EncodingError(format!(
-                        "Branch target block '{}' not found in function '{}'",
-                        target, func_name
-                    ))
-                })?,
-                BranchFixupKind::Cbnz { target, .. } => {
+                BranchFixupKind::B { target } | BranchFixupKind::Cbnz { target, .. } => {
                     *block_offsets.get(target).ok_or_else(|| {
                         RasError::EncodingError(format!(
                             "Branch target block '{}' not found in function '{}'",
@@ -883,6 +877,7 @@ fn aarch64_load_base_gpr(
 }
 
 #[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
 fn aarch64_emit_indexed_address(
     _assembler: &mut RasAssembler,
     base: &lamina_mir::Register,
@@ -1964,6 +1959,7 @@ fn mov_imm_to_w_aarch64(dst: u8, v: i32) -> Vec<u8> {
 
 /// Narrow integer scalar operands for W-width `IntBinary` (I32 / I16 / I8 / I1).
 #[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
 fn materialize_scalar_operand_aarch64_int_binary(
     _assembler: &mut RasAssembler,
     op: &lamina_mir::Operand,
