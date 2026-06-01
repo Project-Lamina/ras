@@ -993,7 +993,7 @@ pub fn compile_mir_riscv_function(
 // Branch patch helper
 // ---------------------------------------------------------------------------
 fn patch_branch(
-    code: &mut Vec<u8>,
+    code: &mut [u8],
     patch_abs: usize,
     target_abs: usize,
     op: BranchFixupOp,
