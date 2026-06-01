@@ -43,18 +43,27 @@ pub struct ExternalReloc {
     pub symbol: String,
 }
 
+/// All data needed to write a single relocatable object file.
+///
+/// Passed to [`ObjectWriter::write_object_file`] so the trait method signature
+/// stays below clippy's argument-count threshold without losing any information.
+pub struct ObjectWriteRequest<'a> {
+    pub code: &'a [u8],
+    pub sections: &'a [Section],
+    pub symbols: &'a [ObjectSymbol],
+    pub relocations: &'a [ExternalReloc],
+    pub target_arch: TargetArchitecture,
+    pub target_os: TargetOperatingSystem,
+    pub opts: &'a ObjectWriteOptions,
+}
+
+/// Backend for writing relocatable object files (ELF, Mach-O, or COFF/PE).
 pub trait ObjectWriter {
-    #[allow(clippy::too_many_arguments)]
+    /// Write a relocatable object file to `path`.
     fn write_object_file(
         &mut self,
         path: &std::path::Path,
-        code: &[u8],
-        sections: &[Section],
-        symbols: &[ObjectSymbol],
-        relocations: &[ExternalReloc],
-        target_arch: TargetArchitecture,
-        target_os: TargetOperatingSystem,
-        opts: &ObjectWriteOptions,
+        req: &ObjectWriteRequest<'_>,
     ) -> Result<(), RasError>;
 }
 
@@ -322,45 +331,15 @@ fn linkable_text_symbols(symbols: &[ObjectSymbol]) -> (Vec<&ObjectSymbol>, Vec<&
     (locals, globals)
 }
 
-/// Builds the `.symtab` bytes (leading null entry + locals + globals) and the
-/// matching `.strtab`. Returns the byte buffers and the index of the first
-/// global symbol for the section header's `sh_info`.
-fn build_symtab_and_strtab(symbols: &[ObjectSymbol]) -> (Vec<u8>, Vec<u8>, u32) {
-    let (locals, globals) = linkable_text_symbols(symbols);
-
-    let mut strtab = vec![0u8];
-    let mut symtab = vec![0u8; ELF64_SYM_SIZE as usize]; // null symbol
-
-    let push_symbol = |symtab: &mut Vec<u8>, strtab: &mut Vec<u8>, sym: &ObjectSymbol, bind: u8| {
-        let name_offset = strtab.len() as u32;
-        strtab.extend_from_slice(sym.name.as_bytes());
-        strtab.push(0);
-        let mut entry = Vec::new();
-        let _ = write_elf64_symbol(
-            &mut entry,
-            name_offset,
-            bind,
-            STT_FUNC,
-            TEXT_SECTION_INDEX,
-            sym.value,
-        );
-        symtab.extend_from_slice(&entry);
-    };
-
-    for sym in &locals {
-        push_symbol(&mut symtab, &mut strtab, sym, STB_LOCAL);
-    }
-    let first_global_index = 1 + locals.len() as u32;
-    for sym in &globals {
-        push_symbol(&mut symtab, &mut strtab, sym, STB_GLOBAL);
-    }
-
-    (symtab, strtab, first_global_index)
-}
-
-/// Like `build_symtab_and_strtab` but also appends undefined external symbols.
-/// Returns (symtab_bytes, strtab_bytes, first_global_index, extern_base_index).
-/// `extern_base_index` is the symbol-table index of the first external symbol.
+/// Builds `.symtab` bytes (null entry + locals + globals) and `.strtab`,
+/// also appending undefined external symbols for cross-object relocations.
+///
+/// Returns `(symtab_bytes, strtab_bytes, first_global_index, extern_base_index)`.
+///
+/// - `first_global_index`: symtab index of the first `STB_GLOBAL` entry;
+///   used as `sh_info` on the symtab section header.
+/// - `extern_base_index`: symtab index of the first `SHN_UNDEF` external entry;
+///   used when building `.rela.text` `r_sym` fields.
 fn build_symtab_with_externals(
     symbols: &[ObjectSymbol],
     extern_names: &[&str],
@@ -467,16 +446,14 @@ impl ObjectWriter for ElfWriter {
     fn write_object_file(
         &mut self,
         path: &std::path::Path,
-        code: &[u8],
-        _sections: &[Section],
-        symbols: &[ObjectSymbol],
-        relocations: &[ExternalReloc],
-        target_arch: TargetArchitecture,
-        _target_os: TargetOperatingSystem,
-        opts: &ObjectWriteOptions,
+        req: &ObjectWriteRequest<'_>,
     ) -> Result<(), RasError> {
-        let e_machine = elf64_e_machine(target_arch).ok_or_else(|| {
-            RasError::ObjectError(format!("ELF does not support arch: {:?}", target_arch))
+        let code = req.code;
+        let symbols = req.symbols;
+        let relocations = req.relocations;
+        let opts = req.opts;
+        let e_machine = elf64_e_machine(req.target_arch).ok_or_else(|| {
+            RasError::ObjectError(format!("ELF does not support arch: {:?}", req.target_arch))
         })?;
 
         let mut f = std::fs::File::create(path)
@@ -632,7 +609,6 @@ impl ObjectWriter for ElfWriter {
                     info: TEXT_SECTION_INDEX as u32, // relocates .text
                     addralign: 8,
                     entsize: ELF64_RELA_SIZE,
-                    ..Default::default()
                 },
             )?;
         }
@@ -711,13 +687,7 @@ impl ObjectWriter for MachOWriter {
     fn write_object_file(
         &mut self,
         _path: &std::path::Path,
-        _code: &[u8],
-        _sections: &[Section],
-        _symbols: &[ObjectSymbol],
-        _relocations: &[ExternalReloc],
-        _target_arch: TargetArchitecture,
-        _target_os: TargetOperatingSystem,
-        _opts: &ObjectWriteOptions,
+        _req: &ObjectWriteRequest<'_>,
     ) -> Result<(), RasError> {
         Err(RasError::ObjectError(
             "Mach-O object file generation not yet implemented".to_string(),
@@ -752,18 +722,15 @@ impl ObjectWriter for CoffWriter {
     fn write_object_file(
         &mut self,
         path: &std::path::Path,
-        code: &[u8],
-        _sections: &[Section],
-        symbols: &[ObjectSymbol],
-        relocations: &[ExternalReloc],
-        target_arch: TargetArchitecture,
-        _target_os: TargetOperatingSystem,
-        _opts: &ObjectWriteOptions,
+        req: &ObjectWriteRequest<'_>,
     ) -> Result<(), RasError> {
-        if target_arch != TargetArchitecture::X86_64 {
+        let code = req.code;
+        let symbols = req.symbols;
+        let relocations = req.relocations;
+        if req.target_arch != TargetArchitecture::X86_64 {
             return Err(RasError::ObjectError(format!(
                 "COFF writer: unsupported architecture {:?}",
-                target_arch
+                req.target_arch
             )));
         }
 
@@ -786,7 +753,7 @@ impl ObjectWriter for CoffWriter {
         let mut strtab: Vec<u8> = vec![0u8; 4]; // size placeholder
         let mut sym_bytes: Vec<u8> = Vec::new();
 
-        let mut push_sym = |sym_bytes: &mut Vec<u8>, strtab: &mut Vec<u8>,
+        let push_sym = |sym_bytes: &mut Vec<u8>, strtab: &mut Vec<u8>,
                              name: &str, value: u32, section: i16,
                              ty: u16, storage: u8| {
             let mut entry = [0u8; 18];
@@ -921,6 +888,12 @@ pub fn object_writer_for_os(
 }
 
 #[cfg(test)]
+fn build_symtab_and_strtab(symbols: &[ObjectSymbol]) -> (Vec<u8>, Vec<u8>, u32) {
+    let (symtab, strtab, first_global, _) = build_symtab_with_externals(symbols, &[]);
+    (symtab, strtab, first_global)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -987,16 +960,12 @@ mod tests {
         let symbols: Vec<ObjectSymbol> = vec![];
         let path = std::env::temp_dir().join("ras_elf_test_x86_64.o");
         let opts = ObjectWriteOptions::default();
-        let result = w.write_object_file(
-            &path,
-            &code,
-            &sections,
-            &symbols,
-            &[],
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-            &opts,
-        );
+        let result = w.write_object_file(&path, &ObjectWriteRequest {
+            code: &code, sections: &sections, symbols: &symbols, relocations: &[],
+            target_arch: TargetArchitecture::X86_64,
+            target_os: TargetOperatingSystem::Linux,
+            opts: &opts,
+        });
         let _ = std::fs::remove_file(&path);
         result.expect("ELF write should succeed");
     }
@@ -1007,25 +976,17 @@ mod tests {
         let code = [0xc0, 0x03, 0x5f, 0xd6];
         let sections = vec![Section {
             name: ".text".to_string(),
-            flags: SectionFlags {
-                alloc: true,
-                exec: true,
-                write: false,
-            },
+            flags: SectionFlags { alloc: true, exec: true, write: false },
         }];
         let symbols: Vec<ObjectSymbol> = vec![];
         let path = std::env::temp_dir().join("ras_elf_test_aarch64.o");
         let opts = ObjectWriteOptions::default();
-        let result = w.write_object_file(
-            &path,
-            &code,
-            &sections,
-            &symbols,
-            &[],
-            TargetArchitecture::Aarch64,
-            TargetOperatingSystem::Linux,
-            &opts,
-        );
+        let result = w.write_object_file(&path, &ObjectWriteRequest {
+            code: &code, sections: &sections, symbols: &symbols, relocations: &[],
+            target_arch: TargetArchitecture::Aarch64,
+            target_os: TargetOperatingSystem::Linux,
+            opts: &opts,
+        });
         let _ = std::fs::remove_file(&path);
         result.expect("ELF write should succeed");
     }
@@ -1042,17 +1003,13 @@ mod tests {
         let mut w = ElfWriter::new();
         let code = [0xc3u8];
         let path = std::env::temp_dir().join("ras_elf_magic_test.o");
-        w.write_object_file(
-            &path,
-            &code,
-            &[],
-            &[],
-            &[],
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-            &ObjectWriteOptions::default(),
-        )
-        .expect("write");
+        let opts = ObjectWriteOptions::default();
+        w.write_object_file(&path, &ObjectWriteRequest {
+            code: &code, sections: &[], symbols: &[], relocations: &[],
+            target_arch: TargetArchitecture::X86_64,
+            target_os: TargetOperatingSystem::Linux,
+            opts: &opts,
+        }).expect("write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
@@ -1068,17 +1025,12 @@ mod tests {
             emit_minimal_dwarf_sections: true,
             dwarf_decl_file_name: "t.s".to_string(),
         };
-        w.write_object_file(
-            &path,
-            &code,
-            &[],
-            &[],
-            &[],
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Linux,
-            &opts,
-        )
-        .expect("write");
+        w.write_object_file(&path, &ObjectWriteRequest {
+            code: &code, sections: &[], symbols: &[], relocations: &[],
+            target_arch: TargetArchitecture::X86_64,
+            target_os: TargetOperatingSystem::Linux,
+            opts: &opts,
+        }).expect("write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert!(
@@ -1093,17 +1045,12 @@ mod tests {
         let code = [0xc3u8];
         let path = std::env::temp_dir().join("ras_coff_test.obj");
         let opts = ObjectWriteOptions::default();
-        w.write_object_file(
-            &path,
-            &code,
-            &[],
-            &[],
-            &[],
-            TargetArchitecture::X86_64,
-            TargetOperatingSystem::Windows,
-            &opts,
-        )
-        .expect("coff write");
+        w.write_object_file(&path, &ObjectWriteRequest {
+            code: &code, sections: &[], symbols: &[], relocations: &[],
+            target_arch: TargetArchitecture::X86_64,
+            target_os: TargetOperatingSystem::Windows,
+            opts: &opts,
+        }).expect("coff write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert_eq!(&buf[0..2], &IMAGE_FILE_MACHINE_AMD64.to_le_bytes());

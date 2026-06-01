@@ -536,6 +536,7 @@ fn riscv_reg_num(name: &str) -> Result<u8, RasError> {
 // ---------------------------------------------------------------------------
 // MIR instruction encoder
 // ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
 fn encode_instruction(
     code: &mut Vec<u8>,
     inst: &lamina_mir::Instruction,
@@ -943,31 +944,17 @@ pub fn compile_mir_riscv_function(
             }
 
             if let Some(term) = block.terminator() {
-                if !matches!(term, lamina_mir::Instruction::Ret { .. }) {
-                    encode_instruction(
-                        &mut code,
-                        term,
-                        &stack_slots,
-                        frame_size,
-                        func.sig.ret_ty.as_ref(),
-                        rv64,
-                        &block_offsets,
-                        &mut local_fixups,
-                        0,
-                    )?;
-                } else {
-                    encode_instruction(
-                        &mut code,
-                        term,
-                        &stack_slots,
-                        frame_size,
-                        func.sig.ret_ty.as_ref(),
-                        rv64,
-                        &block_offsets,
-                        &mut local_fixups,
-                        0,
-                    )?;
-                }
+                encode_instruction(
+                    &mut code,
+                    term,
+                    &stack_slots,
+                    frame_size,
+                    func.sig.ret_ty.as_ref(),
+                    rv64,
+                    &block_offsets,
+                    &mut local_fixups,
+                    0,
+                )?;
             }
         }
 
