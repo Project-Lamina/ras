@@ -124,7 +124,7 @@ impl RasAssembler {
             .parse(asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
 
-        let (code, symbols) = self.encode_lines_two_pass(&parsed.lines)?;
+        let (code, symbols, relocs) = self.encode_lines_two_pass(&parsed.lines)?;
 
         self.object_writer
             .write_object_file(
@@ -132,6 +132,7 @@ impl RasAssembler {
                 &code,
                 &parsed.sections,
                 &symbols,
+                &relocs,
                 self.target_arch,
                 self.target_os,
                 &self.object_write_options,
@@ -144,7 +145,7 @@ impl RasAssembler {
     fn encode_lines_two_pass(
         &mut self,
         lines: &[Line],
-    ) -> Result<(Vec<u8>, Vec<ObjectSymbol>), RasError> {
+    ) -> Result<(Vec<u8>, Vec<ObjectSymbol>, Vec<crate::object::ExternalReloc>), RasError> {
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
         let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
@@ -195,6 +196,22 @@ impl RasAssembler {
                         }
                     }
 
+                    // x86_64 conditional jumps: 2-byte opcode (0x0F 8x) + rel32
+                    if self.target_arch == TargetArchitecture::X86_64
+                        && inst.operands.len() == 1
+                    {
+                        if let Some(cc_byte) = x86_cond_jmp_byte(&opcode) {
+                            let target = inst.operands[0].trim();
+                            code.extend_from_slice(&[0x0F, cc_byte, 0, 0, 0, 0]);
+                            patch_points.push(PatchPoint::X86Rel32 {
+                                offset: current_offset + 2,
+                                target: target.to_string(),
+                            });
+                            current_offset += 6;
+                            continue;
+                        }
+                    }
+
                     if is_jmp_call && inst.operands.len() == 1 {
                         let target = inst.operands[0].trim();
                         if self.target_arch == lamina_platform::TargetArchitecture::X86_64 {
@@ -227,6 +244,8 @@ impl RasAssembler {
             }
         }
 
+        let mut external_relocs: Vec<crate::object::ExternalReloc> = Vec::new();
+
         for patch in &patch_points {
             let target = match patch {
                 PatchPoint::X86Rel32 { target, .. }
@@ -234,30 +253,47 @@ impl RasAssembler {
                 | PatchPoint::Arx64Jal { target, .. }
                 | PatchPoint::Arx64Branch { target, .. } => target,
             };
-            let target_offset = symbol_offsets
-                .get(target)
-                .ok_or_else(|| RasError::EncodingError(format!("Undefined label: {}", target)))?;
-            match patch {
-                PatchPoint::X86Rel32 { offset, .. } | PatchPoint::X86RipRel32 { offset, .. } => {
-                    let rel32 = (*target_offset as i64) - (*offset as i64 + 4);
-                    let rel32_bytes = (rel32 as i32).to_le_bytes();
-                    code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
+            if let Some(&target_offset) = symbol_offsets.get(target) {
+                match patch {
+                    PatchPoint::X86Rel32 { offset, .. }
+                    | PatchPoint::X86RipRel32 { offset, .. } => {
+                        let rel32 = (target_offset as i64) - (*offset as i64 + 4);
+                        let rel32_bytes = (rel32 as i32).to_le_bytes();
+                        code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
+                    }
+                    PatchPoint::Arx64Jal { offset, rd, .. } => {
+                        let rel = (target_offset as i64) - (*offset as i64);
+                        let word = arx64_j_type(rel as i32, *rd);
+                        code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                    PatchPoint::Arx64Branch {
+                        offset,
+                        rs1,
+                        rs2,
+                        funct3,
+                        ..
+                    } => {
+                        let rel = (target_offset as i64) - (*offset as i64);
+                        let word = arx64_b_type(rel as i32, *rs2, *rs1, *funct3);
+                        code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+                    }
                 }
-                PatchPoint::Arx64Jal { offset, rd, .. } => {
-                    let rel = (*target_offset as i64) - (*offset as i64);
-                    let word = arx64_j_type(rel as i32, *rd);
-                    code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
-                }
-                PatchPoint::Arx64Branch {
-                    offset,
-                    rs1,
-                    rs2,
-                    funct3,
-                    ..
-                } => {
-                    let rel = (*target_offset as i64) - (*offset as i64);
-                    let word = arx64_b_type(rel as i32, *rs2, *rs1, *funct3);
-                    code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+            } else {
+                // Unresolved symbol → external relocation for the linker.
+                match patch {
+                    PatchPoint::X86Rel32 { offset, target }
+                    | PatchPoint::X86RipRel32 { offset, target } => {
+                        external_relocs.push(crate::object::ExternalReloc {
+                            offset: *offset,
+                            symbol: target.clone(),
+                        });
+                    }
+                    _ => {
+                        return Err(RasError::EncodingError(format!(
+                            "Undefined label: {}",
+                            target
+                        )));
+                    }
                 }
             }
         }
@@ -275,7 +311,7 @@ impl RasAssembler {
             })
             .collect();
 
-        Ok((code, symbols))
+        Ok((code, symbols, external_relocs))
     }
 
     /// Register a function pointer for runtime calls
@@ -539,6 +575,30 @@ fn arx64_b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8) -> u32 {
         | (((o >> 1) & 0x0f) << 8)
         | (((o >> 11) & 0x1) << 7)
         | 0x63
+}
+
+/// Maps x86 conditional-jump mnemonic to the second opcode byte of the `0F 8x rel32` encoding.
+/// Returns `None` for non-conditional-jump mnemonics.
+fn x86_cond_jmp_byte(opcode: &str) -> Option<u8> {
+    match opcode {
+        "jo" => Some(0x80),
+        "jno" => Some(0x81),
+        "jb" | "jnae" | "jc" => Some(0x82),
+        "jnb" | "jae" | "jnc" => Some(0x83),
+        "je" | "jz" => Some(0x84),
+        "jne" | "jnz" => Some(0x85),
+        "jbe" | "jna" => Some(0x86),
+        "ja" | "jnbe" => Some(0x87),
+        "js" => Some(0x88),
+        "jns" => Some(0x89),
+        "jp" | "jpe" => Some(0x8A),
+        "jnp" | "jpo" => Some(0x8B),
+        "jl" | "jnge" => Some(0x8C),
+        "jge" | "jnl" => Some(0x8D),
+        "jle" | "jng" => Some(0x8E),
+        "jg" | "jnle" => Some(0x8F),
+        _ => None,
+    }
 }
 
 /// Returns the label name if `op` has the form `label(%rip)` (RIP-relative addressing).

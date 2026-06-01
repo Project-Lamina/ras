@@ -35,6 +35,14 @@ pub struct ObjectSymbol {
     pub value: u64,
 }
 
+/// A relocation entry for an unresolved (external) symbol reference.
+/// `offset` is the byte offset within the code section of the 4-byte displacement field.
+#[derive(Debug, Clone)]
+pub struct ExternalReloc {
+    pub offset: usize,
+    pub symbol: String,
+}
+
 pub trait ObjectWriter {
     #[allow(clippy::too_many_arguments)]
     fn write_object_file(
@@ -43,6 +51,7 @@ pub trait ObjectWriter {
         code: &[u8],
         sections: &[Section],
         symbols: &[ObjectSymbol],
+        relocations: &[ExternalReloc],
         target_arch: TargetArchitecture,
         target_os: TargetOperatingSystem,
         opts: &ObjectWriteOptions,
@@ -365,6 +374,7 @@ impl ObjectWriter for ElfWriter {
         code: &[u8],
         _sections: &[Section],
         symbols: &[ObjectSymbol],
+        _relocations: &[ExternalReloc],
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         opts: &ObjectWriteOptions,
@@ -564,6 +574,7 @@ impl ObjectWriter for MachOWriter {
         _code: &[u8],
         _sections: &[Section],
         _symbols: &[ObjectSymbol],
+        _relocations: &[ExternalReloc],
         _target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         _opts: &ObjectWriteOptions,
@@ -595,6 +606,8 @@ const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 const IMAGE_SYM_CLASS_STATIC: u8 = 3;
 
+const IMAGE_REL_AMD64_REL32: u16 = 4;
+
 impl ObjectWriter for CoffWriter {
     fn write_object_file(
         &mut self,
@@ -602,6 +615,7 @@ impl ObjectWriter for CoffWriter {
         code: &[u8],
         _sections: &[Section],
         symbols: &[ObjectSymbol],
+        relocations: &[ExternalReloc],
         target_arch: TargetArchitecture,
         _target_os: TargetOperatingSystem,
         _opts: &ObjectWriteOptions,
@@ -613,60 +627,82 @@ impl ObjectWriter for CoffWriter {
             )));
         }
 
-        // Collect global (exported) symbols — these need entries in the COFF symbol table
-        // so the linker can resolve external references (e.g. `main`).
-        // Local `.L*` labels are assembler-internal and not exported.
+        // Collect unique external symbols referenced by relocations.
+        let mut extern_names: Vec<String> = Vec::new();
+        for r in relocations {
+            if !extern_names.contains(&r.symbol) {
+                extern_names.push(r.symbol.clone());
+            }
+        }
+
+        // Collect global exported functions (defined in this object).
         let exported: Vec<&ObjectSymbol> = symbols
             .iter()
             .filter(|s| s.global && !s.name.starts_with(".L"))
             .collect();
 
-        // Build COFF string table: 4-byte size header + null-terminated strings for names
-        // longer than 8 bytes. Short names (≤8 bytes) are stored inline in the symbol entry.
-        let mut strtab: Vec<u8> = vec![0u8; 4]; // placeholder for table size
+        // Build symbol table and string table.
+        // Symbol index layout: 0 = .text section, 1..=exported, then extern symbols.
+        let mut strtab: Vec<u8> = vec![0u8; 4]; // size placeholder
         let mut sym_bytes: Vec<u8> = Vec::new();
 
-        // Section symbol for .text (always present, static)
-        let text_name = b".text\0\0\0";
-        let mut sec_sym = [0u8; 18];
-        sec_sym[0..8].copy_from_slice(text_name);
-        sec_sym[12..14].copy_from_slice(&1i16.to_le_bytes()); // SectionNumber = 1
-        sec_sym[16] = IMAGE_SYM_CLASS_STATIC;
-        sym_bytes.extend_from_slice(&sec_sym);
-
-        // One symbol entry per exported function.
-        for sym in &exported {
+        let mut push_sym = |sym_bytes: &mut Vec<u8>, strtab: &mut Vec<u8>,
+                             name: &str, value: u32, section: i16,
+                             ty: u16, storage: u8| {
             let mut entry = [0u8; 18];
-            let name = sym.name.as_bytes();
-            if name.len() <= 8 {
-                entry[..name.len()].copy_from_slice(name);
+            let nb = name.as_bytes();
+            if nb.len() <= 8 {
+                entry[..nb.len()].copy_from_slice(nb);
             } else {
-                // Long name: first 4 bytes zero, next 4 bytes = offset into string table
-                let offset = strtab.len() as u32;
-                entry[4..8].copy_from_slice(&offset.to_le_bytes());
-                strtab.extend_from_slice(name);
+                let off = strtab.len() as u32;
+                entry[4..8].copy_from_slice(&off.to_le_bytes());
+                strtab.extend_from_slice(nb);
                 strtab.push(0);
             }
-            entry[8..12].copy_from_slice(&(sym.value as u32).to_le_bytes()); // offset in section
-            entry[12..14].copy_from_slice(&1i16.to_le_bytes()); // SectionNumber = 1 (.text)
-            entry[14..16].copy_from_slice(&0x20u16.to_le_bytes()); // Type = function
-            entry[16] = 2; // IMAGE_SYM_CLASS_EXTERNAL
+            entry[8..12].copy_from_slice(&value.to_le_bytes());
+            entry[12..14].copy_from_slice(&section.to_le_bytes());
+            entry[14..16].copy_from_slice(&ty.to_le_bytes());
+            entry[16] = storage;
             sym_bytes.extend_from_slice(&entry);
+        };
+
+        // Index 0: .text section symbol
+        push_sym(&mut sym_bytes, &mut strtab, ".text", 0, 1, 0, IMAGE_SYM_CLASS_STATIC);
+        // Indices 1..=exported: defined global functions
+        for sym in &exported {
+            push_sym(&mut sym_bytes, &mut strtab, &sym.name,
+                sym.value as u32, 1, 0x20, 2 /* EXTERNAL */);
+        }
+        // Indices after exported: undefined external symbols (printf, etc.)
+        let extern_base_idx = 1 + exported.len(); // 0-based index of first extern sym
+        for name in &extern_names {
+            push_sym(&mut sym_bytes, &mut strtab, name, 0, 0, 0x20, 2);
         }
 
-        // Patch string table size (includes the 4-byte size field itself)
         let strtab_size = strtab.len() as u32;
         strtab[0..4].copy_from_slice(&strtab_size.to_le_bytes());
+        let total_syms = (1 + exported.len() + extern_names.len()) as u32;
 
-        let total_syms = (1 + exported.len()) as u32; // .text section symbol + function symbols
+        // Build COFF relocation entries (10 bytes each).
+        let mut reloc_bytes: Vec<u8> = Vec::new();
+        for r in relocations {
+            let sym_idx = extern_base_idx
+                + extern_names.iter().position(|n| *n == r.symbol).unwrap_or(0);
+            reloc_bytes.extend_from_slice(&(r.offset as u32).to_le_bytes()); // VirtualAddress
+            reloc_bytes.extend_from_slice(&(sym_idx as u32).to_le_bytes());  // SymbolTableIndex
+            reloc_bytes.extend_from_slice(&IMAGE_REL_AMD64_REL32.to_le_bytes()); // Type
+        }
+        let n_relocs = relocations.len() as u16;
 
         let hdr_sz = 20usize;
         let sec_hdr_sz = 40usize;
-        let raw_off = hdr_sz + sec_hdr_sz;
         let align = 16usize;
         let padded_len = (code.len().div_ceil(align) * align) as u32;
-        let sym_off = raw_off + padded_len as usize;
+        let raw_data_off = hdr_sz + sec_hdr_sz;
+        let reloc_off = raw_data_off + padded_len as usize;
+        let sym_off = reloc_off + reloc_bytes.len();
 
+        let text_name = b".text\0\0\0";
         let sec_flags = IMAGE_SCN_CNT_CODE
             | IMAGE_SCN_ALIGN_16BYTES
             | IMAGE_SCN_MEM_EXECUTE
@@ -678,36 +714,43 @@ impl ObjectWriter for CoffWriter {
 
         // COFF file header (20 bytes)
         f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes()).map_err(map)?;
-        f.write_all(&1u16.to_le_bytes()).map_err(map)?;          // NumberOfSections
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // TimeDateStamp
-        f.write_all(&(sym_off as u32).to_le_bytes()).map_err(map)?; // PointerToSymbolTable
-        f.write_all(&total_syms.to_le_bytes()).map_err(map)?;    // NumberOfSymbols
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // SizeOfOptionalHeader
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // Characteristics
+        f.write_all(&1u16.to_le_bytes()).map_err(map)?;
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?;
+        f.write_all(&(sym_off as u32).to_le_bytes()).map_err(map)?;
+        f.write_all(&total_syms.to_le_bytes()).map_err(map)?;
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?;
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?;
 
         // .text section header (40 bytes)
-        f.write_all(text_name).map_err(map)?;                    // Name[8]
+        f.write_all(text_name).map_err(map)?;
         f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // VirtualSize
         f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // VirtualAddress
         f.write_all(&padded_len.to_le_bytes()).map_err(map)?;    // SizeOfRawData
-        f.write_all(&(raw_off as u32).to_le_bytes()).map_err(map)?; // PointerToRawData
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // PointerToRelocations
+        f.write_all(&(raw_data_off as u32).to_le_bytes()).map_err(map)?; // PointerToRawData
+        if n_relocs > 0 {
+            f.write_all(&(reloc_off as u32).to_le_bytes()).map_err(map)?; // PointerToRelocations
+        } else {
+            f.write_all(&0u32.to_le_bytes()).map_err(map)?;
+        }
         f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // PointerToLinenumbers
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // NumberOfRelocations
+        f.write_all(&n_relocs.to_le_bytes()).map_err(map)?;      // NumberOfRelocations
         f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // NumberOfLinenumbers
         f.write_all(&sec_flags.to_le_bytes()).map_err(map)?;     // Characteristics
 
-        // Section raw data (code + padding)
+        // Raw data
         f.write_all(code).map_err(map)?;
         let pad = padded_len as usize - code.len();
         if pad > 0 {
             f.write_all(&vec![0u8; pad]).map_err(map)?;
         }
 
-        // Symbol table
-        f.write_all(&sym_bytes).map_err(map)?;
+        // Relocation table
+        if !reloc_bytes.is_empty() {
+            f.write_all(&reloc_bytes).map_err(map)?;
+        }
 
-        // String table
+        // Symbol table + string table
+        f.write_all(&sym_bytes).map_err(map)?;
         f.write_all(&strtab).map_err(map)?;
 
         Ok(())
@@ -809,6 +852,7 @@ mod tests {
             &code,
             &sections,
             &symbols,
+            &[],
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Linux,
             &opts,
@@ -837,6 +881,7 @@ mod tests {
             &code,
             &sections,
             &symbols,
+            &[],
             TargetArchitecture::Aarch64,
             TargetOperatingSystem::Linux,
             &opts,
@@ -860,6 +905,7 @@ mod tests {
         w.write_object_file(
             &path,
             &code,
+            &[],
             &[],
             &[],
             TargetArchitecture::X86_64,
@@ -887,6 +933,7 @@ mod tests {
             &code,
             &[],
             &[],
+            &[],
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Linux,
             &opts,
@@ -909,6 +956,7 @@ mod tests {
         w.write_object_file(
             &path,
             &code,
+            &[],
             &[],
             &[],
             TargetArchitecture::X86_64,
