@@ -7,7 +7,7 @@ description = "ras - as/GAS alternative. Cross-platform assembler: assembly sour
 license = "Apache-2.0"
 keywords = ["assembler", "assembly", "object-file", "compiler"]
 categories = ["compilers", "development-tools"]
-repository = https://github.com/Project-Lamina/ras"
+repository = "https://github.com/Project-Lamina/ras"
 
 [[bin]]
 name = "ras"
