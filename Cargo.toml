@@ -1,6 +1,6 @@
 [package]
 name = "lamina-ras"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Eira <eira@nornity.com>"]
 description = "ras - as/GAS alternative. Cross-platform assembler: assembly source (.s) to relocatable object files (.o). Used by Lamina, usable standalone."
@@ -18,9 +18,9 @@ name = "ras"
 path = "src/lib.rs"
 
 [dependencies]
-lamina-platform = { path = "../lamina-platform", version = "0.1.0" }
-lamina-mir = { path = "../lamina-mir", version = "0.1.0", optional = true }
-lamina-codegen = { path = "../lamina-codegen", version = "0.1.0" }
+lamina-platform = "0.1.0"
+lamina-mir = { version = "0.1.0", optional = true }
+lamina-codegen = "0.1.1"
 libc = "0.2"
 
 [features]

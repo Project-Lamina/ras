@@ -1,5 +1,6 @@
 //! AArch64 `LDR` / `STR` with immediate offset: shared by the MIR JIT assembler and the
 //! `.s` text encoder so encoding rules stay in one place.
+#![allow(dead_code)]
 
 use crate::error::RasError;
 
