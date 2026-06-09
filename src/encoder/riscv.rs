@@ -587,7 +587,7 @@ mod tests {
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!(word & 0x7F, 0x13); // opcode OP-IMM
         assert_eq!((word >> 7) & 0x1F, 5); // rd = t0 = 5
-        assert_eq!((word >> 20) as i32 as i32, 42); // imm = 42 (sign-extended)
+        assert_eq!((word >> 20) as i32, 42); // imm = 42 (sign-extended)
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(word & 0x7F, 0x67); // JALR opcode
         assert_eq!((word >> 7) & 0x1F, 0); // rd = x0
         assert_eq!((word >> 15) & 0x1F, 1); // rs1 = ra
-        assert_eq!((word >> 20), 0); // imm = 0
+        assert_eq!(word >> 20, 0); // imm = 0
     }
 
     #[test]
