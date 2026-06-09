@@ -877,7 +877,9 @@ pub fn object_writer_for_os(
         | TargetOperatingSystem::OpenBSD
         | TargetOperatingSystem::NetBSD
         | TargetOperatingSystem::DragonFly
-        | TargetOperatingSystem::Redox => Ok(Box::new(ElfWriter::new())),
+        | TargetOperatingSystem::Redox
+        | TargetOperatingSystem::Orbis
+        | TargetOperatingSystem::Prospero => Ok(Box::new(ElfWriter::new())),
         TargetOperatingSystem::MacOS => Ok(Box::new(MachOWriter::new())),
         TargetOperatingSystem::Windows => Ok(Box::new(CoffWriter::new())),
         _ => Err(RasError::UnsupportedTarget(format!(
