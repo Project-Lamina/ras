@@ -2325,7 +2325,7 @@ mod aarch64_jit_tail_call_tests {
     }
 
     /// BaseOffset loads/stores used to mask the displacement with 0x1FF while allowing up to 0xFFF,
-    /// corrupting addresses for offsets in (255, 0xFFF] (same failure mode as multi-arg call STR).
+    /// corrupting addresses for offsets in [255, 0xFFF] (same failure mode as multi-arg call STR).
     #[test]
     fn compile_mir_aarch64_load_scaled_base_offset_encodes() {
         let i64_ty = MirType::Scalar(ScalarType::I64);

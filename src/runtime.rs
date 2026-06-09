@@ -262,7 +262,7 @@ impl ExecutableMemory {
     /// The caller must ensure `F` matches the ABI and signature of the generated code, and that
     /// this `ExecutableMemory` outlives every call through `F`.
     pub unsafe fn entry_fn<F: Sized>(&self) -> F {
-        debug_assert_eq!(core::mem::size_of::<F>(), core::mem::size_of::<*mut u8>());
+        debug_assert_eq!(size_of::<F>(), size_of::<*mut u8>());
         unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 }

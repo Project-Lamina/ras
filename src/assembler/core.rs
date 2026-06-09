@@ -31,7 +31,7 @@ pub struct RasAssembler {
     encoder: Box<dyn InstructionEncoder>,
     object_writer: Box<dyn ObjectWriter>,
     object_write_options: ObjectWriteOptions,
-    pub(crate) function_pointers: std::collections::HashMap<String, u64>, // Function name -> address
+    pub(crate) function_pointers: HashMap<String, u64>, // Function name -> address
     #[cfg(feature = "encoder")]
     pub(crate) current_module: Option<*const lamina_mir::Module>, // Current module being compiled (for internal call detection)
 }
@@ -107,7 +107,7 @@ impl RasAssembler {
             encoder,
             object_writer,
             object_write_options,
-            function_pointers: std::collections::HashMap::new(),
+            function_pointers: HashMap::new(),
             #[cfg(feature = "encoder")]
             current_module: None,
         })
@@ -218,7 +218,7 @@ impl RasAssembler {
 
                     if is_jmp_call && inst.operands.len() == 1 {
                         let target = inst.operands[0].trim();
-                        if self.target_arch == lamina_platform::TargetArchitecture::X86_64 {
+                        if self.target_arch == TargetArchitecture::X86_64 {
                             let is_call = opcode == "call";
                             let opcode_byte: u8 = if is_call { 0xe8 } else { 0xe9 };
                             code.push(opcode_byte);
@@ -628,7 +628,7 @@ fn extract_rip_label(op: &str) -> Option<&str> {
     Some(label)
 }
 
-fn parse_x86_reg(s: &str) -> Result<u8, crate::error::RasError> {
+fn parse_x86_reg(s: &str) -> Result<u8, RasError> {
     let s = s.trim().trim_start_matches('%');
     match s {
         "rax" | "eax" => Ok(0),
@@ -647,7 +647,7 @@ fn parse_x86_reg(s: &str) -> Result<u8, crate::error::RasError> {
         "r13" => Ok(13),
         "r14" => Ok(14),
         "r15" => Ok(15),
-        _ => Err(crate::error::RasError::EncodingError(format!(
+        _ => Err(RasError::EncodingError(format!(
             "Unknown x86 register: {}",
             s
         ))),
