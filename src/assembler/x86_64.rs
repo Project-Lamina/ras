@@ -5,6 +5,7 @@
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
 use std::collections::HashMap;
+use lamina_mir::{MirType, ScalarType};
 
 /// Compile MIR to binary for x86_64
 ///
@@ -308,7 +309,6 @@ enum X86GpStoreToMemKind {
 }
 
 fn mir_ty_x86_gp_load_kind(ty: &lamina_mir::MirType) -> Result<X86GpLoadFromMemKind, RasError> {
-    use lamina_mir::{MirType, ScalarType};
     match ty {
         MirType::Scalar(ScalarType::I1) => Ok(X86GpLoadFromMemKind::I8Z),
         MirType::Scalar(ScalarType::I8) => Ok(X86GpLoadFromMemKind::I8S),
@@ -326,7 +326,6 @@ fn mir_ty_x86_gp_load_kind(ty: &lamina_mir::MirType) -> Result<X86GpLoadFromMemK
 }
 
 fn mir_ty_x86_gp_store_kind(ty: &lamina_mir::MirType) -> Result<X86GpStoreToMemKind, RasError> {
-    use lamina_mir::{MirType, ScalarType};
     match ty {
         MirType::Scalar(ScalarType::I1 | ScalarType::I8) => Ok(X86GpStoreToMemKind::I8),
         MirType::Scalar(ScalarType::I16) => Ok(X86GpStoreToMemKind::I16),
@@ -834,7 +833,6 @@ fn store_int_binop_result_x86_64(
     v: &lamina_mir::VirtualReg,
     ty: &lamina_mir::MirType,
 ) -> Result<Vec<u8>, RasError> {
-    use lamina_mir::{MirType, ScalarType};
     let off = slots
         .get(v)
         .copied()
