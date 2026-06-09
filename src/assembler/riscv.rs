@@ -7,6 +7,7 @@
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
 use std::collections::HashMap;
+use lamina_mir::{Immediate, Operand, Register, Instruction, IntBinOp, IntCmpOp, MirType, ScalarType, Operand as Op};
 
 // ---------------------------------------------------------------------------
 // RISC-V instruction format encoders
@@ -432,7 +433,6 @@ fn materialize_operand(
     stack_slots: &HashMap<lamina_mir::VirtualReg, i32>,
     rv64: bool,
 ) -> Result<(), RasError> {
-    use lamina_mir::{Immediate, Operand, Register};
     match operand {
         Operand::Immediate(imm) => {
             let v: i64 = match imm {
@@ -471,7 +471,6 @@ fn store_result(
     stack_slots: &HashMap<lamina_mir::VirtualReg, i32>,
     rv64: bool,
 ) -> Result<(), RasError> {
-    use lamina_mir::Register;
     match dst {
         Register::Virtual(vreg) => {
             let slot = stack_slots.get(vreg).ok_or_else(|| {
@@ -549,7 +548,6 @@ fn encode_instruction(
     branch_fixups: &mut Vec<(usize, String, BranchFixupOp)>,
     base_offset: usize, // offset of `code[0]` in the final buffer
 ) -> Result<(), RasError> {
-    use lamina_mir::{Instruction, IntBinOp, IntCmpOp, MirType, ScalarType};
 
     match inst {
         // ---- IntBinary ----
@@ -719,7 +717,6 @@ fn encode_instruction(
             false_target,
         } => {
             // Load condition register into t0
-            use lamina_mir::Operand as Op;
             let cond_operand = Op::Register(cond.clone());
             materialize_operand(code, &cond_operand, REG_T0, stack_slots, rv64)?;
 

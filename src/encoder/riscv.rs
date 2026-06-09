@@ -545,7 +545,6 @@ impl InstructionEncoder for RiscVEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoder::traits::ParsedInstruction;
 
     fn instr(opcode: &str, operands: &[&str]) -> ParsedInstruction {
         ParsedInstruction {
