@@ -6,7 +6,9 @@
 
 use crate::encoder::traits::InstructionEncoder;
 use crate::error::RasError;
-use crate::object::{ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter};
+use crate::object::{
+    ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
+};
 use crate::parser::{AssemblyParser, Line};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
@@ -173,12 +175,12 @@ impl RasAssembler {
                     if self.target_arch == TargetArchitecture::Arx64
                         && let Some(patch) =
                             arx64_label_patch(&opcode, &inst.operands, current_offset)?
-                        {
-                            code.extend_from_slice(&[0u8; 4]);
-                            patch_points.push(patch);
-                            current_offset += 4;
-                            continue;
-                        }
+                    {
+                        code.extend_from_slice(&[0u8; 4]);
+                        patch_points.push(patch);
+                        current_offset += 4;
+                        continue;
+                    }
 
                     // Handle leaq/lea with RIP-relative label: "leaq label(%rip), %reg"
                     if self.target_arch == TargetArchitecture::X86_64
@@ -186,9 +188,8 @@ impl RasAssembler {
                         && inst.operands.len() == 2
                         && let Some(label) = extract_rip_label(inst.operands[0].trim())
                     {
-                        let reg = parse_x86_reg(inst.operands[1].trim()).map_err(|e| {
-                            RasError::EncodingError(e.to_string())
-                        })?;
+                        let reg = parse_x86_reg(inst.operands[1].trim())
+                            .map_err(|e| RasError::EncodingError(e.to_string()))?;
                         // REX.W=1, REX.R set if reg>=8; opcode=0x8D; ModRM Mod=00 R/M=101(RIP-rel)
                         let rex: u8 = 0x48 | ((reg >> 3) << 2);
                         let modrm: u8 = ((reg & 7) << 3) | 5;

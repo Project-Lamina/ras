@@ -747,7 +747,9 @@ impl InstructionEncoder for X86_64Encoder {
                         RasError::EncodingError("Invalid immediate for movb".into())
                     })?;
                     let (disp, base) = self.parse_memory(dst_str)?;
-                    if base >= 8 { code.push(0x41); }
+                    if base >= 8 {
+                        code.push(0x41);
+                    }
                     code.push(0xC6);
                     if disp == 0 && base != 5 {
                         code.push(base & 7);
@@ -760,7 +762,9 @@ impl InstructionEncoder for X86_64Encoder {
                     }
                     code.push(imm as u8);
                 } else {
-                    return Err(RasError::EncodingError("movb: unsupported operand form".into()));
+                    return Err(RasError::EncodingError(
+                        "movb: unsupported operand form".into(),
+                    ));
                 }
             }
             // syscall: 0F 05
@@ -770,22 +774,30 @@ impl InstructionEncoder for X86_64Encoder {
             // SETcc for unsigned comparisons
             "seta" | "setnbe" => {
                 let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 { code.push(0x40 | (reg >> 3)); }
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
                 code.extend_from_slice(&[0x0F, 0x97, 0xC0 | (reg & 7)]);
             }
             "setae" | "setnb" | "setnc" => {
                 let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 { code.push(0x40 | (reg >> 3)); }
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
                 code.extend_from_slice(&[0x0F, 0x93, 0xC0 | (reg & 7)]);
             }
             "setb" | "setnae" | "setc" => {
                 let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 { code.push(0x40 | (reg >> 3)); }
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
                 code.extend_from_slice(&[0x0F, 0x92, 0xC0 | (reg & 7)]);
             }
             "setbe" | "setna" => {
                 let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 { code.push(0x40 | (reg >> 3)); }
+                if reg >= 4 {
+                    code.push(0x40 | (reg >> 3));
+                }
                 code.extend_from_slice(&[0x0F, 0x96, 0xC0 | (reg & 7)]);
             }
             // cmovzq / cmovz (conditional move if ZF=1)
@@ -807,29 +819,47 @@ impl InstructionEncoder for X86_64Encoder {
                 let src_str = inst.operands[0].trim().trim_start_matches('%');
                 let dst_str = inst.operands[1].trim().trim_start_matches('%');
                 // movd %gpr, %xmm  →  66 [REX.W] 0F 6E /r
-                if let (Ok(gpr), Some(xmm)) =
-                    (self.parse_register(inst.operands[0].trim()), parse_xmm(dst_str))
-                {
-                    let need_rex_w = inst.operands[0].trim().trim_start_matches('%').starts_with('r');
+                if let (Ok(gpr), Some(xmm)) = (
+                    self.parse_register(inst.operands[0].trim()),
+                    parse_xmm(dst_str),
+                ) {
+                    let need_rex_w = inst.operands[0]
+                        .trim()
+                        .trim_start_matches('%')
+                        .starts_with('r');
                     code.push(0x66);
                     if need_rex_w || gpr >= 8 || xmm >= 8 {
-                        code.push(0x40 | (if need_rex_w { 8 } else { 0 }) | ((xmm >> 3) << 2) | (gpr >> 3));
+                        code.push(
+                            0x40 | (if need_rex_w { 8 } else { 0 })
+                                | ((xmm >> 3) << 2)
+                                | (gpr >> 3),
+                        );
                     }
                     code.extend_from_slice(&[0x0F, 0x6E]);
                     code.push(0xC0 | ((xmm & 7) << 3) | (gpr & 7));
-                } else if let (Some(xmm), Ok(gpr)) =
-                    (parse_xmm(src_str), self.parse_register(inst.operands[1].trim()))
-                {
+                } else if let (Some(xmm), Ok(gpr)) = (
+                    parse_xmm(src_str),
+                    self.parse_register(inst.operands[1].trim()),
+                ) {
                     // movd %xmm, %gpr  →  66 [REX.W] 0F 7E /r
-                    let need_rex_w = inst.operands[1].trim().trim_start_matches('%').starts_with('r');
+                    let need_rex_w = inst.operands[1]
+                        .trim()
+                        .trim_start_matches('%')
+                        .starts_with('r');
                     code.push(0x66);
                     if need_rex_w || xmm >= 8 || gpr >= 8 {
-                        code.push(0x40 | (if need_rex_w { 8 } else { 0 }) | ((xmm >> 3) << 2) | (gpr >> 3));
+                        code.push(
+                            0x40 | (if need_rex_w { 8 } else { 0 })
+                                | ((xmm >> 3) << 2)
+                                | (gpr >> 3),
+                        );
                     }
                     code.extend_from_slice(&[0x0F, 0x7E]);
                     code.push(0xC0 | ((xmm & 7) << 3) | (gpr & 7));
                 } else {
-                    return Err(RasError::EncodingError("movd: expected gpr↔xmm operands".into()));
+                    return Err(RasError::EncodingError(
+                        "movd: expected gpr↔xmm operands".into(),
+                    ));
                 }
             }
             // xorps: 0F 57 /r
