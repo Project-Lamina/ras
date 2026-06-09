@@ -27,6 +27,8 @@ pub fn is_assembly_target_supported(arch: TargetArchitecture, os: TargetOperatin
             | TargetOperatingSystem::NetBSD
             | TargetOperatingSystem::DragonFly
             | TargetOperatingSystem::Redox
+            | TargetOperatingSystem::Orbis
+            | TargetOperatingSystem::Prospero
     )
 }
 
@@ -70,6 +72,8 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
             | TargetOperatingSystem::NetBSD
             | TargetOperatingSystem::DragonFly
             | TargetOperatingSystem::Redox
+            | TargetOperatingSystem::Orbis
+            | TargetOperatingSystem::Prospero
     )
 }
 
@@ -105,7 +109,7 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
             );
         }
         format!(
-            "OS {:?} not supported. Supported: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, Redox.",
+            "OS {:?} not supported. Supported: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, Redox, Orbis (PS4), Prospero (PS5).",
             os
         )
     } else {
