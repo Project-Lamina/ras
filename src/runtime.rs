@@ -181,11 +181,7 @@ impl ExecutableMemory {
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 use crate::runtime::windows_memory::{FlushInstructionCache, GetCurrentProcess};
-                FlushInstructionCache(
-                    GetCurrentProcess(),
-                    self.ptr.cast(),
-                    self.size,
-                );
+                FlushInstructionCache(GetCurrentProcess(), self.ptr.cast(), self.size);
             }
 
             Ok(())

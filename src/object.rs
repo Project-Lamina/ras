@@ -1,9 +1,9 @@
 //! Object file generation: ELF (Linux/BSD), Mach-O (macOS), COFF/PE (Windows).
 
 use crate::error::RasError;
+use crate::parser::Section;
 #[cfg(test)]
 use crate::parser::SectionFlags;
-use crate::parser::Section;
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::io::Write;
 
@@ -281,7 +281,8 @@ fn write_elf64_section_header_full<W: Write>(
 ) -> Result<(), RasError> {
     let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
     w.write_all(&header.name.to_le_bytes()).map_err(map)?;
-    w.write_all(&header.section_type.to_le_bytes()).map_err(map)?;
+    w.write_all(&header.section_type.to_le_bytes())
+        .map_err(map)?;
     w.write_all(&header.flags.to_le_bytes()).map_err(map)?;
     w.write_all(&0u64.to_le_bytes()).map_err(map)?; // sh_addr
     w.write_all(&header.offset.to_le_bytes()).map_err(map)?;
@@ -303,7 +304,8 @@ fn write_elf64_symbol<W: Write>(
 ) -> Result<(), RasError> {
     let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
     w.write_all(&name_offset.to_le_bytes()).map_err(map)?;
-    w.write_all(&[(bind << 4) | (sym_type & 0xf)]).map_err(map)?;
+    w.write_all(&[(bind << 4) | (sym_type & 0xf)])
+        .map_err(map)?;
     w.write_all(&[0u8]).map_err(map)?; // st_other
     w.write_all(&section_index.to_le_bytes()).map_err(map)?;
     w.write_all(&value.to_le_bytes()).map_err(map)?;
@@ -363,7 +365,14 @@ fn build_symtab_with_externals(
         strtab.extend_from_slice(sym.name.as_bytes());
         strtab.push(0);
         let mut e = Vec::new();
-        let _ = write_elf64_symbol(&mut e, name_off, STB_LOCAL, STT_FUNC, TEXT_SECTION_INDEX, sym.value);
+        let _ = write_elf64_symbol(
+            &mut e,
+            name_off,
+            STB_LOCAL,
+            STT_FUNC,
+            TEXT_SECTION_INDEX,
+            sym.value,
+        );
         symtab.extend_from_slice(&e);
     }
 
@@ -375,7 +384,14 @@ fn build_symtab_with_externals(
         strtab.extend_from_slice(sym.name.as_bytes());
         strtab.push(0);
         let mut e = Vec::new();
-        let _ = write_elf64_symbol(&mut e, name_off, STB_GLOBAL, STT_FUNC, TEXT_SECTION_INDEX, sym.value);
+        let _ = write_elf64_symbol(
+            &mut e,
+            name_off,
+            STB_GLOBAL,
+            STT_FUNC,
+            TEXT_SECTION_INDEX,
+            sym.value,
+        );
         symtab.extend_from_slice(&e);
     }
 
@@ -422,8 +438,8 @@ fn build_rela_text(
         let sym_idx = *seen.get(reloc.symbol.as_str()).unwrap_or(&0) as u64;
         let r_info = (sym_idx << 32) | rel_type;
         out.extend_from_slice(&(reloc.offset as u64).to_le_bytes()); // r_offset
-        out.extend_from_slice(&r_info.to_le_bytes());                // r_info
-        out.extend_from_slice(&(-4i64).to_le_bytes());               // r_addend = -4
+        out.extend_from_slice(&r_info.to_le_bytes()); // r_info
+        out.extend_from_slice(&(-4i64).to_le_bytes()); // r_addend = -4
     }
     out
 }
@@ -557,19 +573,45 @@ impl ObjectWriter for ElfWriter {
         //   Without rela: [0] NULL  [1] .text  [2] .symtab  [3] .strtab  [4] .shstrtab
         //   With rela:    [0] NULL  [1] .text  [2] .rela.text  [3] .symtab  [4] .strtab  [5] .shstrtab
         const SHSTRTAB_NO_RELA: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
-        const SHSTRTAB_RELA: &[u8] =
-            b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0";
+        const SHSTRTAB_RELA: &[u8] = b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0";
 
-        let (shstrtab, name_text, name_rela_text, name_symtab, name_strtab, name_shstrtab,
-             section_count, shstrtab_index, symtab_section_index, strtab_section_index) =
-        if has_rela {
-            (SHSTRTAB_RELA,
-             1u32, 7u32, 18u32, 26u32, 34u32,
-             6u16, 5u16, 3u32, 4u32)
+        let (
+            shstrtab,
+            name_text,
+            name_rela_text,
+            name_symtab,
+            name_strtab,
+            name_shstrtab,
+            section_count,
+            shstrtab_index,
+            symtab_section_index,
+            strtab_section_index,
+        ) = if has_rela {
+            (
+                SHSTRTAB_RELA,
+                1u32,
+                7u32,
+                18u32,
+                26u32,
+                34u32,
+                6u16,
+                5u16,
+                3u32,
+                4u32,
+            )
         } else {
-            (SHSTRTAB_NO_RELA,
-             1u32, 0u32, 7u32, 15u32, 23u32,
-             5u16, 4u16, 2u32, 3u32)
+            (
+                SHSTRTAB_NO_RELA,
+                1u32,
+                0u32,
+                7u32,
+                15u32,
+                23u32,
+                5u16,
+                4u16,
+                2u32,
+                3u32,
+            )
         };
 
         let shoff = ELF64_HEADER_SIZE as u64;
@@ -605,7 +647,7 @@ impl ObjectWriter for ElfWriter {
                     flags: SHF_INFO_LINK,
                     offset: rela_offset,
                     size: rela_size,
-                    link: symtab_section_index,    // points to .symtab
+                    link: symtab_section_index,      // points to .symtab
                     info: TEXT_SECTION_INDEX as u32, // relocates .text
                     addralign: 8,
                     entsize: ELF64_RELA_SIZE,
@@ -753,9 +795,13 @@ impl ObjectWriter for CoffWriter {
         let mut strtab: Vec<u8> = vec![0u8; 4]; // size placeholder
         let mut sym_bytes: Vec<u8> = Vec::new();
 
-        let push_sym = |sym_bytes: &mut Vec<u8>, strtab: &mut Vec<u8>,
-                             name: &str, value: u32, section: i16,
-                             ty: u16, storage: u8| {
+        let push_sym = |sym_bytes: &mut Vec<u8>,
+                        strtab: &mut Vec<u8>,
+                        name: &str,
+                        value: u32,
+                        section: i16,
+                        ty: u16,
+                        storage: u8| {
             let mut entry = [0u8; 18];
             let nb = name.as_bytes();
             if nb.len() <= 8 {
@@ -774,11 +820,26 @@ impl ObjectWriter for CoffWriter {
         };
 
         // Index 0: .text section symbol
-        push_sym(&mut sym_bytes, &mut strtab, ".text", 0, 1, 0, IMAGE_SYM_CLASS_STATIC);
+        push_sym(
+            &mut sym_bytes,
+            &mut strtab,
+            ".text",
+            0,
+            1,
+            0,
+            IMAGE_SYM_CLASS_STATIC,
+        );
         // Indices 1..=exported: defined global functions
         for sym in &exported {
-            push_sym(&mut sym_bytes, &mut strtab, &sym.name,
-                sym.value as u32, 1, 0x20, 2 /* EXTERNAL */);
+            push_sym(
+                &mut sym_bytes,
+                &mut strtab,
+                &sym.name,
+                sym.value as u32,
+                1,
+                0x20,
+                2, /* EXTERNAL */
+            );
         }
         // Indices after exported: undefined external symbols (printf, etc.)
         let extern_base_idx = 1 + exported.len(); // 0-based index of first extern sym
@@ -794,9 +855,12 @@ impl ObjectWriter for CoffWriter {
         let mut reloc_bytes: Vec<u8> = Vec::new();
         for r in relocations {
             let sym_idx = extern_base_idx
-                + extern_names.iter().position(|n| *n == r.symbol).unwrap_or(0);
+                + extern_names
+                    .iter()
+                    .position(|n| *n == r.symbol)
+                    .unwrap_or(0);
             reloc_bytes.extend_from_slice(&(r.offset as u32).to_le_bytes()); // VirtualAddress
-            reloc_bytes.extend_from_slice(&(sym_idx as u32).to_le_bytes());  // SymbolTableIndex
+            reloc_bytes.extend_from_slice(&(sym_idx as u32).to_le_bytes()); // SymbolTableIndex
             reloc_bytes.extend_from_slice(&IMAGE_REL_AMD64_REL32.to_le_bytes()); // Type
         }
         let n_relocs = relocations.len() as u16;
@@ -820,7 +884,8 @@ impl ObjectWriter for CoffWriter {
             .map_err(|e| RasError::ObjectError(format!("Failed to create COFF file: {}", e)))?;
 
         // COFF file header (20 bytes)
-        f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes()).map_err(map)?;
+        f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes())
+            .map_err(map)?;
         f.write_all(&1u16.to_le_bytes()).map_err(map)?;
         f.write_all(&0u32.to_le_bytes()).map_err(map)?;
         f.write_all(&(sym_off as u32).to_le_bytes()).map_err(map)?;
@@ -830,19 +895,21 @@ impl ObjectWriter for CoffWriter {
 
         // .text section header (40 bytes)
         f.write_all(text_name).map_err(map)?;
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // VirtualSize
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // VirtualAddress
-        f.write_all(&padded_len.to_le_bytes()).map_err(map)?;    // SizeOfRawData
-        f.write_all(&(raw_data_off as u32).to_le_bytes()).map_err(map)?; // PointerToRawData
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?; // VirtualSize
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?; // VirtualAddress
+        f.write_all(&padded_len.to_le_bytes()).map_err(map)?; // SizeOfRawData
+        f.write_all(&(raw_data_off as u32).to_le_bytes())
+            .map_err(map)?; // PointerToRawData
         if n_relocs > 0 {
-            f.write_all(&(reloc_off as u32).to_le_bytes()).map_err(map)?; // PointerToRelocations
+            f.write_all(&(reloc_off as u32).to_le_bytes())
+                .map_err(map)?; // PointerToRelocations
         } else {
             f.write_all(&0u32.to_le_bytes()).map_err(map)?;
         }
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?;          // PointerToLinenumbers
-        f.write_all(&n_relocs.to_le_bytes()).map_err(map)?;      // NumberOfRelocations
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?;          // NumberOfLinenumbers
-        f.write_all(&sec_flags.to_le_bytes()).map_err(map)?;     // Characteristics
+        f.write_all(&0u32.to_le_bytes()).map_err(map)?; // PointerToLinenumbers
+        f.write_all(&n_relocs.to_le_bytes()).map_err(map)?; // NumberOfRelocations
+        f.write_all(&0u16.to_le_bytes()).map_err(map)?; // NumberOfLinenumbers
+        f.write_all(&sec_flags.to_le_bytes()).map_err(map)?; // Characteristics
 
         // Raw data
         f.write_all(code).map_err(map)?;
@@ -962,12 +1029,18 @@ mod tests {
         let symbols: Vec<ObjectSymbol> = vec![];
         let path = std::env::temp_dir().join("ras_elf_test_x86_64.o");
         let opts = ObjectWriteOptions::default();
-        let result = w.write_object_file(&path, &ObjectWriteRequest {
-            code: &code, sections: &sections, symbols: &symbols, relocations: &[],
-            target_arch: TargetArchitecture::X86_64,
-            target_os: TargetOperatingSystem::Linux,
-            opts: &opts,
-        });
+        let result = w.write_object_file(
+            &path,
+            &ObjectWriteRequest {
+                code: &code,
+                sections: &sections,
+                symbols: &symbols,
+                relocations: &[],
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Linux,
+                opts: &opts,
+            },
+        );
         let _ = std::fs::remove_file(&path);
         result.expect("ELF write should succeed");
     }
@@ -978,17 +1051,27 @@ mod tests {
         let code = [0xc0, 0x03, 0x5f, 0xd6];
         let sections = vec![Section {
             name: ".text".to_string(),
-            flags: SectionFlags { alloc: true, exec: true, write: false },
+            flags: SectionFlags {
+                alloc: true,
+                exec: true,
+                write: false,
+            },
         }];
         let symbols: Vec<ObjectSymbol> = vec![];
         let path = std::env::temp_dir().join("ras_elf_test_aarch64.o");
         let opts = ObjectWriteOptions::default();
-        let result = w.write_object_file(&path, &ObjectWriteRequest {
-            code: &code, sections: &sections, symbols: &symbols, relocations: &[],
-            target_arch: TargetArchitecture::Aarch64,
-            target_os: TargetOperatingSystem::Linux,
-            opts: &opts,
-        });
+        let result = w.write_object_file(
+            &path,
+            &ObjectWriteRequest {
+                code: &code,
+                sections: &sections,
+                symbols: &symbols,
+                relocations: &[],
+                target_arch: TargetArchitecture::Aarch64,
+                target_os: TargetOperatingSystem::Linux,
+                opts: &opts,
+            },
+        );
         let _ = std::fs::remove_file(&path);
         result.expect("ELF write should succeed");
     }
@@ -1006,12 +1089,19 @@ mod tests {
         let code = [0xc3u8];
         let path = std::env::temp_dir().join("ras_elf_magic_test.o");
         let opts = ObjectWriteOptions::default();
-        w.write_object_file(&path, &ObjectWriteRequest {
-            code: &code, sections: &[], symbols: &[], relocations: &[],
-            target_arch: TargetArchitecture::X86_64,
-            target_os: TargetOperatingSystem::Linux,
-            opts: &opts,
-        }).expect("write");
+        w.write_object_file(
+            &path,
+            &ObjectWriteRequest {
+                code: &code,
+                sections: &[],
+                symbols: &[],
+                relocations: &[],
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Linux,
+                opts: &opts,
+            },
+        )
+        .expect("write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
@@ -1027,12 +1117,19 @@ mod tests {
             emit_minimal_dwarf_sections: true,
             dwarf_decl_file_name: "t.s".to_string(),
         };
-        w.write_object_file(&path, &ObjectWriteRequest {
-            code: &code, sections: &[], symbols: &[], relocations: &[],
-            target_arch: TargetArchitecture::X86_64,
-            target_os: TargetOperatingSystem::Linux,
-            opts: &opts,
-        }).expect("write");
+        w.write_object_file(
+            &path,
+            &ObjectWriteRequest {
+                code: &code,
+                sections: &[],
+                symbols: &[],
+                relocations: &[],
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Linux,
+                opts: &opts,
+            },
+        )
+        .expect("write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert!(
@@ -1047,12 +1144,19 @@ mod tests {
         let code = [0xc3u8];
         let path = std::env::temp_dir().join("ras_coff_test.obj");
         let opts = ObjectWriteOptions::default();
-        w.write_object_file(&path, &ObjectWriteRequest {
-            code: &code, sections: &[], symbols: &[], relocations: &[],
-            target_arch: TargetArchitecture::X86_64,
-            target_os: TargetOperatingSystem::Windows,
-            opts: &opts,
-        }).expect("coff write");
+        w.write_object_file(
+            &path,
+            &ObjectWriteRequest {
+                code: &code,
+                sections: &[],
+                symbols: &[],
+                relocations: &[],
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Windows,
+                opts: &opts,
+            },
+        )
+        .expect("coff write");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         assert_eq!(&buf[0..2], &IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
