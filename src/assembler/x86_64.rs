@@ -1424,8 +1424,8 @@ fn encode_mir_instruction_x86_64(
 
 #[cfg(all(test, feature = "encoder"))]
 mod x86_64_jit_inst_tests {
-    use super::compile_mir_x86_64_function;
-    use super::{X86GpStoreToMemKind, encode_gp_store_membase_x86_64, encode_mov_r8_reg_mem_rbp};
+    use crate::compile_mir_x86_64_function;
+    use crate::{X86GpStoreToMemKind, encode_gp_store_membase_x86_64, encode_mov_r8_reg_mem_rbp};
     use crate::assembler::core::RasAssembler;
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};

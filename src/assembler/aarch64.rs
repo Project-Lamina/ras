@@ -2171,7 +2171,7 @@ fn materialize_operand_aarch64(
 
 #[cfg(all(test, feature = "encoder"))]
 mod aarch64_jit_tail_call_tests {
-    use super::compile_mir_aarch64_function;
+    use crate::compile_mir_aarch64_function;
     use crate::assembler::core::RasAssembler;
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};
