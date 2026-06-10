@@ -6,8 +6,11 @@
 
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
+use lamina_mir::{
+    Immediate, Instruction, IntBinOp, IntCmpOp, MirType, Operand, Operand as Op, Register,
+    ScalarType,
+};
 use std::collections::HashMap;
-use lamina_mir::{Immediate, Operand, Register, Instruction, IntBinOp, IntCmpOp, MirType, ScalarType, Operand as Op};
 
 // ---------------------------------------------------------------------------
 // RISC-V instruction format encoders
@@ -548,7 +551,6 @@ fn encode_instruction(
     branch_fixups: &mut Vec<(usize, String, BranchFixupOp)>,
     base_offset: usize, // offset of `code[0]` in the final buffer
 ) -> Result<(), RasError> {
-
     match inst {
         // ---- IntBinary ----
         Instruction::IntBinary {

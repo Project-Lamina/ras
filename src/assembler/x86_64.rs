@@ -4,8 +4,8 @@
 
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
-use std::collections::HashMap;
 use lamina_mir::{MirType, ScalarType};
+use std::collections::HashMap;
 
 /// Compile MIR to binary for x86_64
 ///
