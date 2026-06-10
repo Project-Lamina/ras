@@ -2171,7 +2171,7 @@ fn materialize_operand_aarch64(
 
 #[cfg(all(test, feature = "encoder"))]
 mod aarch64_jit_tail_call_tests {
-    use super::compile_mir_aarch64_function;
+    use crate::compile_mir_aarch64_function;
     use crate::assembler::core::RasAssembler;
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};
@@ -2325,7 +2325,7 @@ mod aarch64_jit_tail_call_tests {
     }
 
     /// BaseOffset loads/stores used to mask the displacement with 0x1FF while allowing up to 0xFFF,
-    /// corrupting addresses for offsets in (255, 0xFFF] (same failure mode as multi-arg call STR).
+    /// corrupting addresses for offsets in [255, 0xFFF] (same failure mode as multi-arg call STR).
     #[test]
     fn compile_mir_aarch64_load_scaled_base_offset_encodes() {
         let i64_ty = MirType::Scalar(ScalarType::I64);

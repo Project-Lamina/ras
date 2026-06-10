@@ -7,6 +7,7 @@
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
 use std::collections::HashMap;
+use lamina_mir::{Immediate, Operand, Register, Instruction, IntBinOp, IntCmpOp, MirType, ScalarType, Operand as Op};
 
 // ---------------------------------------------------------------------------
 // RISC-V instruction format encoders
@@ -432,7 +433,6 @@ fn materialize_operand(
     stack_slots: &HashMap<lamina_mir::VirtualReg, i32>,
     rv64: bool,
 ) -> Result<(), RasError> {
-    use lamina_mir::{Immediate, Operand, Register};
     match operand {
         Operand::Immediate(imm) => {
             let v: i64 = match imm {
@@ -471,7 +471,6 @@ fn store_result(
     stack_slots: &HashMap<lamina_mir::VirtualReg, i32>,
     rv64: bool,
 ) -> Result<(), RasError> {
-    use lamina_mir::Register;
     match dst {
         Register::Virtual(vreg) => {
             let slot = stack_slots.get(vreg).ok_or_else(|| {
@@ -549,7 +548,6 @@ fn encode_instruction(
     branch_fixups: &mut Vec<(usize, String, BranchFixupOp)>,
     base_offset: usize, // offset of `code[0]` in the final buffer
 ) -> Result<(), RasError> {
-    use lamina_mir::{Instruction, IntBinOp, IntCmpOp, MirType, ScalarType};
 
     match inst {
         // ---- IntBinary ----
@@ -682,10 +680,11 @@ fn encode_instruction(
         // ---- Ret ----
         Instruction::Ret { value } => {
             if let Some(v) = value
-                && ret_ty.is_some() {
-                    // Move return value into a0 (x10)
-                    materialize_operand(code, v, ARG_REGS[0], stack_slots, rv64)?;
-                }
+                && ret_ty.is_some()
+            {
+                // Move return value into a0 (x10)
+                materialize_operand(code, v, ARG_REGS[0], stack_slots, rv64)?;
+            }
             let epilogue = encode_epilogue(frame_size, rv64)?;
             code.extend_from_slice(&epilogue);
         }
@@ -718,7 +717,6 @@ fn encode_instruction(
             false_target,
         } => {
             // Load condition register into t0
-            use lamina_mir::Operand as Op;
             let cond_operand = Op::Register(cond.clone());
             materialize_operand(code, &cond_operand, REG_T0, stack_slots, rv64)?;
 
@@ -910,10 +908,11 @@ pub fn compile_mir_riscv_function(
         for (i, param) in func.sig.params.iter().enumerate() {
             if let Register::Virtual(vreg) = &param.reg
                 && let Some(slot) = stack_slots.get(vreg)
-                    && i < ARG_REGS.len() {
-                        emit_store_to_fp(&mut code, ARG_REGS[i], *slot, rv64);
-                    }
-                    // Stack args beyond 8 not yet supported
+                && i < ARG_REGS.len()
+            {
+                emit_store_to_fp(&mut code, ARG_REGS[i], *slot, rv64);
+            }
+            // Stack args beyond 8 not yet supported
         }
 
         // --- Compile blocks ---

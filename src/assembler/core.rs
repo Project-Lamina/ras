@@ -6,7 +6,9 @@
 
 use crate::encoder::traits::InstructionEncoder;
 use crate::error::RasError;
-use crate::object::{ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter};
+use crate::object::{
+    ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
+};
 use crate::parser::{AssemblyParser, Line};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
@@ -31,7 +33,7 @@ pub struct RasAssembler {
     encoder: Box<dyn InstructionEncoder>,
     object_writer: Box<dyn ObjectWriter>,
     object_write_options: ObjectWriteOptions,
-    pub(crate) function_pointers: std::collections::HashMap<String, u64>, // Function name -> address
+    pub(crate) function_pointers: HashMap<String, u64>, // Function name -> address
     #[cfg(feature = "encoder")]
     pub(crate) current_module: Option<*const lamina_mir::Module>, // Current module being compiled (for internal call detection)
 }
@@ -107,7 +109,7 @@ impl RasAssembler {
             encoder,
             object_writer,
             object_write_options,
-            function_pointers: std::collections::HashMap::new(),
+            function_pointers: HashMap::new(),
             #[cfg(feature = "encoder")]
             current_module: None,
         })
@@ -173,12 +175,12 @@ impl RasAssembler {
                     if self.target_arch == TargetArchitecture::Arx64
                         && let Some(patch) =
                             arx64_label_patch(&opcode, &inst.operands, current_offset)?
-                        {
-                            code.extend_from_slice(&[0u8; 4]);
-                            patch_points.push(patch);
-                            current_offset += 4;
-                            continue;
-                        }
+                    {
+                        code.extend_from_slice(&[0u8; 4]);
+                        patch_points.push(patch);
+                        current_offset += 4;
+                        continue;
+                    }
 
                     // Handle leaq/lea with RIP-relative label: "leaq label(%rip), %reg"
                     if self.target_arch == TargetArchitecture::X86_64
@@ -186,9 +188,8 @@ impl RasAssembler {
                         && inst.operands.len() == 2
                         && let Some(label) = extract_rip_label(inst.operands[0].trim())
                     {
-                        let reg = parse_x86_reg(inst.operands[1].trim()).map_err(|e| {
-                            RasError::EncodingError(e.to_string())
-                        })?;
+                        let reg = parse_x86_reg(inst.operands[1].trim())
+                            .map_err(|e| RasError::EncodingError(e.to_string()))?;
                         // REX.W=1, REX.R set if reg>=8; opcode=0x8D; ModRM Mod=00 R/M=101(RIP-rel)
                         let rex: u8 = 0x48 | ((reg >> 3) << 2);
                         let modrm: u8 = ((reg & 7) << 3) | 5;
@@ -218,7 +219,7 @@ impl RasAssembler {
 
                     if is_jmp_call && inst.operands.len() == 1 {
                         let target = inst.operands[0].trim();
-                        if self.target_arch == lamina_platform::TargetArchitecture::X86_64 {
+                        if self.target_arch == TargetArchitecture::X86_64 {
                             let is_call = opcode == "call";
                             let opcode_byte: u8 = if is_call { 0xe8 } else { 0xe9 };
                             code.push(opcode_byte);
@@ -628,7 +629,7 @@ fn extract_rip_label(op: &str) -> Option<&str> {
     Some(label)
 }
 
-fn parse_x86_reg(s: &str) -> Result<u8, crate::error::RasError> {
+fn parse_x86_reg(s: &str) -> Result<u8, RasError> {
     let s = s.trim().trim_start_matches('%');
     match s {
         "rax" | "eax" => Ok(0),
@@ -647,7 +648,7 @@ fn parse_x86_reg(s: &str) -> Result<u8, crate::error::RasError> {
         "r13" => Ok(13),
         "r14" => Ok(14),
         "r15" => Ok(15),
-        _ => Err(crate::error::RasError::EncodingError(format!(
+        _ => Err(RasError::EncodingError(format!(
             "Unknown x86 register: {}",
             s
         ))),

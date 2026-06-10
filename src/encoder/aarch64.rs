@@ -272,8 +272,7 @@ impl InstructionEncoder for AArch64Encoder {
 
 #[cfg(test)]
 mod aarch64_ldr_str_encoder_tests {
-    use super::AArch64Encoder;
-    use crate::encoder::traits::{InstructionEncoder, ParsedInstruction};
+    use super::*;
 
     fn encode_ldr_line(base: &str, dst: &str, offset: i32) -> Vec<u8> {
         let mem = format!("[{}, #{}]", base, offset);
@@ -325,7 +324,7 @@ mod aarch64_ldr_str_encoder_tests {
             })
             .expect_err("260 not multiple of 8 and > 255");
         match err {
-            crate::error::RasError::EncodingError(msg) => {
+            RasError::EncodingError(msg) => {
                 assert!(msg.contains("260"), "{}", msg);
             }
             _ => panic!("expected EncodingError"),
