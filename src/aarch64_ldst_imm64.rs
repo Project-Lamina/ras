@@ -88,7 +88,7 @@ pub fn encode_ldr_scalar(
     }
     if offset >= 0 {
         let (base, align) = ldr_scaled_base(kind);
-        if (offset as u32).is_multiple_of(align) {
+        if (offset as u32) % align == 0 {
             let imm12 = (offset as u32) / align;
             if imm12 <= 0xFFF {
                 let inst = base | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
@@ -133,7 +133,7 @@ pub fn encode_str_scalar(
     }
     if offset >= 0 {
         let (base, align) = str_scaled_base(kind);
-        if (offset as u32).is_multiple_of(align) {
+        if (offset as u32) % align == 0 {
             let imm12 = (offset as u32) / align;
             if imm12 <= 0xFFF {
                 let inst = base | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
