@@ -1425,7 +1425,6 @@ fn encode_mir_instruction_x86_64(
 #[cfg(all(test, feature = "encoder"))]
 mod x86_64_jit_inst_tests {
     use super::*;
-    use crate::assembler::core::RasAssembler;
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};
     use lamina_mir::instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand};

@@ -4,12 +4,18 @@
 //! that are architecture-independent. Uses two-pass assembly for jmp/call
 //! with label resolution.
 
+use crate::encoder::aarch64::AArch64Encoder;
+use crate::encoder::arx64::Arx64Encoder;
+use crate::encoder::riscv::RiscVEncoder;
 use crate::encoder::traits::InstructionEncoder;
+use crate::encoder::x86_64::X86_64Encoder;
 use crate::error::RasError;
 use crate::object::{
     ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
+    object_writer_for_os,
 };
 use crate::parser::{AssemblyParser, Line};
+use crate::target::unsupported_target_hint;
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
 
@@ -78,27 +84,26 @@ impl RasAssembler {
     ) -> Result<Self, RasError> {
         // Create encoder based on target architecture
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
-            TargetArchitecture::X86_64 => Box::new(crate::encoder::x86_64::X86_64Encoder::new()),
-            TargetArchitecture::Aarch64 => Box::new(crate::encoder::aarch64::AArch64Encoder::new()),
-            TargetArchitecture::Arx64 => Box::new(crate::encoder::arx64::Arx64Encoder::new()),
-            TargetArchitecture::Riscv32 => {
-                Box::new(crate::encoder::riscv::RiscVEncoder::new(false))
-            }
-            TargetArchitecture::Riscv64 => Box::new(crate::encoder::riscv::RiscVEncoder::new(true)),
+            TargetArchitecture::X86_64 => Box::new(X86_64Encoder::new()),
+            TargetArchitecture::Aarch64 => Box::new(AArch64Encoder::new()),
+            TargetArchitecture::Arx64 => Box::new(Arx64Encoder::new()),
+            TargetArchitecture::Riscv32 => Box::new(RiscVEncoder::new(false)),
+            TargetArchitecture::Riscv64 => Box::new(RiscVEncoder::new(true)),
             _ => {
-                return Err(RasError::UnsupportedTarget(
-                    crate::target::unsupported_target_hint(target_arch, target_os),
-                ));
+                return Err(RasError::UnsupportedTarget(unsupported_target_hint(
+                    target_arch,
+                    target_os,
+                )));
             }
         };
 
-        let object_writer = match crate::object::object_writer_for_os(target_os) {
+        let object_writer = match object_writer_for_os(target_os) {
             Ok(w) => w,
             Err(_) => {
                 return Err(RasError::UnsupportedTarget(format!(
                     "Unsupported OS for cross-compilation: {:?}. {}",
                     target_os,
-                    crate::target::unsupported_target_hint(target_arch, target_os)
+                    unsupported_target_hint(target_arch, target_os)
                 )));
             }
         };
