@@ -234,10 +234,7 @@ pub fn encode_ldr_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
 
 #[cfg(test)]
 mod aarch64_ldst_imm64_tests {
-    use super::{
-        AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
-        encode_str_imm64, encode_str_scalar,
-    };
+    use super::*;
 
     #[test]
     fn ldrsb_ldur_unscaled_matches_as() {
@@ -279,7 +276,7 @@ mod aarch64_ldst_imm64_tests {
     fn ldr_imm64_rejects_unaligned_260() {
         let err = encode_ldr_imm64(0, 1, 260).expect_err("260");
         match err {
-            crate::error::RasError::EncodingError(msg) => assert!(msg.contains("260"), "{msg}"),
+            RasError::EncodingError(msg) => assert!(msg.contains("260"), "{msg}"),
             _ => panic!("expected EncodingError"),
         }
     }

@@ -336,7 +336,6 @@ impl RasRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
     #[test]
     fn executable_memory_allocate_and_write() {

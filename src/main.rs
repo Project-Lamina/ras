@@ -255,8 +255,7 @@ fn read_assembly_input(input_file: &Option<PathBuf>) -> Result<String, Box<dyn s
 
 #[cfg(test)]
 mod gnu_as_compat_tests {
-    use super::parse_gnu_as_invocation;
-    use std::path::PathBuf;
+    use super::*;
 
     #[test]
     fn gcc_passes_64_o_and_input() {
