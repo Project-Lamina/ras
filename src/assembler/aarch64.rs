@@ -2,8 +2,15 @@
 //!
 //! This module handles compilation of MIR to AArch64 binary machine code.
 
+use crate::aarch64_ldst_imm64::AArch64ScalarLdKind;
+use crate::aarch64_ldst_imm64::{AArch64ScalarStKind, encode_ldr_imm64, encode_str_imm64};
+use crate::aarch64_ldst_imm64::{encode_ldr_scalar, encode_str_scalar};
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
+use lamina_codegen::aarch64::{A64RegAlloc, AArch64ABI, FrameMap};
+use lamina_mir::{
+    AddressMode, Immediate, IntBinOp, IntCmpOp, MirType, Operand, Register, ScalarType,
+};
 
 #[cfg(feature = "encoder")]
 #[derive(Debug, Clone)]
@@ -27,9 +34,6 @@ pub fn compile_mir_aarch64_function(
     module: &lamina_mir::Module,
     _function_name: Option<&str>,
 ) -> Result<(Vec<u8>, std::collections::HashMap<String, usize>), RasError> {
-    use lamina_codegen::aarch64::{A64RegAlloc, AArch64ABI, FrameMap};
-    use lamina_mir::Register;
-
     let _abi = AArch64ABI::new(assembler.target_os);
     let mut code = Vec::new();
     let mut function_offsets: std::collections::HashMap<String, usize> =
@@ -323,8 +327,6 @@ pub fn compile_mir_aarch64_function(
                     ));
                 }
                 lamina_mir::Instruction::TailCall { name, args } => {
-                    use lamina_codegen::aarch64::AArch64ABI;
-
                     if name == "print" {
                         return Err(RasError::EncodingError(
                             "TailCall to print() is not supported by AArch64 JIT".to_string(),
@@ -621,30 +623,21 @@ fn encode_epilogue_aarch64(aligned_stack_size: usize) -> Result<Vec<u8>, RasErro
 
 fn encode_str_aarch64(src_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
     let src = parse_register_aarch64(src_reg)?;
-    crate::aarch64_ldst_imm64::encode_str_imm64(src, base_reg, offset)
+    encode_str_imm64(src, base_reg, offset)
 }
 
 fn encode_ldr_aarch64(dst_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
     let dst = parse_register_aarch64(dst_reg)?;
-    crate::aarch64_ldst_imm64::encode_ldr_imm64(dst, base_reg, offset)
+    encode_ldr_imm64(dst, base_reg, offset)
 }
 
-fn mir_scalar_ld_kind_aarch64(
-    ty: &lamina_mir::MirType,
-) -> Result<crate::aarch64_ldst_imm64::AArch64ScalarLdKind, RasError> {
-    use lamina_mir::{MirType, ScalarType};
+fn mir_scalar_ld_kind_aarch64(ty: &lamina_mir::MirType) -> Result<AArch64ScalarLdKind, RasError> {
     match ty {
-        MirType::Scalar(ScalarType::I1) => Ok(crate::aarch64_ldst_imm64::AArch64ScalarLdKind::I8U),
-        MirType::Scalar(ScalarType::I8) => Ok(crate::aarch64_ldst_imm64::AArch64ScalarLdKind::I8S),
-        MirType::Scalar(ScalarType::I16) => {
-            Ok(crate::aarch64_ldst_imm64::AArch64ScalarLdKind::I16S)
-        }
-        MirType::Scalar(ScalarType::I32) => {
-            Ok(crate::aarch64_ldst_imm64::AArch64ScalarLdKind::I32S)
-        }
-        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
-            Ok(crate::aarch64_ldst_imm64::AArch64ScalarLdKind::I64)
-        }
+        MirType::Scalar(ScalarType::I1) => Ok(AArch64ScalarLdKind::I8U),
+        MirType::Scalar(ScalarType::I8) => Ok(AArch64ScalarLdKind::I8S),
+        MirType::Scalar(ScalarType::I16) => Ok(AArch64ScalarLdKind::I16S),
+        MirType::Scalar(ScalarType::I32) => Ok(AArch64ScalarLdKind::I32S),
+        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(AArch64ScalarLdKind::I64),
         MirType::Scalar(ScalarType::F32 | ScalarType::F64) => Err(RasError::EncodingError(
             "AArch64 JIT Load of floating-point type is not supported".into(),
         )),
@@ -655,19 +648,12 @@ fn mir_scalar_ld_kind_aarch64(
     }
 }
 
-fn mir_scalar_st_kind_aarch64(
-    ty: &lamina_mir::MirType,
-) -> Result<crate::aarch64_ldst_imm64::AArch64ScalarStKind, RasError> {
-    use lamina_mir::{MirType, ScalarType};
+fn mir_scalar_st_kind_aarch64(ty: &lamina_mir::MirType) -> Result<AArch64ScalarStKind, RasError> {
     match ty {
-        MirType::Scalar(ScalarType::I1 | ScalarType::I8) => {
-            Ok(crate::aarch64_ldst_imm64::AArch64ScalarStKind::I8)
-        }
-        MirType::Scalar(ScalarType::I16) => Ok(crate::aarch64_ldst_imm64::AArch64ScalarStKind::I16),
-        MirType::Scalar(ScalarType::I32) => Ok(crate::aarch64_ldst_imm64::AArch64ScalarStKind::I32),
-        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
-            Ok(crate::aarch64_ldst_imm64::AArch64ScalarStKind::I64)
-        }
+        MirType::Scalar(ScalarType::I1 | ScalarType::I8) => Ok(AArch64ScalarStKind::I8),
+        MirType::Scalar(ScalarType::I16) => Ok(AArch64ScalarStKind::I16),
+        MirType::Scalar(ScalarType::I32) => Ok(AArch64ScalarStKind::I32),
+        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(AArch64ScalarStKind::I64),
         MirType::Scalar(ScalarType::F32 | ScalarType::F64) => Err(RasError::EncodingError(
             "AArch64 JIT Store of floating-point type is not supported".into(),
         )),
@@ -686,7 +672,7 @@ fn encode_ldr_typed_aarch64(
 ) -> Result<Vec<u8>, RasError> {
     let dst = parse_register_aarch64(dst_reg)?;
     let kind = mir_scalar_ld_kind_aarch64(ty)?;
-    crate::aarch64_ldst_imm64::encode_ldr_scalar(dst, base_reg, offset, kind)
+    encode_ldr_scalar(dst, base_reg, offset, kind)
 }
 
 fn encode_str_typed_aarch64(
@@ -697,7 +683,7 @@ fn encode_str_typed_aarch64(
 ) -> Result<Vec<u8>, RasError> {
     let src = parse_register_aarch64(src_reg)?;
     let kind = mir_scalar_st_kind_aarch64(ty)?;
-    crate::aarch64_ldst_imm64::encode_str_scalar(src, base_reg, offset, kind)
+    encode_str_scalar(src, base_reg, offset, kind)
 }
 
 /// Encode RET instruction (AArch64)
@@ -741,7 +727,6 @@ fn aarch64_apply_i32_offset_to_reg(
     base_reg: u8,
     offset: i32,
 ) -> Result<(), RasError> {
-    use lamina_mir::{Immediate, Operand};
     if offset == 0 {
         return Ok(());
     }
@@ -858,7 +843,6 @@ fn aarch64_load_base_gpr(
     reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
     code: &mut Vec<u8>,
 ) -> Result<(u8, Option<&'static str>), RasError> {
-    use lamina_mir::Register;
     match base {
         Register::Virtual(vreg) => {
             let base_offset = stack_slots.get(vreg).ok_or_else(|| {
@@ -889,8 +873,6 @@ fn aarch64_emit_indexed_address(
     _stack_size: usize,
     out_addr_scratch: &'static str,
 ) -> Result<(), RasError> {
-    use lamina_mir::Register;
-
     fn mov_x_dst_src(dst: u8, src: u8) -> Vec<u8> {
         let w = 0xAA00_03E0u32 | ((src as u32) << 16) | (dst as u32);
         w.to_le_bytes().to_vec()
@@ -1034,7 +1016,6 @@ fn encode_mir_instruction_aarch64_with_context(
     current_offset: usize,
     bl_fixups: &mut Vec<BlFixup>,
 ) -> Result<Vec<u8>, RasError> {
-    use lamina_mir::{IntBinOp, MirType, Register, ScalarType};
     let mut code = Vec::new();
 
     match inst {
@@ -1307,7 +1288,6 @@ fn encode_mir_instruction_aarch64_with_context(
             reg_alloc.free_scratch(dst_reg_str);
         }
         lamina_mir::Instruction::Load { dst, addr, ty, .. } => {
-            use lamina_mir::{AddressMode, MirType, Operand, ScalarType};
             let tmp_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
 
             match addr {
@@ -1391,7 +1371,6 @@ fn encode_mir_instruction_aarch64_with_context(
             reg_alloc.free_scratch(tmp_reg_str);
         }
         lamina_mir::Instruction::Store { src, addr, ty, .. } => {
-            use lamina_mir::AddressMode;
             // Store from source to memory address
             let src_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let src_reg = parse_register_aarch64(src_reg_str)?;
@@ -1464,7 +1443,6 @@ fn encode_mir_instruction_aarch64_with_context(
             reg_alloc.free_scratch(src_reg_str);
         }
         lamina_mir::Instruction::Lea { dst, base, offset } => {
-            use lamina_mir::{Operand, Register};
             let base_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let base_reg = parse_register_aarch64(base_reg_str)?;
             materialize_operand_aarch64(
@@ -1499,7 +1477,6 @@ fn encode_mir_instruction_aarch64_with_context(
             false_val,
             ty: _,
         } => {
-            use lamina_mir::{Operand, Register};
             let t_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let f_str = reg_alloc.alloc_scratch().unwrap_or("x11");
             let c_str = reg_alloc.alloc_scratch().unwrap_or("x12");
@@ -1569,7 +1546,6 @@ fn encode_mir_instruction_aarch64_with_context(
             rhs,
             ty,
         } => {
-            use lamina_mir::{Immediate, IntCmpOp, MirType, Operand, ScalarType};
             let lhs_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let rhs_reg_str = reg_alloc.alloc_scratch().unwrap_or("x11");
             let dst_reg_str = reg_alloc.alloc_scratch().unwrap_or("x12");
@@ -1700,7 +1676,6 @@ fn encode_mir_instruction_aarch64_with_context(
             reg_alloc.free_scratch(dst_reg_str);
         }
         lamina_mir::Instruction::Call { name, args, ret } => {
-            use lamina_codegen::aarch64::AArch64ABI;
             let _abi = AArch64ABI::new(assembler.target_os);
 
             // Materialize arguments into argument registers (x0-x7).
@@ -1971,8 +1946,6 @@ fn materialize_scalar_operand_aarch64_int_binary(
     code: &mut Vec<u8>,
     _stack_size: usize,
 ) -> Result<(), RasError> {
-    use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
-
     let dst_w = format!("w{}", dst_reg);
     let signed_style = !unsigned_atom;
 
@@ -2047,8 +2020,6 @@ fn materialize_return_value_aarch64(
     code: &mut Vec<u8>,
     stack_size: usize,
 ) -> Result<(), RasError> {
-    use lamina_mir::{MirType, Operand, Register, ScalarType};
-
     match op {
         Operand::Register(Register::Virtual(vreg)) => {
             let offset = stack_slots.get(vreg).copied().ok_or_else(|| {
@@ -2091,8 +2062,6 @@ fn materialize_operand_aarch64(
     code: &mut Vec<u8>,
     _stack_size: usize,
 ) -> Result<(), RasError> {
-    use lamina_mir::{Immediate, Operand, Register};
-
     match op {
         Operand::Immediate(imm) => {
             // MOVZ/MOVK sequence (64-bit).
@@ -2172,7 +2141,6 @@ fn materialize_operand_aarch64(
 #[cfg(all(test, feature = "encoder"))]
 mod aarch64_jit_tail_call_tests {
     use super::*;
-    use crate::assembler::core::RasAssembler;
     use lamina_mir::block::Block;
     use lamina_mir::function::{Function, Parameter, Signature};
     use lamina_mir::instruction::{
