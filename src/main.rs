@@ -4,6 +4,8 @@ use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use lamina_platform::Target;
+use std::str::FromStr;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -129,8 +131,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .output_file
         .unwrap_or_else(|| PathBuf::from("a.out"));
 
-    use lamina_platform::Target;
-    use std::str::FromStr;
     let target = if let Some(target_str) = &options.target {
         Target::from_str(target_str)
             .map_err(|e| format!("Invalid target '{}': {}", target_str, e))?
@@ -255,8 +255,7 @@ fn read_assembly_input(input_file: &Option<PathBuf>) -> Result<String, Box<dyn s
 
 #[cfg(test)]
 mod gnu_as_compat_tests {
-    use super::parse_gnu_as_invocation;
-    use std::path::PathBuf;
+    use super::*;
 
     #[test]
     fn gcc_passes_64_o_and_input() {

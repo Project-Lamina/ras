@@ -169,9 +169,8 @@ impl AssemblyParser {
                 }
             }
             ".section" | ".align" | ".balign" | ".p2align" | ".byte" | ".short" | ".int"
-            | ".long" | ".quad" | ".zero" | ".space"
-            | ".skip" | ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type"
-            | ".ident" | ".file" => {}
+            | ".long" | ".quad" | ".zero" | ".space" | ".skip" | ".cfi_startproc"
+            | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type" | ".ident" | ".file" => {}
             _ => {}
         }
 
