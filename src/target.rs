@@ -36,45 +36,50 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
     if !is_arch_encoded(arch) {
         return false;
     }
-    if arch == TargetArchitecture::Arx64 {
-        return matches!(
-            os,
-            TargetOperatingSystem::Linux
-                | TargetOperatingSystem::FreeBSD
-                | TargetOperatingSystem::OpenBSD
-                | TargetOperatingSystem::NetBSD
-                | TargetOperatingSystem::DragonFly
-                | TargetOperatingSystem::Redox
-        );
+    match object_format_for_os(os) {
+        // ELF is the complete writer and carries every encoded architecture.
+        Some(ObjectFormat::Elf) => !matches!(
+            (arch, os),
+            // ARX64 and RISC-V exist on Linux and the BSDs only.
+            (
+                TargetArchitecture::Arx64
+                    | TargetArchitecture::Riscv32
+                    | TargetArchitecture::Riscv64,
+                TargetOperatingSystem::Orbis | TargetOperatingSystem::Prospero
+            )
+        ),
+        // The COFF writer rejects anything but x86_64, see object.rs.
+        Some(ObjectFormat::Coff) => arch == TargetArchitecture::X86_64,
+        // MachOWriter::write_object_file is a stub that always errors. Saying macOS is
+        // supported here just moves the failure to the end of a compile, with a message
+        // that does not explain it.
+        Some(ObjectFormat::MachO) => false,
+        None => false,
     }
-    // RISC-V is only relevant on Linux/BSD (no macOS/Windows RISC-V targets)
-    if matches!(
-        arch,
-        TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
-    ) {
-        return matches!(
-            os,
-            TargetOperatingSystem::Linux
-                | TargetOperatingSystem::FreeBSD
-                | TargetOperatingSystem::OpenBSD
-                | TargetOperatingSystem::NetBSD
-                | TargetOperatingSystem::DragonFly
-                | TargetOperatingSystem::Redox
-        );
-    }
-    matches!(
-        os,
+}
+
+/// Object container for an OS, independent of whether the writer for it is finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectFormat {
+    Elf,
+    MachO,
+    Coff,
+}
+
+pub fn object_format_for_os(os: TargetOperatingSystem) -> Option<ObjectFormat> {
+    match os {
         TargetOperatingSystem::Linux
-            | TargetOperatingSystem::MacOS
-            | TargetOperatingSystem::Windows
-            | TargetOperatingSystem::FreeBSD
-            | TargetOperatingSystem::OpenBSD
-            | TargetOperatingSystem::NetBSD
-            | TargetOperatingSystem::DragonFly
-            | TargetOperatingSystem::Redox
-            | TargetOperatingSystem::Orbis
-            | TargetOperatingSystem::Prospero
-    )
+        | TargetOperatingSystem::FreeBSD
+        | TargetOperatingSystem::OpenBSD
+        | TargetOperatingSystem::NetBSD
+        | TargetOperatingSystem::DragonFly
+        | TargetOperatingSystem::Redox
+        | TargetOperatingSystem::Orbis
+        | TargetOperatingSystem::Prospero => Some(ObjectFormat::Elf),
+        TargetOperatingSystem::MacOS => Some(ObjectFormat::MachO),
+        TargetOperatingSystem::Windows => Some(ObjectFormat::Coff),
+        _ => None,
+    }
 }
 
 pub fn is_jit_arch_supported(arch: TargetArchitecture) -> bool {
@@ -112,6 +117,18 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
             "OS {:?} not supported. Supported: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, Redox, Orbis (PS4), Prospero (PS5).",
             os
         )
+    } else if !is_object_file_supported(arch, os) {
+        match object_format_for_os(os) {
+            Some(ObjectFormat::MachO) => format!(
+                "ras can encode {arch:?} but cannot yet write a Mach-O object, so {os:?} \
+                 output is unavailable. Assemble with the system assembler for now."
+            ),
+            Some(ObjectFormat::Coff) => format!(
+                "ras writes COFF objects for x86_64 only, so {arch:?} on {os:?} is \
+                 unavailable."
+            ),
+            _ => format!("No object format is mapped for {os:?}."),
+        }
     } else {
         "Target should be supported; check ras::target module.".to_string()
     }
@@ -139,7 +156,10 @@ mod tests {
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Linux
         ));
-        assert!(is_object_file_supported(
+        // macOS reports unsupported because MachOWriter::write_object_file is a stub
+        // that always errors. This used to assert true, which meant the failure only
+        // showed up at the end of a compile.
+        assert!(!is_object_file_supported(
             TargetArchitecture::X86_64,
             TargetOperatingSystem::MacOS
         ));
@@ -151,5 +171,25 @@ mod tests {
             TargetArchitecture::Riscv64,
             TargetOperatingSystem::MacOS
         ));
+        // The COFF writer rejects everything but x86_64.
+        assert!(is_object_file_supported(
+            TargetArchitecture::X86_64,
+            TargetOperatingSystem::Windows
+        ));
+        assert!(!is_object_file_supported(
+            TargetArchitecture::Aarch64,
+            TargetOperatingSystem::Windows
+        ));
+    }
+
+    #[test]
+    fn unsupported_object_target_says_why() {
+        let macos =
+            unsupported_target_hint(TargetArchitecture::X86_64, TargetOperatingSystem::MacOS);
+        assert!(macos.contains("Mach-O"), "unhelpful hint: {macos}");
+
+        let win_arm =
+            unsupported_target_hint(TargetArchitecture::Aarch64, TargetOperatingSystem::Windows);
+        assert!(win_arm.contains("COFF"), "unhelpful hint: {win_arm}");
     }
 }
