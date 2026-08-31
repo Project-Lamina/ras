@@ -2,11 +2,14 @@
 //!
 //! This module handles compilation of MIR to AArch64 binary machine code.
 
-use crate::aarch64_ldst_imm64::AArch64ScalarLdKind;
-use crate::aarch64_ldst_imm64::{AArch64ScalarStKind, encode_ldr_imm64, encode_str_imm64};
-use crate::aarch64_ldst_imm64::{encode_ldr_scalar, encode_str_scalar};
-use crate::assembler::core::RasAssembler;
-use crate::error::RasError;
+use crate::{
+    aarch64_ldst_imm64::{
+        AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
+        encode_str_imm64, encode_str_scalar,
+    },
+    assembler::core::RasAssembler,
+    error::RasError,
+};
 use lamina_codegen::aarch64::{A64RegAlloc, AArch64ABI, FrameMap};
 use lamina_mir::{
     AddressMode, Immediate, IntBinOp, IntCmpOp, MirType, Operand, Register, ScalarType,
@@ -2141,14 +2144,16 @@ fn materialize_operand_aarch64(
 #[cfg(all(test, feature = "encoder"))]
 mod aarch64_jit_tail_call_tests {
     use super::*;
-    use lamina_mir::block::Block;
-    use lamina_mir::function::{Function, Parameter, Signature};
-    use lamina_mir::instruction::{
-        AddressMode, Immediate, Instruction, IntBinOp, IntCmpOp, MemoryAttrs, Operand,
+    use lamina_mir::{
+        block::Block,
+        function::{Function, Parameter, Signature},
+        instruction::{
+            AddressMode, Immediate, Instruction, IntBinOp, IntCmpOp, MemoryAttrs, Operand,
+        },
+        module::Module,
+        register::{Register, VirtualReg},
+        types::{MirType, ScalarType},
     };
-    use lamina_mir::module::Module;
-    use lamina_mir::register::{Register, VirtualReg};
-    use lamina_mir::types::{MirType, ScalarType};
     use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
     fn subslice_present(hay: &[u8], needle: &[u8]) -> bool {

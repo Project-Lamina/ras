@@ -2,8 +2,7 @@
 //!
 //! This module handles compilation of MIR to x86_64 binary machine code.
 
-use crate::assembler::core::RasAssembler;
-use crate::error::RasError;
+use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_mir::{MirType, ScalarType};
 use std::collections::HashMap;
 
@@ -1425,12 +1424,14 @@ fn encode_mir_instruction_x86_64(
 #[cfg(all(test, feature = "encoder"))]
 mod x86_64_jit_inst_tests {
     use super::*;
-    use lamina_mir::block::Block;
-    use lamina_mir::function::{Function, Parameter, Signature};
-    use lamina_mir::instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand};
-    use lamina_mir::module::Module;
-    use lamina_mir::register::{Register, VirtualReg};
-    use lamina_mir::types::{MirType, ScalarType};
+    use lamina_mir::{
+        block::Block,
+        function::{Function, Parameter, Signature},
+        instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand},
+        module::Module,
+        register::{Register, VirtualReg},
+        types::{MirType, ScalarType},
+    };
     use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
     fn subslice_present(hay: &[u8], needle: &[u8]) -> bool {

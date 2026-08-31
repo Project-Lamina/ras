@@ -4,8 +4,7 @@
 //! labels, and instructions. Outputs `lines` preserving label/instruction order
 //! for two-pass assembly (jmp/call with label resolution).
 
-use crate::encoder::traits::ParsedInstruction;
-use crate::error::RasError;
+use crate::{encoder::traits::ParsedInstruction, error::RasError};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]

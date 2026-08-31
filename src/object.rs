@@ -1,9 +1,8 @@
 //! Object file generation: ELF (Linux/BSD), Mach-O (macOS), COFF/PE (Windows).
 
-use crate::error::RasError;
-use crate::parser::Section;
 #[cfg(test)]
 use crate::parser::SectionFlags;
+use crate::{error::RasError, parser::Section};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::io::Write;
 
