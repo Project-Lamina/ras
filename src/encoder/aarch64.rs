@@ -101,14 +101,8 @@ impl AArch64Encoder {
     }
 
     fn encode_add_reg(&self, dst: u8, src1: u8, src2: u8) -> Vec<u8> {
-        let inst = (0b1u32 << 31)
-            | (0b0u32 << 30)
-            | (0b010110u32 << 24)
-            | (0b00u32 << 22)
-            | (0b000000u32 << 16)
-            | ((src2 as u32) << 10)
-            | ((src1 as u32) << 5)
-            | (dst as u32);
+        // ADD (shifted register), 64-bit: base 0x8B000000, Rm at 20:16.
+        let inst = 0x8B00_0000 | ((src2 as u32) << 16) | ((src1 as u32) << 5) | (dst as u32);
         self.encode_u32(inst)
     }
 
@@ -330,5 +324,19 @@ mod aarch64_ldr_str_encoder_tests {
             }
             _ => panic!("expected EncodingError"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_reg_is_an_add_not_a_branch() {
+        let enc = AArch64Encoder::new();
+        assert_eq!(
+            enc.encode_add_reg(0, 1, 2),
+            0x8B02_0020u32.to_le_bytes().to_vec()
+        );
     }
 }
