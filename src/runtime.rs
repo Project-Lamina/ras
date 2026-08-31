@@ -374,19 +374,19 @@ mod tests {
 mod jit_host_exec_tests {
     use std::str::FromStr;
 
-    use lamina_mir::block::Block;
-    use lamina_mir::function::{Function, Parameter, Signature};
-    use lamina_mir::instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand};
-    use lamina_mir::module::Module;
-    use lamina_mir::register::{Register, VirtualReg};
-    use lamina_mir::types::{MirType, ScalarType};
+    use lamina_mir::{
+        block::Block,
+        function::{Function, Parameter, Signature},
+        instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand},
+        module::Module,
+        register::{Register, VirtualReg},
+        types::{MirType, ScalarType},
+    };
     use lamina_platform::{
         TargetArchitecture, TargetOperatingSystem, detect_host_architecture_only, detect_host_os,
     };
 
-    use crate::assembler::core::RasAssembler;
-    use crate::error::RasError;
-    use crate::runtime::ExecutableMemory;
+    use crate::{assembler::core::RasAssembler, error::RasError, runtime::ExecutableMemory};
 
     fn host_jit_pair() -> Option<(TargetArchitecture, TargetOperatingSystem)> {
         let arch = TargetArchitecture::from_str(detect_host_architecture_only()).ok()?;

@@ -1,7 +1,9 @@
 //! x86-64 binary instruction encoder
 
-use crate::encoder::traits::{InstructionEncoder, ParsedInstruction};
-use crate::error::RasError;
+use crate::{
+    encoder::traits::{InstructionEncoder, ParsedInstruction},
+    error::RasError,
+};
 
 pub struct X86_64Encoder {
     position: usize,

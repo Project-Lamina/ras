@@ -4,8 +4,7 @@
 //! Supports RV64 (default) and RV32 via the `rv64` flag.
 //! Calling convention: RISC-V LP64 (Linux) — a0-a7 for args, a0 for return.
 
-use crate::assembler::core::RasAssembler;
-use crate::error::RasError;
+use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_mir::{
     Immediate, Instruction, IntBinOp, IntCmpOp, MirType, Operand, Operand as Op, Register,
     ScalarType,

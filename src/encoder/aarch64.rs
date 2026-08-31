@@ -8,9 +8,11 @@
 // they are no-ops but make the encoding explicit.
 #![allow(clippy::identity_op)]
 
-use crate::aarch64_ldst_imm64::{encode_ldr_imm64, encode_str_imm64};
-use crate::encoder::traits::{InstructionEncoder, ParsedInstruction};
-use crate::error::RasError;
+use crate::{
+    aarch64_ldst_imm64::{encode_ldr_imm64, encode_str_imm64},
+    encoder::traits::{InstructionEncoder, ParsedInstruction},
+    error::RasError,
+};
 
 pub struct AArch64Encoder {
     position: usize,

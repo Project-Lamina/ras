@@ -4,18 +4,19 @@
 //! that are architecture-independent. Uses two-pass assembly for jmp/call
 //! with label resolution.
 
-use crate::encoder::aarch64::AArch64Encoder;
-use crate::encoder::arx64::Arx64Encoder;
-use crate::encoder::riscv::RiscVEncoder;
-use crate::encoder::traits::InstructionEncoder;
-use crate::encoder::x86_64::X86_64Encoder;
-use crate::error::RasError;
-use crate::object::{
-    ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
-    object_writer_for_os,
+use crate::{
+    encoder::{
+        aarch64::AArch64Encoder, arx64::Arx64Encoder, riscv::RiscVEncoder,
+        traits::InstructionEncoder, x86_64::X86_64Encoder,
+    },
+    error::RasError,
+    object::{
+        ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
+        object_writer_for_os,
+    },
+    parser::{AssemblyParser, Line},
+    target::unsupported_target_hint,
 };
-use crate::parser::{AssemblyParser, Line};
-use crate::target::unsupported_target_hint;
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
 

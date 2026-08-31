@@ -1,11 +1,13 @@
 //! ras - drop-in replacement for as/gas
 
 use lamina_platform::Target;
-use std::env;
-use std::ffi::OsStr;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::{
+    env,
+    ffi::OsStr,
+    io::{self, Read},
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
