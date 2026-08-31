@@ -95,25 +95,19 @@ impl X86_64Encoder {
         let rex = self.encode_rex(true, reg >> 3, 0, base >> 3);
         let mod_reg = (reg & 7) << 3;
 
-        let (mod_bits, r_m, sib_opt, disp_bytes): (u8, u8, Option<u8>, Vec<u8>) = if base == 4 {
-            (0, 4, Some(0x24), vec![])
-        } else if base >= 8 {
-            let sib = (2 << 6) | (4 << 3) | (base & 7);
-            if disp == 0 {
-                (0, 4, Some(sib), vec![])
-            } else if (-128..=127).contains(&disp) {
-                (1, 4, Some(sib), vec![disp as u8])
-            } else {
-                (2, 4, Some(sib), disp.to_le_bytes().to_vec())
-            }
-        } else if disp == 0 && base != 5 {
-            (0, base & 7, None, vec![])
-        } else if base == 5 && disp == 0 {
-            (1, 5, None, vec![0])
+        // r/m 100 means a SIB follows; r/m 101 at mod 00 means disp32-only.
+        let low = base & 7;
+        let needs_sib = low == 4;
+        // scale 00, index 100 (none)
+        let sib_opt = needs_sib.then_some((4 << 3) | low);
+        let r_m = if needs_sib { 4 } else { low };
+
+        let (mod_bits, disp_bytes): (u8, Vec<u8>) = if disp == 0 && low != 5 {
+            (0, vec![])
         } else if (-128..=127).contains(&disp) {
-            (1, base & 7, None, vec![disp as u8])
+            (1, vec![disp as u8])
         } else {
-            (2, base & 7, None, disp.to_le_bytes().to_vec())
+            (2, disp.to_le_bytes().to_vec())
         };
 
         let modrm = (mod_bits << 6) | mod_reg | r_m;
@@ -932,4 +926,26 @@ fn parse_xmm(s: &str) -> Option<u8> {
     let s = s.strip_prefix("xmm")?;
     let n: u8 = s.parse().ok()?;
     if n < 16 { Some(n) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Expected bytes come from GNU as.
+    #[test]
+    fn memory_operands_match_gnu_as() {
+        let enc = X86_64Encoder::new();
+        let load = |mem: &str| enc.encode_mov_mem_reg(mem, 0, false).expect("encode");
+
+        assert_eq!(load("8(%rsp)"), vec![0x48, 0x8b, 0x44, 0x24, 0x08]);
+        assert_eq!(load("(%rsp)"), vec![0x48, 0x8b, 0x04, 0x24]);
+
+        assert_eq!(load("(%r13)"), vec![0x49, 0x8b, 0x45, 0x00]);
+        assert_eq!(load("8(%r13)"), vec![0x49, 0x8b, 0x45, 0x08]);
+
+        assert_eq!(load("(%rbp)"), vec![0x48, 0x8b, 0x45, 0x00]);
+
+        assert_eq!(load("(%r12)"), vec![0x49, 0x8b, 0x04, 0x24]);
+    }
 }
