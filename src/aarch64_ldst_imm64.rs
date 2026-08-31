@@ -36,7 +36,7 @@ fn ldur_simm9_base(kind: AArch64ScalarLdKind) -> u32 {
         AArch64ScalarLdKind::I8S => 0x3880_0000,
         AArch64ScalarLdKind::I8U => 0x3840_0000,
         AArch64ScalarLdKind::I16S => 0x7880_0000,
-        AArch64ScalarLdKind::I32S => 0xB980_0000,
+        AArch64ScalarLdKind::I32S => 0xB880_0000,
         AArch64ScalarLdKind::I64 => LDUR_BASE,
     }
 }
@@ -44,9 +44,9 @@ fn ldur_simm9_base(kind: AArch64ScalarLdKind) -> u32 {
 #[inline]
 fn stur_simm9_base(kind: AArch64ScalarStKind) -> u32 {
     match kind {
-        AArch64ScalarStKind::I8 => 0x3900_0000,
-        AArch64ScalarStKind::I16 => 0x7900_0000,
-        AArch64ScalarStKind::I32 => 0xB900_0000,
+        AArch64ScalarStKind::I8 => 0x3800_0000,
+        AArch64ScalarStKind::I16 => 0x7800_0000,
+        AArch64ScalarStKind::I32 => 0xB800_0000,
         AArch64ScalarStKind::I64 => STUR_BASE,
     }
 }
@@ -245,7 +245,7 @@ mod aarch64_ldst_imm64_tests {
     #[test]
     fn ldrsw_unscaled_small_offset_encodes_like_ldursw() {
         let b = encode_ldr_scalar(0, 1, 8, AArch64ScalarLdKind::I32S).expect("encode");
-        assert_eq!(b, [0x20, 0x80, 0x80, 0xB9]);
+        assert_eq!(b, [0x20, 0x80, 0x80, 0xB8]);
     }
 
     #[test]
@@ -257,7 +257,13 @@ mod aarch64_ldst_imm64_tests {
     #[test]
     fn strb_unscaled_small_offset_encodes_like_sturb() {
         let b = encode_str_scalar(0, 1, 8, AArch64ScalarStKind::I8).expect("encode");
-        assert_eq!(b, [0x20, 0x80, 0x00, 0x39]);
+        assert_eq!(b, [0x20, 0x80, 0x00, 0x38]);
+    }
+
+    #[test]
+    fn strb_negative_offset_stays_below_the_frame() {
+        let b = encode_str_scalar(0, 29, -8, AArch64ScalarStKind::I8).expect("encode");
+        assert_eq!(b, [0xa0, 0x83, 0x1f, 0x38]);
     }
 
     #[test]
