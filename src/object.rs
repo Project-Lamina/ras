@@ -40,6 +40,9 @@ pub struct ObjectSymbol {
 pub struct ExternalReloc {
     pub offset: usize,
     pub symbol: String,
+    pub section: String,
+    pub kind: u32,
+    pub addend: i64,
 }
 
 /// All data needed to write a single relocatable object file.
@@ -74,22 +77,14 @@ const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
 const EM_ARX64: u16 = 0xa064;
-const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
-const SHF_ALLOC: u64 = 2;
-const SHF_EXECINSTR: u64 = 4;
 const SHF_INFO_LINK: u64 = 0x40;
 const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
-const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
-const STT_FUNC: u8 = 2;
-const TEXT_SECTION_INDEX: u16 = 1;
-const R_X86_64_PLT32: u64 = 4;
-const R_AARCH64_CALL26: u64 = 283;
 
 fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
@@ -227,38 +222,6 @@ fn write_elf64_header_with_shnum<W: Write>(
     Ok(())
 }
 
-fn write_elf64_section_header<W: Write>(
-    w: &mut W,
-    sh_name: u32,
-    sh_type: u32,
-    sh_flags: u64,
-    sh_offset: u64,
-    sh_size: u64,
-    sh_addralign: u64,
-) -> Result<(), RasError> {
-    w.write_all(&sh_name.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&sh_type.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&sh_flags.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u64.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&sh_offset.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&sh_size.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u32.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u32.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&sh_addralign.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u64.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    Ok(())
-}
-
 /// Full ELF64 section header fields. `sh_addr` is always zero for relocatable
 /// objects, so it is not exposed. Unset fields default to zero.
 #[derive(Default)]
@@ -312,137 +275,6 @@ fn write_elf64_symbol<W: Write>(
     Ok(())
 }
 
-/// Symbols defined in `.text` that should appear in the object symbol table.
-/// Assembler-internal labels (`.L*`) are dropped, matching gas behavior.
-/// Locals are returned before globals so the symbol table satisfies the ELF
-/// requirement that `sh_info` marks the first global symbol.
-fn linkable_text_symbols(symbols: &[ObjectSymbol]) -> (Vec<&ObjectSymbol>, Vec<&ObjectSymbol>) {
-    let mut locals = Vec::new();
-    let mut globals = Vec::new();
-    for symbol in symbols {
-        if symbol.section != ".text" || symbol.name.starts_with(".L") {
-            continue;
-        }
-        if symbol.global {
-            globals.push(symbol);
-        } else {
-            locals.push(symbol);
-        }
-    }
-    (locals, globals)
-}
-
-/// Builds `.symtab` bytes (null entry + locals + globals) and `.strtab`,
-/// also appending undefined external symbols for cross-object relocations.
-///
-/// Returns `(symtab_bytes, strtab_bytes, first_global_index, extern_base_index)`.
-///
-/// - `first_global_index`: symtab index of the first `STB_GLOBAL` entry;
-///   used as `sh_info` on the symtab section header.
-/// - `extern_base_index`: symtab index of the first `SHN_UNDEF` external entry;
-///   used when building `.rela.text` `r_sym` fields.
-fn build_symtab_with_externals(
-    symbols: &[ObjectSymbol],
-    extern_names: &[&str],
-) -> (Vec<u8>, Vec<u8>, u32, u32) {
-    let (locals, globals) = linkable_text_symbols(symbols);
-
-    let mut strtab = vec![0u8];
-    let mut symtab = vec![0u8; ELF64_SYM_SIZE as usize]; // null symbol
-
-    // Dedup extern names while preserving order
-    let mut seen = std::collections::HashSet::new();
-    let unique_externs: Vec<&str> = extern_names
-        .iter()
-        .copied()
-        .filter(|&n| seen.insert(n))
-        .collect();
-
-    // Local defined symbols
-    for sym in &locals {
-        let name_off = strtab.len() as u32;
-        strtab.extend_from_slice(sym.name.as_bytes());
-        strtab.push(0);
-        let mut e = Vec::new();
-        let _ = write_elf64_symbol(
-            &mut e,
-            name_off,
-            STB_LOCAL,
-            STT_FUNC,
-            TEXT_SECTION_INDEX,
-            sym.value,
-        );
-        symtab.extend_from_slice(&e);
-    }
-
-    let first_global_index = 1 + locals.len() as u32;
-
-    // Global defined symbols
-    for sym in &globals {
-        let name_off = strtab.len() as u32;
-        strtab.extend_from_slice(sym.name.as_bytes());
-        strtab.push(0);
-        let mut e = Vec::new();
-        let _ = write_elf64_symbol(
-            &mut e,
-            name_off,
-            STB_GLOBAL,
-            STT_FUNC,
-            TEXT_SECTION_INDEX,
-            sym.value,
-        );
-        symtab.extend_from_slice(&e);
-    }
-
-    let extern_base_index = first_global_index + globals.len() as u32;
-
-    // Undefined external symbols (STB_GLOBAL, SHN_UNDEF=0, value=0)
-    for name in &unique_externs {
-        let name_off = strtab.len() as u32;
-        strtab.extend_from_slice(name.as_bytes());
-        strtab.push(0);
-        let mut e = Vec::new();
-        let _ = write_elf64_symbol(&mut e, name_off, STB_GLOBAL, 0, 0, 0); // SHN_UNDEF = 0
-        symtab.extend_from_slice(&e);
-    }
-
-    (symtab, strtab, first_global_index, extern_base_index)
-}
-
-/// Build the raw bytes for a `.rela.text` section.
-fn build_rela_text(
-    relocations: &[ExternalReloc],
-    extern_names: &[&str],
-    extern_base_index: u32,
-    e_machine: u16,
-) -> Vec<u8> {
-    // Deduplicated extern name → symbol table index
-    let mut seen: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
-    let mut next_idx = extern_base_index;
-    for name in extern_names {
-        seen.entry(name).or_insert_with(|| {
-            let idx = next_idx;
-            next_idx += 1;
-            idx
-        });
-    }
-
-    let rel_type: u64 = match e_machine {
-        183 => R_AARCH64_CALL26, // EM_AARCH64
-        _ => R_X86_64_PLT32,
-    };
-
-    let mut out = Vec::with_capacity(relocations.len() * 24);
-    for reloc in relocations {
-        let sym_idx = *seen.get(reloc.symbol.as_str()).unwrap_or(&0) as u64;
-        let r_info = (sym_idx << 32) | rel_type;
-        out.extend_from_slice(&(reloc.offset as u64).to_le_bytes()); // r_offset
-        out.extend_from_slice(&r_info.to_le_bytes()); // r_info
-        out.extend_from_slice(&(-4i64).to_le_bytes()); // r_addend = -4
-    }
-    out
-}
-
 pub struct ElfWriter;
 
 impl Default for ElfWriter {
@@ -463,249 +295,187 @@ impl ObjectWriter for ElfWriter {
         path: &std::path::Path,
         req: &ObjectWriteRequest<'_>,
     ) -> Result<(), RasError> {
-        let code = req.code;
-        let symbols = req.symbols;
-        let relocations = req.relocations;
-        let opts = req.opts;
-        let e_machine = elf64_e_machine(req.target_arch).ok_or_else(|| {
-            RasError::ObjectError(format!("ELF does not support arch: {:?}", req.target_arch))
-        })?;
-
-        let mut f = std::fs::File::create(path)
-            .map_err(|e| RasError::ObjectError(format!("Failed to create ELF file: {}", e)))?;
-
-        if opts.emit_minimal_dwarf_sections {
-            const SHSTRTAB_DWARF: &[u8] =
-                b"\0.text\0.debug_line\0.debug_abbrev\0.debug_info\0.shstrtab\0";
-            let line_b = dwarf_debug_line_bytes(opts.dwarf_decl_file_name.as_str());
-            let abbrev_b = dwarf_debug_abbrev_bytes();
-            let info_b = dwarf_debug_info_bytes(opts.dwarf_decl_file_name.as_str());
-
-            let n_sec = 6u16;
-            let shoff = ELF64_HEADER_SIZE as u64;
-            let first_data = shoff + u64::from(n_sec) * ELF64_SECTION_HEADER_SIZE as u64;
-            let text_align = 16u64;
-            let text_size_aligned = (code.len() as u64 + text_align - 1) & !(text_align - 1);
-            let mut cur = first_data + text_size_aligned;
-            let line_off = cur;
-            cur += line_b.len() as u64;
-            let abbrev_off = cur;
-            cur += abbrev_b.len() as u64;
-            let info_off = cur;
-            cur += info_b.len() as u64;
-            let shstrtab_off = cur;
-            let shstrtab_size = SHSTRTAB_DWARF.len() as u64;
-
-            write_elf64_header_with_shnum(&mut f, e_machine, n_sec, 5)?;
-            write_elf64_section_header(&mut f, 0, SHT_NULL, 0, 0, 0, 0)?;
-            write_elf64_section_header(
-                &mut f,
-                1,
-                SHT_PROGBITS,
-                SHF_ALLOC | SHF_EXECINSTR,
-                first_data,
-                code.len() as u64,
-                text_align,
-            )?;
-            write_elf64_section_header(
-                &mut f,
-                7,
-                SHT_PROGBITS,
-                0,
-                line_off,
-                line_b.len() as u64,
-                1,
-            )?;
-            write_elf64_section_header(
-                &mut f,
-                19,
-                SHT_PROGBITS,
-                0,
-                abbrev_off,
-                abbrev_b.len() as u64,
-                1,
-            )?;
-            write_elf64_section_header(
-                &mut f,
-                33,
-                SHT_PROGBITS,
-                0,
-                info_off,
-                info_b.len() as u64,
-                1,
-            )?;
-            write_elf64_section_header(&mut f, 45, SHT_STRTAB, 0, shstrtab_off, shstrtab_size, 1)?;
-
-            let pad = text_size_aligned as usize - code.len();
-            f.write_all(code)
-                .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-            if pad > 0 {
-                f.write_all(&vec![0u8; pad])
-                    .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-            }
-            f.write_all(&line_b)
-                .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-            f.write_all(&abbrev_b)
-                .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-            f.write_all(&info_b)
-                .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-            f.write_all(SHSTRTAB_DWARF)
-                .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-            return Ok(());
+        let machine = elf64_e_machine(req.target_arch)
+            .ok_or_else(|| RasError::ObjectError("Unsupported ELF architecture".into()))?;
+        let mut sections = req.sections.to_vec();
+        if sections.is_empty() {
+            sections.push(Section {
+                name: ".text".into(),
+                flags: crate::parser::SectionFlags {
+                    alloc: true,
+                    exec: true,
+                    write: false,
+                },
+                data: req.code.to_vec(),
+            });
         }
-
-        // Build symtab including undefined external symbols (so weld/ld can resolve them).
-        let extern_names: Vec<&str> = relocations.iter().map(|r| r.symbol.as_str()).collect();
-        let (symtab_bytes, strtab_bytes, first_global_index, extern_sym_base) =
-            build_symtab_with_externals(symbols, &extern_names);
-
-        // Build .rela.text entries for each external relocation.
-        // R_X86_64_PLT32 / R_AARCH64_CALL26 with addend = -4.
-        let rela_bytes = if !relocations.is_empty() {
-            build_rela_text(relocations, &extern_names, extern_sym_base, e_machine)
-        } else {
-            Vec::new()
-        };
-        let has_rela = !rela_bytes.is_empty();
-
-        // Section layout:
-        //   Without rela: [0] NULL  [1] .text  [2] .symtab  [3] .strtab  [4] .shstrtab
-        //   With rela:    [0] NULL  [1] .text  [2] .rela.text  [3] .symtab  [4] .strtab  [5] .shstrtab
-        const SHSTRTAB_NO_RELA: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
-        const SHSTRTAB_RELA: &[u8] = b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0";
-
-        let (
-            shstrtab,
-            name_text,
-            name_rela_text,
-            name_symtab,
-            name_strtab,
-            name_shstrtab,
-            section_count,
-            shstrtab_index,
-            symtab_section_index,
-            strtab_section_index,
-        ) = if has_rela {
-            (
-                SHSTRTAB_RELA,
-                1u32,
-                7u32,
-                18u32,
-                26u32,
-                34u32,
-                6u16,
-                5u16,
-                3u32,
-                4u32,
-            )
-        } else {
-            (
-                SHSTRTAB_NO_RELA,
-                1u32,
-                0u32,
-                7u32,
-                15u32,
-                23u32,
-                5u16,
-                4u16,
-                2u32,
-                3u32,
-            )
-        };
-
-        let shoff = ELF64_HEADER_SIZE as u64;
-        let text_offset = shoff + u64::from(section_count) * ELF64_SECTION_HEADER_SIZE as u64;
-        let text_align = 16u64;
-        let text_size_aligned = (code.len() as u64 + text_align - 1) & !(text_align - 1);
-        let rela_offset = text_offset + text_size_aligned;
-        let rela_size = rela_bytes.len() as u64;
-        let symtab_offset = rela_offset + rela_size;
-        let strtab_offset = symtab_offset + symtab_bytes.len() as u64;
-        let shstrtab_offset = strtab_offset + strtab_bytes.len() as u64;
-
-        write_elf64_header_with_shnum(&mut f, e_machine, section_count, shstrtab_index)?;
-        // [0] NULL
-        write_elf64_section_header(&mut f, 0, SHT_NULL, 0, 0, 0, 0)?;
-        // [1] .text
-        write_elf64_section_header(
-            &mut f,
-            name_text,
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_EXECINSTR,
-            text_offset,
-            code.len() as u64,
-            text_align,
-        )?;
-        // [2] .rela.text (only when needed)
-        if has_rela {
-            write_elf64_section_header_full(
-                &mut f,
-                &Elf64SectionHeader {
-                    name: name_rela_text,
+        let mut names: Vec<String> = sections.iter().map(|s| s.name.clone()).collect();
+        let mut data: Vec<Vec<u8>> = sections.iter().map(|s| s.data.clone()).collect();
+        let mut headers: Vec<Elf64SectionHeader> = sections
+            .iter()
+            .map(|s| Elf64SectionHeader {
+                section_type: if s.name == ".bss" { 8 } else { SHT_PROGBITS },
+                flags: u64::from(s.flags.write)
+                    | (u64::from(s.flags.alloc) << 1)
+                    | (u64::from(s.flags.exec) << 2),
+                addralign: 1,
+                ..Default::default()
+            })
+            .collect();
+        let mut strtab = vec![0];
+        let mut symtab = vec![0; ELF64_SYM_SIZE as usize];
+        let mut sym_indices = std::collections::HashMap::new();
+        let mut defined: Vec<_> = req.symbols.iter().collect();
+        defined.sort_by_key(|s| s.global);
+        let first_global = 1 + defined.iter().filter(|s| !s.global).count() as u32;
+        for sym in defined {
+            let index = symtab.len() / ELF64_SYM_SIZE as usize;
+            sym_indices.insert(sym.name.as_str(), index as u32);
+            let name = strtab.len() as u32;
+            strtab.extend_from_slice(sym.name.as_bytes());
+            strtab.push(0);
+            let section = names
+                .iter()
+                .position(|n| n == &sym.section)
+                .ok_or_else(|| {
+                    RasError::ObjectError(format!("Unknown symbol section: {}", sym.section))
+                })?
+                + 1;
+            write_elf64_symbol(
+                &mut symtab,
+                name,
+                u8::from(sym.global),
+                0,
+                section as u16,
+                sym.value,
+            )?;
+        }
+        for reloc in req.relocations {
+            if !sym_indices.contains_key(reloc.symbol.as_str()) {
+                sym_indices.insert(
+                    reloc.symbol.as_str(),
+                    (symtab.len() / ELF64_SYM_SIZE as usize) as u32,
+                );
+                let name = strtab.len() as u32;
+                strtab.extend_from_slice(reloc.symbol.as_bytes());
+                strtab.push(0);
+                write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, 0, 0)?;
+            }
+        }
+        let mut rela_sections = Vec::new();
+        for (i, section) in sections.iter().enumerate() {
+            let mut bytes = Vec::new();
+            for r in req.relocations.iter().filter(|r| r.section == section.name) {
+                bytes.extend_from_slice(&(r.offset as u64).to_le_bytes());
+                let info = (u64::from(sym_indices[r.symbol.as_str()]) << 32) | u64::from(r.kind);
+                bytes.extend_from_slice(&info.to_le_bytes());
+                bytes.extend_from_slice(&r.addend.to_le_bytes());
+            }
+            if !bytes.is_empty() {
+                rela_sections.push(headers.len());
+                names.push(format!(".rela{}", section.name));
+                data.push(bytes);
+                headers.push(Elf64SectionHeader {
                     section_type: SHT_RELA,
                     flags: SHF_INFO_LINK,
-                    offset: rela_offset,
-                    size: rela_size,
-                    link: symtab_section_index,      // points to .symtab
-                    info: TEXT_SECTION_INDEX as u32, // relocates .text
+                    info: (i + 1) as u32,
                     addralign: 8,
                     entsize: ELF64_RELA_SIZE,
-                },
-            )?;
+                    ..Default::default()
+                });
+            }
         }
-        // .symtab
-        write_elf64_section_header_full(
-            &mut f,
-            &Elf64SectionHeader {
-                name: name_symtab,
-                section_type: SHT_SYMTAB,
-                offset: symtab_offset,
-                size: symtab_bytes.len() as u64,
-                link: strtab_section_index,
-                info: first_global_index,
-                addralign: 8,
-                entsize: ELF64_SYM_SIZE,
-                ..Default::default()
-            },
-        )?;
-        // .strtab
-        write_elf64_section_header_full(
-            &mut f,
-            &Elf64SectionHeader {
-                name: name_strtab,
-                section_type: SHT_STRTAB,
-                offset: strtab_offset,
-                size: strtab_bytes.len() as u64,
-                addralign: 1,
-                ..Default::default()
-            },
-        )?;
-        // .shstrtab
-        write_elf64_section_header_full(
-            &mut f,
-            &Elf64SectionHeader {
-                name: name_shstrtab,
-                section_type: SHT_STRTAB,
-                offset: shstrtab_offset,
-                size: shstrtab.len() as u64,
-                addralign: 1,
-                ..Default::default()
-            },
-        )?;
-
-        let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
-        let padding = text_size_aligned as usize - code.len();
-        f.write_all(code).map_err(map)?;
-        if padding > 0 {
-            f.write_all(&vec![0u8; padding]).map_err(map)?;
+        let symtab_index = headers.len() + 1;
+        for i in rela_sections {
+            headers[i].link = symtab_index as u32;
         }
-        if has_rela {
-            f.write_all(&rela_bytes).map_err(map)?;
+        names.push(".symtab".into());
+        data.push(symtab);
+        headers.push(Elf64SectionHeader {
+            section_type: SHT_SYMTAB,
+            link: (symtab_index + 1) as u32,
+            info: first_global,
+            addralign: 8,
+            entsize: ELF64_SYM_SIZE,
+            ..Default::default()
+        });
+        names.push(".strtab".into());
+        data.push(strtab);
+        headers.push(Elf64SectionHeader {
+            section_type: SHT_STRTAB,
+            addralign: 1,
+            ..Default::default()
+        });
+        if req.opts.emit_minimal_dwarf_sections {
+            for (name, bytes) in [
+                (
+                    ".debug_line",
+                    dwarf_debug_line_bytes(&req.opts.dwarf_decl_file_name),
+                ),
+                (".debug_abbrev", dwarf_debug_abbrev_bytes()),
+                (
+                    ".debug_info",
+                    dwarf_debug_info_bytes(&req.opts.dwarf_decl_file_name),
+                ),
+            ] {
+                names.push(name.into());
+                data.push(bytes);
+                headers.push(Elf64SectionHeader {
+                    section_type: SHT_PROGBITS,
+                    addralign: 1,
+                    ..Default::default()
+                });
+            }
         }
-        f.write_all(&symtab_bytes).map_err(map)?;
-        f.write_all(&strtab_bytes).map_err(map)?;
-        f.write_all(shstrtab).map_err(map)?;
-
+        names.push(".shstrtab".into());
+        let mut shstrtab = vec![0];
+        for name in names {
+            shstrtab.extend_from_slice(name.as_bytes());
+            shstrtab.push(0);
+        }
+        headers.push(Elf64SectionHeader {
+            section_type: SHT_STRTAB,
+            addralign: 1,
+            ..Default::default()
+        });
+        let mut name_offset = 1;
+        for header in &mut headers {
+            header.name = name_offset as u32;
+            name_offset += shstrtab[name_offset..]
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap()
+                + 1;
+        }
+        data.push(shstrtab);
+        let mut offset = ELF64_HEADER_SIZE + (headers.len() + 1) * ELF64_SECTION_HEADER_SIZE;
+        let mut payload = Vec::new();
+        for (header, bytes) in headers.iter_mut().zip(data) {
+            let padding = (header.addralign as usize - offset % header.addralign as usize)
+                % header.addralign as usize;
+            payload.resize(payload.len() + padding, 0);
+            offset += padding;
+            header.offset = offset as u64;
+            header.size = bytes.len() as u64;
+            if header.section_type != 8 {
+                offset += bytes.len();
+                payload.extend_from_slice(&bytes);
+            }
+        }
+        let mut f =
+            std::fs::File::create(path).map_err(|e| RasError::ObjectError(e.to_string()))?;
+        write_elf64_header_with_shnum(
+            &mut f,
+            machine,
+            (headers.len() + 1) as u16,
+            headers.len() as u16,
+        )?;
+        write_elf64_section_header_full(&mut f, &Elf64SectionHeader::default())?;
+        for header in headers {
+            write_elf64_section_header_full(&mut f, &header)?;
+        }
+        f.write_all(&payload)
+            .map_err(|e| RasError::ObjectError(e.to_string()))?;
         Ok(())
     }
 }
@@ -956,62 +726,8 @@ pub fn object_writer_for_os(
 }
 
 #[cfg(test)]
-fn build_symtab_and_strtab(symbols: &[ObjectSymbol]) -> (Vec<u8>, Vec<u8>, u32) {
-    let (symtab, strtab, first_global, _) = build_symtab_with_externals(symbols, &[]);
-    (symtab, strtab, first_global)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn symtab_includes_globals_and_skips_local_temporaries() {
-        let symbols = vec![
-            ObjectSymbol {
-                name: "main".to_string(),
-                global: true,
-                section: ".text".to_string(),
-                value: 0,
-            },
-            ObjectSymbol {
-                name: ".L_main_entry".to_string(),
-                global: false,
-                section: ".text".to_string(),
-                value: 16,
-            },
-            ObjectSymbol {
-                name: "helper".to_string(),
-                global: false,
-                section: ".text".to_string(),
-                value: 32,
-            },
-        ];
-
-        let (symtab, strtab, first_global) = build_symtab_and_strtab(&symbols);
-
-        // Null entry + one local (helper) + one global (main); `.L` is dropped.
-        assert_eq!(symtab.len(), 3 * ELF64_SYM_SIZE as usize);
-        assert_eq!(first_global, 2);
-        assert!(strtab.windows(4).any(|w| w == b"main"));
-        assert!(strtab.windows(6).any(|w| w == b"helper"));
-        assert!(!strtab.windows(2).any(|w| w == b".L"));
-    }
-
-    #[test]
-    fn symtab_drops_symbols_outside_text() {
-        let symbols = vec![ObjectSymbol {
-            name: "data_label".to_string(),
-            global: true,
-            section: ".data".to_string(),
-            value: 0,
-        }];
-
-        let (symtab, _strtab, first_global) = build_symtab_and_strtab(&symbols);
-
-        assert_eq!(symtab.len(), ELF64_SYM_SIZE as usize);
-        assert_eq!(first_global, 1);
-    }
 
     #[test]
     fn test_elf64_x86_64_write() {
@@ -1019,6 +735,7 @@ mod tests {
         let code = [0xc3u8];
         let sections = vec![Section {
             name: ".text".to_string(),
+            data: code.to_vec(),
             flags: SectionFlags {
                 alloc: true,
                 exec: true,
@@ -1050,6 +767,7 @@ mod tests {
         let code = [0xc0, 0x03, 0x5f, 0xd6];
         let sections = vec![Section {
             name: ".text".to_string(),
+            data: code.to_vec(),
             flags: SectionFlags {
                 alloc: true,
                 exec: true,

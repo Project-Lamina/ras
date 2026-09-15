@@ -11,6 +11,7 @@ use std::collections::HashSet;
 pub struct Section {
     pub name: String,
     pub flags: SectionFlags,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub struct Symbol {
 
 #[derive(Debug, Clone)]
 pub enum Line {
+    Section(String),
     Label(Symbol),
     Instruction(ParsedInstruction),
     Data(Vec<u8>),
@@ -123,27 +125,35 @@ impl AssemblyParser {
         }
 
         match parts[0] {
-            ".text" => {
-                self.current_section = ".text".to_string();
-                self.sections.push(Section {
-                    name: ".text".to_string(),
-                    flags: SectionFlags {
-                        alloc: true,
-                        exec: true,
-                        write: false,
-                    },
-                });
-            }
-            ".data" => {
-                self.current_section = ".data".to_string();
-                self.sections.push(Section {
-                    name: ".data".to_string(),
-                    flags: SectionFlags {
-                        alloc: true,
-                        exec: false,
-                        write: true,
-                    },
-                });
+            ".text" | ".data" | ".bss" | ".section" => {
+                let name = if parts[0] == ".section" {
+                    parts
+                        .get(1)
+                        .ok_or_else(|| RasError::ParseError(".section requires a name".into()))?
+                        .split(',')
+                        .next()
+                        .unwrap()
+                } else {
+                    parts[0]
+                };
+                self.current_section = name.to_string();
+                self.lines.push(Line::Section(name.to_string()));
+                if !self.sections.iter().any(|s| s.name == name) {
+                    let explicit = line.split('"').nth(1);
+                    self.sections.push(Section {
+                        name: name.to_string(),
+                        flags: SectionFlags {
+                            alloc: explicit.map_or(
+                                !name.starts_with(".debug") && name != ".note.GNU-stack",
+                                |f| f.contains('a'),
+                            ),
+                            exec: explicit.map_or(name == ".text", |f| f.contains('x')),
+                            write: explicit
+                                .map_or(name == ".data" || name == ".bss", |f| f.contains('w')),
+                        },
+                        data: Vec::new(),
+                    });
+                }
             }
             ".global" | ".globl" => {
                 if parts.len() < 2 {
@@ -167,9 +177,9 @@ impl AssemblyParser {
                     self.lines.push(Line::Data(bytes));
                 }
             }
-            ".section" | ".align" | ".balign" | ".p2align" | ".byte" | ".short" | ".int"
-            | ".long" | ".quad" | ".zero" | ".space" | ".skip" | ".cfi_startproc"
-            | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type" | ".ident" | ".file" => {}
+            ".align" | ".balign" | ".p2align" | ".byte" | ".short" | ".int" | ".long" | ".quad"
+            | ".zero" | ".space" | ".skip" | ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa"
+            | ".size" | ".type" | ".ident" | ".file" => {}
             _ => {}
         }
 
