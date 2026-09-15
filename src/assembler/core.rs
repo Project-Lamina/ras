@@ -139,14 +139,53 @@ impl RasAssembler {
             .parse(asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
 
-        let (code, symbols, relocs) = self.encode_lines_two_pass(&parsed.lines)?;
+        let mut sections = parsed.sections.clone();
+        if !sections.iter().any(|s| s.name == ".text") {
+            sections.insert(
+                0,
+                crate::parser::Section {
+                    name: ".text".into(),
+                    flags: crate::parser::SectionFlags {
+                        alloc: true,
+                        exec: true,
+                        write: false,
+                    },
+                    data: Vec::new(),
+                },
+            );
+        }
+        let mut symbols = Vec::new();
+        let mut relocs = Vec::new();
+        for section in &mut sections {
+            let mut current = ".text";
+            let lines: Vec<_> = parsed
+                .lines
+                .iter()
+                .filter(|line| {
+                    if let Line::Section(name) = line {
+                        current = name;
+                        return false;
+                    }
+                    current == section.name
+                })
+                .cloned()
+                .collect();
+            let (data, mut syms, mut relocations) = self.encode_lines_two_pass(&lines)?;
+            section.data = data;
+            for reloc in &mut relocations {
+                reloc.section = section.name.clone();
+            }
+            symbols.append(&mut syms);
+            relocs.append(&mut relocations);
+        }
+        let code = &sections.iter().find(|s| s.name == ".text").unwrap().data;
 
         self.object_writer
             .write_object_file(
                 output_path,
                 &ObjectWriteRequest {
-                    code: &code,
-                    sections: &parsed.sections,
+                    code,
+                    sections: &sections,
                     symbols: &symbols,
                     relocations: &relocs,
                     target_arch: self.target_arch,
@@ -167,6 +206,7 @@ impl RasAssembler {
 
         for line in lines {
             match line {
+                Line::Section(_) => {}
                 Line::Label(sym) => {
                     symbol_offsets.insert(sym.name.clone(), current_offset);
                 }
@@ -297,6 +337,13 @@ impl RasAssembler {
                         external_relocs.push(ExternalReloc {
                             offset: *offset,
                             symbol: target.clone(),
+                            section: String::new(),
+                            kind: if matches!(patch, PatchPoint::X86RipRel32 { .. }) {
+                                2
+                            } else {
+                                4
+                            },
+                            addend: -4,
                         });
                     }
                     _ => {
