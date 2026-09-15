@@ -83,6 +83,11 @@ impl AssemblyParser {
                 let before = &line[..colon_pos];
                 if !before.is_empty() && !before.contains(char::is_whitespace) {
                     let label = before.trim();
+                    if self.symbols.iter().any(|s| s.name == label) {
+                        return Err(RasError::ParseError(format!(
+                            "Symbol already defined: {label}"
+                        )));
+                    }
                     let global = self.pending_globals.remove(label);
                     let sym = Symbol {
                         name: label.to_string(),
