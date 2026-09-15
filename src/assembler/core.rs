@@ -46,6 +46,14 @@ pub struct RasAssembler {
 }
 
 enum PatchPoint {
+    AArch64 {
+        offset: usize,
+        target: String,
+        word: u32,
+        bits: u32,
+        kind: u32,
+        relocate: bool,
+    },
     X86Rel32 {
         offset: usize,
         target: String,
@@ -228,6 +236,77 @@ impl RasAssembler {
                         continue;
                     }
 
+                    if self.target_arch == TargetArchitecture::Aarch64 {
+                        let operands = &inst.operands;
+                        let patch = if matches!(opcode.as_str(), "b" | "bl")
+                            || opcode.starts_with("b.")
+                        {
+                            let target = operands
+                                .first()
+                                .ok_or_else(|| {
+                                    RasError::EncodingError("Missing branch target".into())
+                                })?
+                                .clone();
+                            let conditional = opcode.starts_with("b.");
+                            let word = if conditional {
+                                0x5400_0000 | crate::encoder::aarch64::condition(&opcode[2..])?
+                            } else if opcode == "bl" {
+                                0x9400_0000
+                            } else {
+                                0x1400_0000
+                            };
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: target.clone(),
+                                word,
+                                bits: if conditional { 19 } else { 26 },
+                                kind: if conditional {
+                                    280
+                                } else if opcode == "bl" {
+                                    283
+                                } else {
+                                    282
+                                },
+                                relocate: opcode == "bl" && !target.starts_with(".L"),
+                            })
+                        } else if opcode == "adrp" && operands.len() == 2 {
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: operands[1].clone(),
+                                word: 0x9000_0000
+                                    | u32::from(crate::encoder::aarch64::register(&operands[0])?),
+                                bits: 0,
+                                kind: 275,
+                                relocate: true,
+                            })
+                        } else if opcode == "add"
+                            && operands.len() == 3
+                            && operands[2].starts_with(":lo12:")
+                        {
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: operands[2][6..].into(),
+                                word: 0x9100_0000
+                                    | (u32::from(crate::encoder::aarch64::register(&operands[1])?)
+                                        << 5)
+                                    | u32::from(crate::encoder::aarch64::register(&operands[0])?),
+                                bits: 0,
+                                kind: 277,
+                                relocate: true,
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(patch) = patch {
+                            if let PatchPoint::AArch64 { word, .. } = &patch {
+                                code.extend_from_slice(&word.to_le_bytes());
+                            }
+                            patch_points.push(patch);
+                            current_offset += 4;
+                            continue;
+                        }
+                    }
+
                     // Handle leaq/lea with RIP-relative label: "leaq label(%rip), %reg"
                     if self.target_arch == TargetArchitecture::X86_64
                         && (opcode == "leaq" || opcode == "lea")
@@ -299,13 +378,47 @@ impl RasAssembler {
 
         for patch in &patch_points {
             let target = match patch {
-                PatchPoint::X86Rel32 { target, .. }
+                PatchPoint::AArch64 { target, .. }
+                | PatchPoint::X86Rel32 { target, .. }
                 | PatchPoint::X86RipRel32 { target, .. }
                 | PatchPoint::Arx64Jal { target, .. }
                 | PatchPoint::Arx64Branch { target, .. } => target,
             };
+            if let PatchPoint::AArch64 {
+                offset,
+                target,
+                word,
+                bits,
+                kind,
+                relocate,
+            } = patch
+            {
+                if !relocate && let Some(&target_offset) = symbol_offsets.get(target) {
+                    let delta = target_offset as i64 - *offset as i64;
+                    if delta % 4 != 0
+                        || !(-(1i64 << (bits + 1))..(1i64 << (bits + 1))).contains(&delta)
+                    {
+                        return Err(RasError::EncodingError(
+                            "AArch64 branch out of range".into(),
+                        ));
+                    }
+                    let imm = (delta / 4) as u32 & ((1 << bits) - 1);
+                    let instruction = word | if *bits == 19 { imm << 5 } else { imm };
+                    code[*offset..*offset + 4].copy_from_slice(&instruction.to_le_bytes());
+                } else {
+                    external_relocs.push(ExternalReloc {
+                        offset: *offset,
+                        symbol: target.clone(),
+                        section: String::new(),
+                        kind: *kind,
+                        addend: 0,
+                    });
+                }
+                continue;
+            }
             if let Some(&target_offset) = symbol_offsets.get(target) {
                 match patch {
+                    PatchPoint::AArch64 { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. }
                     | PatchPoint::X86RipRel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);

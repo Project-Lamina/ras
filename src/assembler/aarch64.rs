@@ -2,6 +2,10 @@
 //!
 //! This module handles compilation of MIR to AArch64 binary machine code.
 
+use crate::aarch64_encoding::{
+    enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr_aarch64, encode_and_rrr_aarch64,
+    encode_and_w_rrr_aarch64, encode_msub_aarch64, encode_msub_aarch64_w,
+};
 use crate::{
     aarch64_ldst_imm64::{
         AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
@@ -521,47 +525,9 @@ pub fn compile_mir_aarch64_function(
 
 /// Encode STP 64-bit pre-index instruction
 /// stp Xt, Xt2, [Xn|SP, #imm]!
-fn enc_stp_pre_64(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> Result<u32, RasError> {
-    if imm_bytes % 8 != 0 {
-        return Err(RasError::EncodingError(
-            "STP imm must be multiple of 8".into(),
-        ));
-    }
-    let imm7 = imm_bytes / 8;
-    if !(-64..=63).contains(&imm7) {
-        return Err(RasError::EncodingError(format!(
-            "STP imm7 out of range: {}",
-            imm7
-        )));
-    }
-    let imm7_bits = (imm7 as u32) & 0x7F;
-
-    // STP 64-bit, pre-index base opcode: 0xA980_0000
-    // imm7 at [21:15], Rt2 at [14:10], Rn at [9:5], Rt at [4:0]
-    Ok(0xA980_0000 | (imm7_bits << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | (rt as u32))
-}
 
 /// Encode LDP 64-bit post-index instruction
 /// ldp Xt, Xt2, [Xn|SP], #imm
-fn enc_ldp_post_64(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> Result<u32, RasError> {
-    if imm_bytes % 8 != 0 {
-        return Err(RasError::EncodingError(
-            "LDP imm must be multiple of 8".into(),
-        ));
-    }
-    let imm7 = imm_bytes / 8;
-    if !(-64..=63).contains(&imm7) {
-        return Err(RasError::EncodingError(format!(
-            "LDP imm7 out of range: {}",
-            imm7
-        )));
-    }
-    let imm7_bits = (imm7 as u32) & 0x7F;
-
-    // LDP 64-bit, post-index base opcode: 0xA8C0_0000
-    // imm7 at [21:15], Rt2 at [14:10], Rn at [9:5], Rt at [4:0]
-    Ok(0xA8C0_0000 | (imm7_bits << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | (rt as u32))
-}
 
 /// Encode AArch64 prologue
 fn encode_prologue_aarch64(stack_size: usize) -> Result<Vec<u8>, RasError> {
@@ -766,26 +732,10 @@ fn aarch64_apply_i32_offset_to_reg(
 }
 
 /// MSUB Xd, Xn, Xm, Xa: Xd = Xa - (Xn * Xm)
-fn encode_msub_aarch64(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
-    let w = 0x9B008000u32
-        | ((rm as u32) << 16)
-        | ((ra as u32) << 10)
-        | ((rn as u32) << 5)
-        | (rd as u32);
-    w.to_le_bytes().to_vec()
-}
 
 /// ADD Xd, Xn, Xm (no shift)
-fn encode_add_rrr_aarch64(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
-    let w = 0x8B000000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
-    w.to_le_bytes().to_vec()
-}
 
 /// AND Xd, Xn, Xm (no shift)
-fn encode_and_rrr_aarch64(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
-    let w = 0x8A000000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
-    w.to_le_bytes().to_vec()
-}
 
 /// SBFM Xd, Xn, #immr, #imms (64-bit); used for sign-extension of low (imms+1) bits.
 fn encode_sbfm64_aarch64(rd: u8, rn: u8, immr: u8, imms: u8) -> Vec<u8> {
@@ -815,14 +765,6 @@ fn encode_shiftv_aarch64(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
 }
 
 /// MSUB Wd, Wn, Wm, Wa
-fn encode_msub_aarch64_w(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
-    let w = 0x1B00_8000u32
-        | ((rm as u32) << 16)
-        | ((ra as u32) << 10)
-        | ((rn as u32) << 5)
-        | (rd as u32);
-    w.to_le_bytes().to_vec()
-}
 
 fn encode_shiftv_aarch64_w(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let op = match which {
@@ -831,11 +773,6 @@ fn encode_shiftv_aarch64_w(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8>
         ShiftVKind::Asr => 0x1AC0_2800u32,
     };
     let w = op | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
-    w.to_le_bytes().to_vec()
-}
-
-fn encode_and_w_rrr_aarch64(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
-    let w = 0x0A00_0000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
 }
 

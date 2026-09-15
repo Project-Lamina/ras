@@ -3,6 +3,7 @@
 //! Assembly source (.s) to relocatable object files (.o).
 //! Supported: x86_64 and AArch64; ELF on Linux/BSD/Redox.
 
+mod aarch64_encoding;
 mod aarch64_ldst_imm64;
 
 pub mod assembler;
