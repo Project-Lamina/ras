@@ -638,12 +638,10 @@ impl InstructionEncoder for X86_64Encoder {
                         code.extend_from_slice(&imm.to_le_bytes());
                     }
                 } else {
-                    // AT&T order: `cmp src, dst` computes dst - src. 0x3B is
-                    // CMP r64, r/m64 (reg = dst, r/m = src).
                     let src = self.parse_register(a)?;
-                    code.push(self.encode_rex(true, dst >> 3, 0, src >> 3));
-                    code.push(0x3B);
-                    code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
+                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
+                    code.push(0x39);
+                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
                 }
             }
             // testq: bitwise AND without storing result (sets flags)
