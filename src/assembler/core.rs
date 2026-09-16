@@ -159,6 +159,7 @@ impl RasAssembler {
                         write: false,
                     },
                     data: Vec::new(),
+                    alignment: 1,
                 },
             );
         }
@@ -178,10 +179,28 @@ impl RasAssembler {
                 })
                 .cloned()
                 .collect();
-            let (data, mut syms, mut relocations) = self.encode_lines_two_pass(&lines)?;
+            let (data, mut syms, mut relocations) =
+                self.encode_lines_two_pass(&lines, section.flags.exec)?;
+            section.alignment =
+                if self.target_arch == TargetArchitecture::Aarch64 && section.flags.exec {
+                    4
+                } else {
+                    1
+                };
+            for line in &lines {
+                if let Line::Align {
+                    value, directive, ..
+                } = line
+                {
+                    section.alignment = section.alignment.max(self.alignment(*value, directive)?);
+                }
+            }
             section.data = data;
             for reloc in &mut relocations {
                 reloc.section = section.name.clone();
+            }
+            for sym in &mut syms {
+                sym.section = section.name.clone();
             }
             symbols.append(&mut syms);
             relocs.append(&mut relocations);
@@ -206,15 +225,77 @@ impl RasAssembler {
         Ok(())
     }
 
-    fn encode_lines_two_pass(&mut self, lines: &[Line]) -> EncodeResult {
+    fn alignment(&self, value: usize, directive: &str) -> Result<usize, RasError> {
+        let power = directive == ".p2align"
+            || directive == ".align" && self.target_arch == TargetArchitecture::Aarch64;
+        let alignment = if power {
+            1usize.checked_shl(u32::try_from(value).unwrap_or(u32::MAX))
+        } else {
+            Some(value.max(1))
+        };
+        alignment
+            .filter(|n| n.is_power_of_two())
+            .ok_or_else(|| RasError::EncodingError("Invalid section alignment".into()))
+    }
+
+    fn encode_lines_two_pass(&mut self, lines: &[Line], executable: bool) -> EncodeResult {
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
         let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
+        let mut mapping_symbols = Vec::new();
+        let mut mapping_mode = "";
         let mut current_offset = 0usize;
 
         for line in lines {
+            if self.target_arch == TargetArchitecture::Aarch64 {
+                let mode = match line {
+                    Line::Instruction(_) => "$x",
+                    Line::Data(bytes) if !bytes.is_empty() => "$d",
+                    _ => mapping_mode,
+                };
+                if mode != mapping_mode {
+                    mapping_symbols.push(ObjectSymbol {
+                        name: format!("{mode}.{}", mapping_symbols.len()),
+                        global: false,
+                        section: String::new(),
+                        value: current_offset as u64,
+                    });
+                    mapping_mode = mode;
+                }
+            }
             match line {
                 Line::Section(_) => {}
+                Line::Align {
+                    value,
+                    directive,
+                    fill,
+                    max_skip,
+                } => {
+                    let alignment = self.alignment(*value, directive)?;
+                    let padding = (alignment - current_offset % alignment) % alignment;
+                    if max_skip.is_some_and(|maximum| padding > maximum) {
+                        continue;
+                    }
+                    if let Some(fill) = fill {
+                        code.resize(code.len() + padding, *fill);
+                    } else if executable && self.target_arch == TargetArchitecture::Aarch64 {
+                        let prefix = padding % 4;
+                        code.resize(code.len() + prefix, 0);
+                        for _ in 0..padding / 4 {
+                            code.extend_from_slice(&0xd503_201fu32.to_le_bytes());
+                        }
+                    } else {
+                        code.resize(
+                            code.len() + padding,
+                            if executable && self.target_arch == TargetArchitecture::X86_64 {
+                                0x90
+                            } else {
+                                0
+                            },
+                        );
+                    }
+                    current_offset += padding;
+                }
                 Line::Label(sym) => {
                     symbol_offsets.insert(sym.name.clone(), current_offset);
                 }
@@ -469,7 +550,7 @@ impl RasAssembler {
             }
         }
 
-        let symbols = lines
+        let mut symbols: Vec<_> = lines
             .iter()
             .filter_map(|l| match l {
                 Line::Label(s) => Some(ObjectSymbol {
@@ -482,6 +563,7 @@ impl RasAssembler {
             })
             .collect();
 
+        symbols.extend(mapping_symbols);
         Ok((code, symbols, external_relocs))
     }
 
