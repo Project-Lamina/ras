@@ -18,10 +18,24 @@ use crate::{
     target::unsupported_target_hint,
 };
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Return type of the two-pass encoding pass.
 type EncodeResult = Result<(Vec<u8>, Vec<ObjectSymbol>, Vec<ExternalReloc>), RasError>;
+
+struct ShortJump {
+    index: usize,
+    offset: usize,
+    target: String,
+}
+
+struct Layout {
+    code: Vec<u8>,
+    symbol_offsets: HashMap<String, usize>,
+    patch_points: Vec<PatchPoint>,
+    mapping_symbols: Vec<ObjectSymbol>,
+    short_jumps: Vec<ShortJump>,
+}
 
 #[cfg(windows)]
 mod windows_loader {
@@ -239,14 +253,45 @@ impl RasAssembler {
     }
 
     fn encode_lines_two_pass(&mut self, lines: &[Line], executable: bool) -> EncodeResult {
+        let mut long_jumps = HashSet::new();
+        let layout = loop {
+            let layout = self.layout_lines(lines, executable, &long_jumps)?;
+            let grown: Vec<usize> = layout
+                .short_jumps
+                .iter()
+                .filter(|site| {
+                    !layout
+                        .symbol_offsets
+                        .get(&site.target)
+                        .is_some_and(|&target| {
+                            i8::try_from(target as i64 - (site.offset as i64 + 2)).is_ok()
+                        })
+                })
+                .map(|site| site.index)
+                .collect();
+            if grown.is_empty() {
+                break layout;
+            }
+            long_jumps.extend(grown);
+        };
+        Self::finish_layout(layout, lines)
+    }
+
+    fn layout_lines(
+        &mut self,
+        lines: &[Line],
+        executable: bool,
+        long_jumps: &HashSet<usize>,
+    ) -> Result<Layout, RasError> {
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
         let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
         let mut mapping_symbols = Vec::new();
         let mut mapping_mode = "";
         let mut current_offset = 0usize;
+        let mut short_jumps = Vec::new();
 
-        for line in lines {
+        for (index, line) in lines.iter().enumerate() {
             if self.target_arch == TargetArchitecture::Aarch64 {
                 let mode = match line {
                     Line::Instruction(_) => "$x",
@@ -414,6 +459,16 @@ impl RasAssembler {
                         && let Some(cc_byte) = x86_cond_jmp_byte(&opcode)
                     {
                         let target = inst.operands[0].trim();
+                        if !long_jumps.contains(&index) {
+                            code.extend_from_slice(&[cc_byte - 0x10, 0]);
+                            short_jumps.push(ShortJump {
+                                index,
+                                offset: current_offset,
+                                target: target.to_string(),
+                            });
+                            current_offset += 2;
+                            continue;
+                        }
                         code.extend_from_slice(&[0x0F, cc_byte, 0, 0, 0, 0]);
                         patch_points.push(PatchPoint::X86Rel32 {
                             offset: current_offset + 2,
@@ -427,6 +482,16 @@ impl RasAssembler {
                         let target = inst.operands[0].trim();
                         if self.target_arch == TargetArchitecture::X86_64 {
                             let is_call = opcode == "call";
+                            if !is_call && !long_jumps.contains(&index) {
+                                code.extend_from_slice(&[0xeb, 0]);
+                                short_jumps.push(ShortJump {
+                                    index,
+                                    offset: current_offset,
+                                    target: target.to_string(),
+                                });
+                                current_offset += 2;
+                                continue;
+                            }
                             let opcode_byte: u8 = if is_call { 0xe8 } else { 0xe9 };
                             code.push(opcode_byte);
                             code.extend_from_slice(&[0u8; 4]);
@@ -453,6 +518,33 @@ impl RasAssembler {
                     }
                 }
             }
+        }
+
+        Ok(Layout {
+            code,
+            symbol_offsets,
+            patch_points,
+            mapping_symbols,
+            short_jumps,
+        })
+    }
+
+    fn finish_layout(layout: Layout, lines: &[Line]) -> EncodeResult {
+        let Layout {
+            mut code,
+            symbol_offsets,
+            patch_points,
+            mapping_symbols,
+            short_jumps,
+        } = layout;
+        for site in &short_jumps {
+            let target = symbol_offsets.get(&site.target).ok_or_else(|| {
+                RasError::EncodingError(format!("Undefined label: {}", site.target))
+            })?;
+            let rel = i8::try_from(*target as i64 - (site.offset as i64 + 2)).map_err(|_| {
+                RasError::EncodingError(format!("Short jump out of range: {}", site.target))
+            })?;
+            code[site.offset + 1] = rel as u8;
         }
 
         let mut external_relocs: Vec<ExternalReloc> = Vec::new();
