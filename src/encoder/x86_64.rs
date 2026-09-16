@@ -71,93 +71,107 @@ impl X86_64Encoder {
         }
     }
 
-    fn parse_memory(&self, op: &str) -> Result<(i32, u8), RasError> {
-        let op = op.trim();
-        if !op.contains('(') || !op.contains(')') {
-            return Err(RasError::EncodingError(format!(
-                "Invalid memory operand: {}",
-                op
-            )));
-        }
-        let paren_start = op.find('(').unwrap();
-        let paren_end = op.find(')').unwrap();
-        let disp_str = op[..paren_start].trim();
-        let base_str = op[paren_start + 1..paren_end].trim();
-
-        let disp: i32 = if disp_str.is_empty() {
-            0
-        } else {
-            disp_str.parse().map_err(|_| {
-                RasError::EncodingError(format!("Invalid displacement: {}", disp_str))
-            })?
+    fn parse_mem(&self, op: &str) -> Result<Mem, RasError> {
+        let invalid = || RasError::EncodingError(format!("Invalid memory operand: {}", op));
+        let mut text = op.trim();
+        let fs = match text.strip_prefix("%fs:") {
+            Some(rest) => {
+                text = rest;
+                true
+            }
+            None => false,
         };
-
-        let base = self.parse_register(base_str)?;
-        Ok((disp, base))
+        let (disp_text, inner) = match text.find('(') {
+            Some(open) => {
+                let inner = text[open + 1..].strip_suffix(')').ok_or_else(invalid)?;
+                (&text[..open], Some(inner))
+            }
+            None => (text, None),
+        };
+        let disp_text = disp_text.trim();
+        let mut mem = Mem {
+            fs,
+            disp: 0,
+            label: None,
+            base: None,
+            index: None,
+        };
+        if !disp_text.is_empty() {
+            match parse_imm(disp_text) {
+                Ok(value) => mem.disp = value,
+                Err(_) if is_symbol(disp_text) => mem.label = Some(disp_text.to_string()),
+                Err(_) => return Err(invalid()),
+            }
+        }
+        if let Some(inner) = inner {
+            let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+            let (base, index) = match parts.as_slice() {
+                [base] => (*base, None),
+                [base, index] => (*base, Some((*index, "1"))),
+                [base, index, scale] => (*base, Some((*index, *scale))),
+                _ => return Err(invalid()),
+            };
+            if base.trim_start_matches('%') == "rip" {
+                return Err(RasError::EncodingError(
+                    "RIP-relative operands are not supported".into(),
+                ));
+            } else if !base.is_empty() {
+                let reg = gpr(base)
+                    .filter(|g| g.width == 64 && !g.high)
+                    .ok_or_else(invalid)?;
+                mem.base = Some(reg.num);
+            }
+            if let Some((index, scale)) = index {
+                let reg = gpr(index)
+                    .filter(|g| g.width == 64 && !g.high && g.num != 4)
+                    .ok_or_else(invalid)?;
+                let scale_bits = match scale {
+                    "1" => 0,
+                    "2" => 1,
+                    "4" => 2,
+                    "8" => 3,
+                    _ => return Err(invalid()),
+                };
+                mem.index = Some((reg.num, scale_bits));
+            }
+        }
+        if mem.label.is_some() {
+            return Err(RasError::EncodingError(
+                "Absolute symbol operands are not supported".into(),
+            ));
+        }
+        Ok(mem)
     }
 
     fn is_memory(&self, op: &str) -> bool {
-        op.contains('(') && op.contains(')')
+        let op = op.trim();
+        (op.contains('(') && op.contains(')')) || op.starts_with("%fs:")
     }
 
-    fn encode_rm(&self, operand: &str, reg: u8) -> Result<(Vec<u8>, u8), RasError> {
-        if !self.is_memory(operand) {
-            let rm = self.parse_register(operand)?;
-            return Ok((vec![0xc0 | ((reg & 7) << 3) | (rm & 7)], rm >> 3));
+    fn parse_rm(&self, op: &str, xmm: bool) -> Result<(Rm, Option<Gpr>), RasError> {
+        let op = op.trim();
+        if self.is_memory(op) {
+            return Ok((Rm::Mem(self.parse_mem(op)?), None));
         }
-        let (disp, base) = self.parse_memory(operand)?;
-        let low = base & 7;
-        let mode = if disp == 0 && low != 5 {
-            0
-        } else if (-128..=127).contains(&disp) {
-            1
-        } else {
-            2
-        };
-        let mut bytes = vec![(mode << 6) | ((reg & 7) << 3) | low];
-        if low == 4 {
-            bytes.push(0x24);
+        if xmm && let Some(number) = parse_xmm(op) {
+            return Ok((Rm::Reg(number), None));
         }
-        if mode == 1 {
-            bytes.push(disp as u8);
-        } else if mode == 2 {
-            bytes.extend_from_slice(&disp.to_le_bytes());
+        if xmm {
+            return Err(RasError::EncodingError(format!(
+                "Expected xmm or memory operand: {}",
+                op
+            )));
         }
-        Ok((bytes, base >> 3))
+        let gpr =
+            gpr(op).ok_or_else(|| RasError::EncodingError(format!("Unknown register: {}", op)))?;
+        Ok((Rm::Reg(gpr.num), Some(gpr)))
     }
 
-    fn move_prefix(
+    fn encode_integer_move(
         &self,
-        width: u8,
-        reg: u8,
-        base: u8,
+        width: Option<u8>,
         operands: &[String],
     ) -> Result<Vec<u8>, RasError> {
-        let mut bytes = Vec::new();
-        if width == 16 {
-            bytes.push(0x66);
-        }
-        let rex = self.encode_rex(width == 64, reg >> 3, 0, base);
-        let low_byte = width == 8
-            && operands
-                .iter()
-                .any(|s| matches!(s.trim_start_matches('%'), "spl" | "bpl" | "sil" | "dil"));
-        if rex != 0x40 || low_byte {
-            if width == 8
-                && operands
-                    .iter()
-                    .any(|s| matches!(s.trim_start_matches('%'), "ah" | "ch" | "dh" | "bh"))
-            {
-                return Err(RasError::EncodingError(
-                    "High byte registers cannot use REX".into(),
-                ));
-            }
-            bytes.push(rex);
-        }
-        Ok(bytes)
-    }
-
-    fn encode_integer_move(&self, width: u8, operands: &[String]) -> Result<Vec<u8>, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("mov requires two operands".into()));
         }
@@ -166,53 +180,159 @@ impl X86_64Encoder {
         } else {
             (&operands[0], &operands[1])
         };
-        if let Some(imm) = src.strip_prefix('$') {
-            let imm: i64 = imm
-                .parse()
-                .map_err(|_| RasError::EncodingError("Invalid move immediate".into()))?;
-            if self.is_memory(dst) && width == 64 && i32::try_from(imm).is_err() {
+        if let Some(imm_text) = src.trim().strip_prefix('$') {
+            let imm = parse_imm(imm_text)?;
+            let (rm, gpr) = self.parse_rm(dst, false)?;
+            let width = operand_width(width, &[gpr])?;
+            let legacy: &[u8] = if width == 16 { &[0x66] } else { &[] };
+            if matches!(rm, Rm::Mem(_)) || (width == 64 && i32::try_from(imm).is_ok()) {
+                if width == 64 && i32::try_from(imm).is_err() {
+                    return Err(RasError::EncodingError(
+                        "Memory move immediate must fit signed 32 bits".into(),
+                    ));
+                }
+                let (byte_rex, high) = byte_flags(&[gpr]);
+                let opcode = [if width == 8 { 0xc6 } else { 0xc7 }];
+                return encode_op(Op {
+                    legacy,
+                    wide: width == 64,
+                    byte_rex,
+                    high,
+                    opcode: &opcode,
+                    rm,
+                    imm: &imm_bytes(imm, width)?,
+                    ..Op::default()
+                });
+            }
+            let gpr = gpr.ok_or_else(|| RasError::EncodingError("Expected gpr".into()))?;
+            let (byte_rex, high) = byte_flags(&[Some(gpr)]);
+            let rex = 0x40 | (u8::from(width == 64) << 3) | (gpr.num >> 3);
+            let needs_rex = rex != 0x40 || byte_rex;
+            if high && needs_rex {
                 return Err(RasError::EncodingError(
-                    "Memory move immediate must fit signed 32 bits".into(),
+                    "High byte registers cannot use REX".into(),
                 ));
             }
-            if self.is_memory(dst) || (width == 64 && i32::try_from(imm).is_ok()) {
-                let (rm, base) = self.encode_rm(dst, 0)?;
-                let mut bytes = self.move_prefix(width, 0, base, operands)?;
-                bytes.push(if width == 8 { 0xc6 } else { 0xc7 });
-                bytes.extend(rm);
-                bytes.extend_from_slice(&imm.to_le_bytes()[..usize::from(width.min(32) / 8)]);
-                return Ok(bytes);
+            let mut bytes = legacy.to_vec();
+            if needs_rex {
+                bytes.push(rex);
             }
-            let reg = self.parse_register(dst)?;
-            let mut bytes = self.move_prefix(width, 0, reg >> 3, operands)?;
-            bytes.push((if width == 8 { 0xb0 } else { 0xb8 }) | (reg & 7));
-            bytes.extend_from_slice(&imm.to_le_bytes()[..usize::from(width / 8)]);
+            bytes.push((if width == 8 { 0xb0 } else { 0xb8 }) | (gpr.num & 7));
+            if width == 64 {
+                bytes.extend_from_slice(&imm.to_le_bytes());
+            } else {
+                bytes.extend(imm_bytes(imm, width)?);
+            }
             return Ok(bytes);
         }
-        let load = self.is_memory(src);
-        let (reg, rm) = if load {
-            (self.parse_register(dst)?, src)
-        } else {
-            (self.parse_register(src)?, dst)
+        let (src_rm, src_gpr) = self.parse_rm(src, false)?;
+        let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
+        let width = operand_width(width, &[src_gpr, dst_gpr])?;
+        let legacy: &[u8] = if width == 16 { &[0x66] } else { &[] };
+        let (byte_rex, high) = byte_flags(&[src_gpr, dst_gpr]);
+        let (opcode, reg, rm) = match (src_rm, dst_rm) {
+            (Rm::Mem(_), Rm::Mem(_)) => {
+                return Err(RasError::EncodingError(
+                    "mov: memory to memory is not encodable".into(),
+                ));
+            }
+            (Rm::Mem(mem), Rm::Reg(reg)) => {
+                ([if width == 8 { 0x8a } else { 0x8b }], reg, Rm::Mem(mem))
+            }
+            (Rm::Reg(reg), rm) => ([if width == 8 { 0x88 } else { 0x89 }], reg, rm),
         };
-        let (rm, base) = self.encode_rm(rm, reg)?;
-        let mut bytes = self.move_prefix(width, reg, base, operands)?;
-        bytes.push(match (width == 8, load) {
-            (true, true) => 0x8a,
-            (true, false) => 0x88,
-            (false, true) => 0x8b,
-            (false, false) => 0x89,
-        });
-        bytes.extend(rm);
-        Ok(bytes)
+        encode_op(Op {
+            legacy,
+            wide: width == 64,
+            byte_rex,
+            high,
+            opcode: &opcode,
+            reg,
+            rm,
+            ..Op::default()
+        })
     }
 
-    fn encode_mov_mem_reg(&self, mem: &str, reg: u8, store: bool) -> Result<Vec<u8>, RasError> {
-        let (rm, base) = self.encode_rm(mem, reg)?;
-        let mut bytes = self.move_prefix(64, reg, base, &[])?;
-        bytes.push(if store { 0x89 } else { 0x8b });
-        bytes.extend(rm);
-        Ok(bytes)
+    fn encode_lea(&self, width: Option<u8>, operands: &[String]) -> Result<Vec<u8>, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError("lea requires 2 operands".into()));
+        }
+        let (src, _) = self.parse_rm(&operands[0], false)?;
+        let Rm::Mem(_) = src else {
+            return Err(RasError::EncodingError(
+                "lea: first operand must be memory".into(),
+            ));
+        };
+        let (dst, dst_gpr) = self.parse_rm(&operands[1], false)?;
+        let Rm::Reg(reg) = dst else {
+            return Err(RasError::EncodingError(
+                "lea: second operand must be a register".into(),
+            ));
+        };
+        let width = operand_width(width, &[dst_gpr])?;
+        if width != 32 && width != 64 {
+            return Err(RasError::EncodingError(
+                "lea: unsupported operand width".into(),
+            ));
+        }
+        encode_op(Op {
+            wide: width == 64,
+            opcode: &[0x8d],
+            reg,
+            rm: src,
+            ..Op::default()
+        })
+    }
+
+    fn encode_movzx(&self, opcode: &str, operands: &[String]) -> Result<Vec<u8>, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError(
+                "movzx requires two operands".into(),
+            ));
+        }
+        let (src_bits, dst_width): (Option<u8>, Option<u8>) = match opcode {
+            "movzbq" => (Some(8), Some(64)),
+            "movzbl" => (Some(8), Some(32)),
+            "movzwq" => (Some(16), Some(64)),
+            "movzwl" => (Some(16), Some(32)),
+            _ => (None, None),
+        };
+        let (src, src_gpr) = self.parse_rm(&operands[0], false)?;
+        let (dst, dst_gpr) = self.parse_rm(&operands[1], false)?;
+        let Rm::Reg(reg) = dst else {
+            return Err(RasError::EncodingError(
+                "movzx: destination must be a register".into(),
+            ));
+        };
+        let src_bits = match (src_bits, src_gpr) {
+            (Some(bits), _) => bits,
+            (None, Some(gpr)) => gpr.width,
+            (None, None) => {
+                return Err(RasError::EncodingError(
+                    "movzx: cannot infer source width".into(),
+                ));
+            }
+        };
+        if src_bits != 8 && src_bits != 16 {
+            return Err(RasError::EncodingError("movzx: bad source width".into()));
+        }
+        let width = operand_width(dst_width, &[dst_gpr])?;
+        if width != 16 && width != 32 && width != 64 {
+            return Err(RasError::EncodingError(
+                "movzx: bad destination width".into(),
+            ));
+        }
+        let (byte_rex, high) = byte_flags(&[src_gpr]);
+        encode_op(Op {
+            legacy: if width == 16 { &[0x66] } else { &[] },
+            wide: width == 64,
+            byte_rex,
+            high,
+            opcode: &[0x0f, if src_bits == 8 { 0xb6 } else { 0xb7 }],
+            reg,
+            rm: src,
+            ..Op::default()
+        })
     }
 }
 
@@ -232,7 +352,10 @@ impl InstructionEncoder for X86_64Encoder {
                 let b = &inst.operands[1];
 
                 if parse_xmm(a).is_none() && parse_xmm(b).is_none() {
-                    code = self.encode_integer_move(64, &inst.operands)?;
+                    code = self.encode_integer_move(
+                        if opcode == "movq" { Some(64) } else { None },
+                        &inst.operands,
+                    )?;
                 } else {
                     let a_xmm = parse_xmm(a.trim().trim_start_matches('%'));
                     let b_xmm = parse_xmm(b.trim().trim_start_matches('%'));
@@ -330,25 +453,13 @@ impl InstructionEncoder for X86_64Encoder {
                 }
                 code.push(0x58 | (reg & 7));
             }
-            "leaq" | "lea" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "lea requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                if !self.is_memory(a) || self.is_memory(b) {
-                    return Err(RasError::EncodingError(
-                        "lea: first operand must be memory, second register".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(b)?;
-                let bytes = self.encode_mov_mem_reg(a, reg, false)?;
-                let mut lea_code = vec![bytes[0]];
-                lea_code.push(0x8D);
-                lea_code.extend_from_slice(&bytes[2..]);
-                code.extend(lea_code);
+            "leaq" | "lea" | "leal" => {
+                let width = match opcode.as_str() {
+                    "leal" => Some(32),
+                    "leaq" => Some(64),
+                    _ => None,
+                };
+                code = self.encode_lea(width, &inst.operands)?;
             }
             "imulq" | "imul" => {
                 if inst.operands.len() != 2 {
@@ -775,7 +886,7 @@ impl InstructionEncoder for X86_64Encoder {
                     "movw" => 16,
                     _ => 32,
                 };
-                code = self.encode_integer_move(width, &inst.operands)?;
+                code = self.encode_integer_move(Some(width), &inst.operands)?;
             }
             // syscall: 0F 05
             "syscall" => {
@@ -923,24 +1034,7 @@ impl InstructionEncoder for X86_64Encoder {
                 code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
             }
             "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "movzx requires two operands".into(),
-                    ));
-                }
-                let dst = self.parse_register(&inst.operands[1])?;
-                let (rm, base) = self.encode_rm(&inst.operands[0], dst)?;
-                let width = if opcode.ends_with('l') { 32 } else { 64 };
-                code = self.move_prefix(width, dst, base, &inst.operands)?;
-                code.extend_from_slice(&[
-                    0x0f,
-                    if opcode.starts_with("movzw") {
-                        0xb7
-                    } else {
-                        0xb6
-                    },
-                ]);
-                code.extend(rm);
+                code = self.encode_movzx(&opcode, &inst.operands)?;
             }
             _ => {
                 return Err(RasError::EncodingError(format!(
@@ -959,6 +1053,233 @@ impl InstructionEncoder for X86_64Encoder {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Gpr {
+    num: u8,
+    width: u8,
+    high: bool,
+}
+
+const GPR_NAMES: [[&str; 4]; 16] = [
+    ["rax", "eax", "ax", "al"],
+    ["rcx", "ecx", "cx", "cl"],
+    ["rdx", "edx", "dx", "dl"],
+    ["rbx", "ebx", "bx", "bl"],
+    ["rsp", "esp", "sp", "spl"],
+    ["rbp", "ebp", "bp", "bpl"],
+    ["rsi", "esi", "si", "sil"],
+    ["rdi", "edi", "di", "dil"],
+    ["r8", "r8d", "r8w", "r8b"],
+    ["r9", "r9d", "r9w", "r9b"],
+    ["r10", "r10d", "r10w", "r10b"],
+    ["r11", "r11d", "r11w", "r11b"],
+    ["r12", "r12d", "r12w", "r12b"],
+    ["r13", "r13d", "r13w", "r13b"],
+    ["r14", "r14d", "r14w", "r14b"],
+    ["r15", "r15d", "r15w", "r15b"],
+];
+
+fn gpr(name: &str) -> Option<Gpr> {
+    let name = name.trim().trim_start_matches('%');
+    for (num, names) in GPR_NAMES.iter().enumerate() {
+        if let Some(index) = names.iter().position(|candidate| *candidate == name) {
+            let width = [64, 32, 16, 8][index];
+            return Some(Gpr {
+                num: num as u8,
+                width,
+                high: false,
+            });
+        }
+    }
+    ["ah", "ch", "dh", "bh"]
+        .iter()
+        .position(|candidate| *candidate == name)
+        .map(|index| Gpr {
+            num: 4 + index as u8,
+            width: 8,
+            high: true,
+        })
+}
+
+#[derive(Clone)]
+struct Mem {
+    fs: bool,
+    disp: i64,
+    label: Option<String>,
+    base: Option<u8>,
+    index: Option<(u8, u8)>,
+}
+
+enum Rm {
+    Reg(u8),
+    Mem(Mem),
+}
+
+impl Default for Rm {
+    fn default() -> Self {
+        Rm::Reg(0)
+    }
+}
+
+#[derive(Default)]
+struct Op<'a> {
+    legacy: &'a [u8],
+    wide: bool,
+    byte_rex: bool,
+    high: bool,
+    opcode: &'a [u8],
+    reg: u8,
+    rm: Rm,
+    imm: &'a [u8],
+}
+
+fn encode_op(op: Op<'_>) -> Result<Vec<u8>, RasError> {
+    let mut tail = Vec::new();
+    let mut rex_x = 0;
+    let mut rex_b = 0;
+    let reg_field = (op.reg & 7) << 3;
+    let mut seg = false;
+    match &op.rm {
+        Rm::Reg(number) => {
+            tail.push(0xc0 | reg_field | (number & 7));
+            rex_b = number >> 3;
+        }
+        Rm::Mem(mem) => {
+            seg = mem.fs;
+            if let Some((index, _)) = mem.index {
+                rex_x = index >> 3;
+            }
+            let index_field = mem.index.map_or(4, |(index, _)| index & 7);
+            let scale = mem.index.map_or(0, |(_, bits)| bits);
+            match mem.base {
+                None => {
+                    tail.push(reg_field | 4);
+                    tail.push((scale << 6) | (index_field << 3) | 5);
+                    tail.extend_from_slice(&disp32(mem.disp)?);
+                }
+                Some(base) => {
+                    rex_b = base >> 3;
+                    let need_sib = mem.index.is_some() || base & 7 == 4;
+                    let mode = if mem.disp == 0 && base & 7 != 5 {
+                        0
+                    } else if i8::try_from(mem.disp).is_ok() {
+                        1
+                    } else {
+                        2
+                    };
+                    let rm_field = if need_sib { 4 } else { base & 7 };
+                    tail.push((mode << 6) | reg_field | rm_field);
+                    if need_sib {
+                        tail.push((scale << 6) | (index_field << 3) | (base & 7));
+                    }
+                    match mode {
+                        1 => tail.push(mem.disp as u8),
+                        2 => tail.extend_from_slice(&disp32(mem.disp)?),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let rex = 0x40 | (u8::from(op.wide) << 3) | ((op.reg >> 3) << 2) | (rex_x << 1) | rex_b;
+    let needs_rex = rex != 0x40 || op.byte_rex;
+    if op.high && needs_rex {
+        return Err(RasError::EncodingError(
+            "High byte registers cannot use REX".into(),
+        ));
+    }
+    let mut bytes = op.legacy.to_vec();
+    if seg {
+        bytes.push(0x64);
+    }
+    if needs_rex {
+        bytes.push(rex);
+    }
+    bytes.extend_from_slice(op.opcode);
+    bytes.extend(tail);
+    bytes.extend_from_slice(op.imm);
+    Ok(bytes)
+}
+
+fn disp32(value: i64) -> Result<[u8; 4], RasError> {
+    i32::try_from(value)
+        .map(i32::to_le_bytes)
+        .map_err(|_| RasError::EncodingError(format!("Displacement out of range: {}", value)))
+}
+
+fn parse_imm(text: &str) -> Result<i64, RasError> {
+    let text = text.trim();
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let magnitude = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) => i64::from_str_radix(hex, 16),
+        None => digits.parse::<i64>(),
+    }
+    .map_err(|_| RasError::EncodingError(format!("Invalid immediate: {}", text)))?;
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
+fn is_symbol(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '.')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
+fn imm_bytes(value: i64, width: u8) -> Result<Vec<u8>, RasError> {
+    let fits = match width {
+        8 => (-128..=255).contains(&value),
+        16 => (-32768..=65535).contains(&value),
+        32 => (-(1i64 << 31)..=(1i64 << 32) - 1).contains(&value),
+        _ => i32::try_from(value).is_ok(),
+    };
+    if !fits {
+        return Err(RasError::EncodingError(format!(
+            "Immediate {} out of range for {}-bit operand",
+            value, width
+        )));
+    }
+    Ok(match width {
+        8 => vec![value as u8],
+        16 => (value as u16).to_le_bytes().to_vec(),
+        32 => (value as u32).to_le_bytes().to_vec(),
+        _ => (value as i32).to_le_bytes().to_vec(),
+    })
+}
+
+fn operand_width(width: Option<u8>, gprs: &[Option<Gpr>]) -> Result<u8, RasError> {
+    let mut found = width;
+    for gpr in gprs.iter().flatten() {
+        match found {
+            None => found = Some(gpr.width),
+            Some(existing) if existing == gpr.width => {}
+            Some(_) => {
+                return Err(RasError::EncodingError(
+                    "Operand widths do not match".into(),
+                ));
+            }
+        }
+    }
+    found.ok_or_else(|| RasError::EncodingError("Cannot infer operand width".into()))
+}
+
+fn byte_flags(gprs: &[Option<Gpr>]) -> (bool, bool) {
+    gprs.iter()
+        .flatten()
+        .filter(|gpr| gpr.width == 8)
+        .fold((false, false), |(rex, high), gpr| {
+            if gpr.high {
+                (rex, true)
+            } else {
+                (rex || (4..8).contains(&gpr.num), high)
+            }
+        })
+}
+
 fn parse_xmm(s: &str) -> Option<u8> {
     let s = s.trim_start_matches('%');
     let s = s.strip_prefix("xmm")?;
@@ -974,7 +1295,10 @@ mod tests {
     #[test]
     fn memory_operands_match_gnu_as() {
         let enc = X86_64Encoder::new();
-        let load = |mem: &str| enc.encode_mov_mem_reg(mem, 0, false).expect("encode");
+        let load = |mem: &str| {
+            enc.encode_integer_move(Some(64), &[mem.to_string(), "%rax".to_string()])
+                .expect("encode")
+        };
 
         assert_eq!(load("8(%rsp)"), vec![0x48, 0x8b, 0x44, 0x24, 0x08]);
         assert_eq!(load("(%rsp)"), vec![0x48, 0x8b, 0x04, 0x24]);
