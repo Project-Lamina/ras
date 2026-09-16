@@ -75,6 +75,7 @@ enum PatchPoint {
     X86RipRel32 {
         offset: usize,
         target: String,
+        trailing: usize,
     },
     Arx64Jal {
         offset: usize,
@@ -433,26 +434,6 @@ impl RasAssembler {
                         }
                     }
 
-                    // Handle leaq/lea with RIP-relative label: "leaq label(%rip), %reg"
-                    if self.target_arch == TargetArchitecture::X86_64
-                        && (opcode == "leaq" || opcode == "lea")
-                        && inst.operands.len() == 2
-                        && let Some(label) = extract_rip_label(inst.operands[0].trim())
-                    {
-                        let reg = parse_x86_reg(inst.operands[1].trim())
-                            .map_err(|e| RasError::EncodingError(e.to_string()))?;
-                        // REX.W=1, REX.R set if reg>=8; opcode=0x8D; ModRM Mod=00 R/M=101(RIP-rel)
-                        let rex: u8 = 0x48 | ((reg >> 3) << 2);
-                        let modrm: u8 = ((reg & 7) << 3) | 5;
-                        code.extend_from_slice(&[rex, 0x8D, modrm, 0, 0, 0, 0]);
-                        patch_points.push(PatchPoint::X86RipRel32 {
-                            offset: current_offset + 3,
-                            target: label.to_string(),
-                        });
-                        current_offset += 7;
-                        continue;
-                    }
-
                     // x86_64 conditional jumps: 2-byte opcode (0x0F 8x) + rel32
                     if self.target_arch == TargetArchitecture::X86_64
                         && inst.operands.len() == 1
@@ -513,6 +494,18 @@ impl RasAssembler {
                             .encoder
                             .encode_instruction(inst)
                             .map_err(|e| RasError::EncodingError(e.to_string()))?;
+                        if let Some(fixup) = self.encoder.take_rip_fixup()
+                            && let Some(label) = inst
+                                .operands
+                                .iter()
+                                .find_map(|op| extract_rip_label(op.trim()))
+                        {
+                            patch_points.push(PatchPoint::X86RipRel32 {
+                                offset: current_offset + fixup.disp_offset,
+                                target: label.to_string(),
+                                trailing: fixup.trailing,
+                            });
+                        }
                         code.extend_from_slice(&bytes);
                         current_offset += bytes.len();
                     }
@@ -592,9 +585,16 @@ impl RasAssembler {
             if let Some(&target_offset) = symbol_offsets.get(target) {
                 match patch {
                     PatchPoint::AArch64 { .. } => unreachable!(),
-                    PatchPoint::X86Rel32 { offset, .. }
-                    | PatchPoint::X86RipRel32 { offset, .. } => {
+                    PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
+                        let rel32_bytes = (rel32 as i32).to_le_bytes();
+                        code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
+                    }
+                    PatchPoint::X86RipRel32 {
+                        offset, trailing, ..
+                    } => {
+                        let rel32 =
+                            (target_offset as i64) - (*offset as i64 + 4 + *trailing as i64);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
                         code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
                     }
@@ -618,18 +618,26 @@ impl RasAssembler {
             } else {
                 // Unresolved symbol → external relocation for the linker.
                 match patch {
-                    PatchPoint::X86Rel32 { offset, target }
-                    | PatchPoint::X86RipRel32 { offset, target } => {
+                    PatchPoint::X86Rel32 { offset, target } => {
                         external_relocs.push(ExternalReloc {
                             offset: *offset,
                             symbol: target.clone(),
                             section: String::new(),
-                            kind: if matches!(patch, PatchPoint::X86RipRel32 { .. }) {
-                                2
-                            } else {
-                                4
-                            },
+                            kind: 4,
                             addend: -4,
+                        });
+                    }
+                    PatchPoint::X86RipRel32 {
+                        offset,
+                        target,
+                        trailing,
+                    } => {
+                        external_relocs.push(ExternalReloc {
+                            offset: *offset,
+                            symbol: target.clone(),
+                            section: String::new(),
+                            kind: 2,
+                            addend: -(4 + *trailing as i64),
                         });
                     }
                     _ => {
@@ -967,30 +975,4 @@ fn extract_rip_label(op: &str) -> Option<&str> {
         return None;
     }
     Some(label)
-}
-
-fn parse_x86_reg(s: &str) -> Result<u8, RasError> {
-    let s = s.trim().trim_start_matches('%');
-    match s {
-        "rax" | "eax" => Ok(0),
-        "rcx" | "ecx" => Ok(1),
-        "rdx" | "edx" => Ok(2),
-        "rbx" | "ebx" => Ok(3),
-        "rsp" | "esp" => Ok(4),
-        "rbp" | "ebp" => Ok(5),
-        "rsi" | "esi" => Ok(6),
-        "rdi" | "edi" => Ok(7),
-        "r8" => Ok(8),
-        "r9" => Ok(9),
-        "r10" => Ok(10),
-        "r11" => Ok(11),
-        "r12" => Ok(12),
-        "r13" => Ok(13),
-        "r14" => Ok(14),
-        "r15" => Ok(15),
-        _ => Err(RasError::EncodingError(format!(
-            "Unknown x86 register: {}",
-            s
-        ))),
-    }
 }

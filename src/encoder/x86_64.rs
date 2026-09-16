@@ -1,12 +1,13 @@
 //! x86-64 binary instruction encoder
 
 use crate::{
-    encoder::traits::{InstructionEncoder, ParsedInstruction},
+    encoder::traits::{InstructionEncoder, ParsedInstruction, RipFixup},
     error::RasError,
 };
 
 pub struct X86_64Encoder {
     position: usize,
+    rip_fixup: Option<RipFixup>,
 }
 
 impl Default for X86_64Encoder {
@@ -17,7 +18,10 @@ impl Default for X86_64Encoder {
 
 impl X86_64Encoder {
     pub fn new() -> Self {
-        Self { position: 0 }
+        Self {
+            position: 0,
+            rip_fixup: None,
+        }
     }
 
     fn encode_rex(&self, w: bool, r: u8, x: u8, b: u8) -> u8 {
@@ -95,6 +99,7 @@ impl X86_64Encoder {
             label: None,
             base: None,
             index: None,
+            rip: false,
         };
         if !disp_text.is_empty() {
             match parse_imm(disp_text) {
@@ -112,9 +117,10 @@ impl X86_64Encoder {
                 _ => return Err(invalid()),
             };
             if base.trim_start_matches('%') == "rip" {
-                return Err(RasError::EncodingError(
-                    "RIP-relative operands are not supported".into(),
-                ));
+                if index.is_some() || fs {
+                    return Err(invalid());
+                }
+                mem.rip = true;
             } else if !base.is_empty() {
                 let reg = gpr(base)
                     .filter(|g| g.width == 64 && !g.high)
@@ -135,12 +141,17 @@ impl X86_64Encoder {
                 mem.index = Some((reg.num, scale_bits));
             }
         }
-        if mem.label.is_some() {
+        if mem.label.is_some() && !mem.rip {
             return Err(RasError::EncodingError(
                 "Absolute symbol operands are not supported".into(),
             ));
         }
         Ok(mem)
+    }
+
+    fn emit(&mut self, encoded: Encoded) -> Vec<u8> {
+        self.rip_fixup = encoded.rip;
+        encoded.bytes
     }
 
     fn is_memory(&self, op: &str) -> bool {
@@ -171,7 +182,7 @@ impl X86_64Encoder {
         &self,
         width: Option<u8>,
         operands: &[String],
-    ) -> Result<Vec<u8>, RasError> {
+    ) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("mov requires two operands".into()));
         }
@@ -223,7 +234,7 @@ impl X86_64Encoder {
             } else {
                 bytes.extend(imm_bytes(imm, width)?);
             }
-            return Ok(bytes);
+            return Ok(Encoded { bytes, rip: None });
         }
         let (src_rm, src_gpr) = self.parse_rm(src, false)?;
         let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
@@ -253,7 +264,7 @@ impl X86_64Encoder {
         })
     }
 
-    fn encode_lea(&self, width: Option<u8>, operands: &[String]) -> Result<Vec<u8>, RasError> {
+    fn encode_lea(&self, width: Option<u8>, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("lea requires 2 operands".into()));
         }
@@ -284,7 +295,7 @@ impl X86_64Encoder {
         })
     }
 
-    fn encode_movzx(&self, opcode: &str, operands: &[String]) -> Result<Vec<u8>, RasError> {
+    fn encode_movzx(&self, opcode: &str, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError(
                 "movzx requires two operands".into(),
@@ -337,7 +348,12 @@ impl X86_64Encoder {
 }
 
 impl InstructionEncoder for X86_64Encoder {
+    fn take_rip_fixup(&mut self) -> Option<RipFixup> {
+        self.rip_fixup.take()
+    }
+
     fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
+        self.rip_fixup = None;
         let opcode = inst.opcode.to_lowercase();
         let mut code = Vec::new();
 
@@ -352,10 +368,10 @@ impl InstructionEncoder for X86_64Encoder {
                 let b = &inst.operands[1];
 
                 if parse_xmm(a).is_none() && parse_xmm(b).is_none() {
-                    code = self.encode_integer_move(
+                    code = self.emit(self.encode_integer_move(
                         if opcode == "movq" { Some(64) } else { None },
                         &inst.operands,
-                    )?;
+                    )?);
                 } else {
                     let a_xmm = parse_xmm(a.trim().trim_start_matches('%'));
                     let b_xmm = parse_xmm(b.trim().trim_start_matches('%'));
@@ -459,7 +475,7 @@ impl InstructionEncoder for X86_64Encoder {
                     "leaq" => Some(64),
                     _ => None,
                 };
-                code = self.encode_lea(width, &inst.operands)?;
+                code = self.emit(self.encode_lea(width, &inst.operands)?);
             }
             "imulq" | "imul" => {
                 if inst.operands.len() != 2 {
@@ -886,7 +902,7 @@ impl InstructionEncoder for X86_64Encoder {
                     "movw" => 16,
                     _ => 32,
                 };
-                code = self.encode_integer_move(Some(width), &inst.operands)?;
+                code = self.emit(self.encode_integer_move(Some(width), &inst.operands)?);
             }
             // syscall: 0F 05
             "syscall" => {
@@ -1034,7 +1050,7 @@ impl InstructionEncoder for X86_64Encoder {
                 code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
             }
             "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" => {
-                code = self.encode_movzx(&opcode, &inst.operands)?;
+                code = self.emit(self.encode_movzx(&opcode, &inst.operands)?);
             }
             _ => {
                 return Err(RasError::EncodingError(format!(
@@ -1108,6 +1124,12 @@ struct Mem {
     label: Option<String>,
     base: Option<u8>,
     index: Option<(u8, u8)>,
+    rip: bool,
+}
+
+struct Encoded {
+    bytes: Vec<u8>,
+    rip: Option<RipFixup>,
 }
 
 enum Rm {
@@ -1133,16 +1155,22 @@ struct Op<'a> {
     imm: &'a [u8],
 }
 
-fn encode_op(op: Op<'_>) -> Result<Vec<u8>, RasError> {
+fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     let mut tail = Vec::new();
     let mut rex_x = 0;
     let mut rex_b = 0;
     let reg_field = (op.reg & 7) << 3;
     let mut seg = false;
+    let mut rip_disp = None;
     match &op.rm {
         Rm::Reg(number) => {
             tail.push(0xc0 | reg_field | (number & 7));
             rex_b = number >> 3;
+        }
+        Rm::Mem(mem) if mem.rip => {
+            tail.push(reg_field | 5);
+            rip_disp = Some(tail.len());
+            tail.extend_from_slice(&disp32(mem.disp)?);
         }
         Rm::Mem(mem) => {
             seg = mem.fs;
@@ -1196,9 +1224,14 @@ fn encode_op(op: Op<'_>) -> Result<Vec<u8>, RasError> {
         bytes.push(rex);
     }
     bytes.extend_from_slice(op.opcode);
+    let tail_start = bytes.len();
     bytes.extend(tail);
+    let rip = rip_disp.map(|position| RipFixup {
+        disp_offset: tail_start + position,
+        trailing: op.imm.len(),
+    });
     bytes.extend_from_slice(op.imm);
-    Ok(bytes)
+    Ok(Encoded { bytes, rip })
 }
 
 fn disp32(value: i64) -> Result<[u8; 4], RasError> {
@@ -1298,6 +1331,7 @@ mod tests {
         let load = |mem: &str| {
             enc.encode_integer_move(Some(64), &[mem.to_string(), "%rax".to_string()])
                 .expect("encode")
+                .bytes
         };
 
         assert_eq!(load("8(%rsp)"), vec![0x48, 0x8b, 0x44, 0x24, 0x08]);
