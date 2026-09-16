@@ -57,3 +57,14 @@ fn move_widths_extensions_and_scalar_operations_match_gas() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn memory_move_rejects_an_unrepresentable_immediate() {
+    let path = std::env::temp_dir().join(format!("ras_invalid_immediate_{}.o", std::process::id()));
+    assert!(
+        Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .unwrap()
+            .assemble("movq $4294967295, (%rax)\n", &path)
+            .is_err()
+    );
+}

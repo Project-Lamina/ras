@@ -170,6 +170,11 @@ impl X86_64Encoder {
             let imm: i64 = imm
                 .parse()
                 .map_err(|_| RasError::EncodingError("Invalid move immediate".into()))?;
+            if self.is_memory(dst) && width == 64 && i32::try_from(imm).is_err() {
+                return Err(RasError::EncodingError(
+                    "Memory move immediate must fit signed 32 bits".into(),
+                ));
+            }
             if self.is_memory(dst) || (width == 64 && i32::try_from(imm).is_ok()) {
                 let (rm, base) = self.encode_rm(dst, 0)?;
                 let mut bytes = self.move_prefix(width, 0, base, operands)?;
