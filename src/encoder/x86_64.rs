@@ -39,15 +39,23 @@ impl X86_64Encoder {
 
     fn parse_register(&self, reg: &str) -> Result<u8, RasError> {
         let reg = reg.trim_start_matches('%');
+        if let Some(number) = reg.strip_prefix('r') {
+            let number = number.trim_end_matches(['b', 'w', 'd']);
+            if let Ok(n) = number.parse::<u8>()
+                && (8..=15).contains(&n)
+            {
+                return Ok(n);
+            }
+        }
         match reg {
             "rax" | "eax" | "ax" | "al" => Ok(0),
             "rcx" | "ecx" | "cx" | "cl" => Ok(1),
             "rdx" | "edx" | "dx" | "dl" => Ok(2),
             "rbx" | "ebx" | "bx" | "bl" => Ok(3),
-            "rsp" | "esp" | "sp" | "ah" => Ok(4),
-            "rbp" | "ebp" | "bp" | "ch" => Ok(5),
-            "rsi" | "esi" | "si" | "dh" => Ok(6),
-            "rdi" | "edi" | "di" | "bh" => Ok(7),
+            "rsp" | "esp" | "sp" | "spl" | "ah" => Ok(4),
+            "rbp" | "ebp" | "bp" | "bpl" | "ch" => Ok(5),
+            "rsi" | "esi" | "si" | "sil" | "dh" => Ok(6),
+            "rdi" | "edi" | "di" | "dil" | "bh" => Ok(7),
             "r8" => Ok(8),
             "r9" => Ok(9),
             "r10" => Ok(10),
@@ -92,35 +100,114 @@ impl X86_64Encoder {
         op.contains('(') && op.contains(')')
     }
 
-    fn encode_mov_mem_reg(&self, mem: &str, reg: u8, store: bool) -> Result<Vec<u8>, RasError> {
-        let (disp, base) = self.parse_memory(mem)?;
-        let rex = self.encode_rex(true, reg >> 3, 0, base >> 3);
-        let mod_reg = (reg & 7) << 3;
-
-        // r/m 100 means a SIB follows; r/m 101 at mod 00 means disp32-only.
-        let low = base & 7;
-        let needs_sib = low == 4;
-        // scale 00, index 100 (none)
-        let sib_opt = needs_sib.then_some((4 << 3) | low);
-        let r_m = if needs_sib { 4 } else { low };
-
-        let (mod_bits, disp_bytes): (u8, Vec<u8>) = if disp == 0 && low != 5 {
-            (0, vec![])
-        } else if (-128..=127).contains(&disp) {
-            (1, vec![disp as u8])
-        } else {
-            (2, disp.to_le_bytes().to_vec())
-        };
-
-        let modrm = (mod_bits << 6) | mod_reg | r_m;
-        let mut code = vec![rex];
-        code.push(if store { 0x89 } else { 0x8B });
-        code.push(modrm);
-        if let Some(sib) = sib_opt {
-            code.push(sib);
+    fn encode_rm(&self, operand: &str, reg: u8) -> Result<(Vec<u8>, u8), RasError> {
+        if !self.is_memory(operand) {
+            let rm = self.parse_register(operand)?;
+            return Ok((vec![0xc0 | ((reg & 7) << 3) | (rm & 7)], rm >> 3));
         }
-        code.extend(disp_bytes);
-        Ok(code)
+        let (disp, base) = self.parse_memory(operand)?;
+        let low = base & 7;
+        let mode = if disp == 0 && low != 5 {
+            0
+        } else if (-128..=127).contains(&disp) {
+            1
+        } else {
+            2
+        };
+        let mut bytes = vec![(mode << 6) | ((reg & 7) << 3) | low];
+        if low == 4 {
+            bytes.push(0x24);
+        }
+        if mode == 1 {
+            bytes.push(disp as u8);
+        } else if mode == 2 {
+            bytes.extend_from_slice(&disp.to_le_bytes());
+        }
+        Ok((bytes, base >> 3))
+    }
+
+    fn move_prefix(
+        &self,
+        width: u8,
+        reg: u8,
+        base: u8,
+        operands: &[String],
+    ) -> Result<Vec<u8>, RasError> {
+        let mut bytes = Vec::new();
+        if width == 16 {
+            bytes.push(0x66);
+        }
+        let rex = self.encode_rex(width == 64, reg >> 3, 0, base);
+        let low_byte = width == 8
+            && operands
+                .iter()
+                .any(|s| matches!(s.trim_start_matches('%'), "spl" | "bpl" | "sil" | "dil"));
+        if rex != 0x40 || low_byte {
+            if width == 8
+                && operands
+                    .iter()
+                    .any(|s| matches!(s.trim_start_matches('%'), "ah" | "ch" | "dh" | "bh"))
+            {
+                return Err(RasError::EncodingError(
+                    "High byte registers cannot use REX".into(),
+                ));
+            }
+            bytes.push(rex);
+        }
+        Ok(bytes)
+    }
+
+    fn encode_integer_move(&self, width: u8, operands: &[String]) -> Result<Vec<u8>, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError("mov requires two operands".into()));
+        }
+        let (src, dst) = if operands[1].starts_with('$') {
+            (&operands[1], &operands[0])
+        } else {
+            (&operands[0], &operands[1])
+        };
+        if let Some(imm) = src.strip_prefix('$') {
+            let imm: i64 = imm
+                .parse()
+                .map_err(|_| RasError::EncodingError("Invalid move immediate".into()))?;
+            if self.is_memory(dst) || (width == 64 && i32::try_from(imm).is_ok()) {
+                let (rm, base) = self.encode_rm(dst, 0)?;
+                let mut bytes = self.move_prefix(width, 0, base, operands)?;
+                bytes.push(if width == 8 { 0xc6 } else { 0xc7 });
+                bytes.extend(rm);
+                bytes.extend_from_slice(&imm.to_le_bytes()[..usize::from(width.min(32) / 8)]);
+                return Ok(bytes);
+            }
+            let reg = self.parse_register(dst)?;
+            let mut bytes = self.move_prefix(width, 0, reg >> 3, operands)?;
+            bytes.push((if width == 8 { 0xb0 } else { 0xb8 }) | (reg & 7));
+            bytes.extend_from_slice(&imm.to_le_bytes()[..usize::from(width / 8)]);
+            return Ok(bytes);
+        }
+        let load = self.is_memory(src);
+        let (reg, rm) = if load {
+            (self.parse_register(dst)?, src)
+        } else {
+            (self.parse_register(src)?, dst)
+        };
+        let (rm, base) = self.encode_rm(rm, reg)?;
+        let mut bytes = self.move_prefix(width, reg, base, operands)?;
+        bytes.push(match (width == 8, load) {
+            (true, true) => 0x8a,
+            (true, false) => 0x88,
+            (false, true) => 0x8b,
+            (false, false) => 0x89,
+        });
+        bytes.extend(rm);
+        Ok(bytes)
+    }
+
+    fn encode_mov_mem_reg(&self, mem: &str, reg: u8, store: bool) -> Result<Vec<u8>, RasError> {
+        let (rm, base) = self.encode_rm(mem, reg)?;
+        let mut bytes = self.move_prefix(64, reg, base, &[])?;
+        bytes.push(if store { 0x89 } else { 0x8b });
+        bytes.extend(rm);
+        Ok(bytes)
     }
 }
 
@@ -139,35 +226,9 @@ impl InstructionEncoder for X86_64Encoder {
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
 
-                if a.starts_with('$') && !b.starts_with('$') {
-                    let imm: i64 = a
-                        .trim_start_matches('$')
-                        .parse()
-                        .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
-                    let dst_reg = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
-                    code.push(0xB8 | (dst_reg & 7));
-                    code.extend_from_slice(&imm.to_le_bytes());
-                } else if !a.starts_with('$') && b.starts_with('$') {
-                    let imm: i64 = b
-                        .trim_start_matches('$')
-                        .parse()
-                        .map_err(|_| RasError::EncodingError("Invalid immediate".to_string()))?;
-                    let dst_reg = self.parse_register(a)?;
-                    code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
-                    code.push(0xB8 | (dst_reg & 7));
-                    code.extend_from_slice(&imm.to_le_bytes());
-                } else if self.is_memory(a) && !self.is_memory(b) {
-                    let reg = self.parse_register(b)?;
-                    code.extend(self.encode_mov_mem_reg(a, reg, false)?);
-                } else if self.is_memory(b) && !self.is_memory(a) {
-                    let reg = self.parse_register(a)?;
-                    code.extend(self.encode_mov_mem_reg(b, reg, true)?);
-                } else if !a.starts_with('$')
-                    && !b.starts_with('$')
-                    && !self.is_memory(a)
-                    && !self.is_memory(b)
-                {
+                if parse_xmm(a).is_none() && parse_xmm(b).is_none() {
+                    code = self.encode_integer_move(64, &inst.operands)?;
+                } else {
                     let a_xmm = parse_xmm(a.trim().trim_start_matches('%'));
                     let b_xmm = parse_xmm(b.trim().trim_start_matches('%'));
                     if let (Ok(gpr), Some(xmm)) = (self.parse_register(a), b_xmm) {
@@ -191,10 +252,6 @@ impl InstructionEncoder for X86_64Encoder {
                         code.push(0x89);
                         code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
                     }
-                } else {
-                    return Err(RasError::EncodingError(
-                        "mov: one operand must be a register".to_string(),
-                    ));
                 }
             }
             "ret" => code.push(0xC3),
@@ -709,59 +766,13 @@ impl InstructionEncoder for X86_64Encoder {
                 code.push(0x31);
                 code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
             }
-            // movb: byte store to memory or byte reg move
-            "movb" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("movb requires 2 operands".into()));
-                }
-                let src_str = &inst.operands[0];
-                let dst_str = &inst.operands[1];
-                if self.is_memory(dst_str) {
-                    // movb %reg8, (mem)  — 88 /r
-                    let (disp, base) = self.parse_memory(dst_str)?;
-                    let src = self.parse_register(src_str)?;
-                    // REX prefix if needed for high-numbered regs
-                    if src >= 4 || base >= 8 {
-                        code.push(0x40 | ((src >> 3) << 2) | (base >> 3));
-                    }
-                    code.push(0x88);
-                    if base == 4 {
-                        code.push(((src & 7) << 3) | 4);
-                        code.push(0x24); // SIB: index=none, base=rsp
-                    } else if disp == 0 && base != 5 {
-                        code.push(((src & 7) << 3) | (base & 7));
-                    } else if (-128..=127).contains(&disp) {
-                        code.push(0x40 | ((src & 7) << 3) | (base & 7));
-                        code.push(disp as u8);
-                    } else {
-                        code.push(0x80 | ((src & 7) << 3) | (base & 7));
-                        code.extend_from_slice(&disp.to_le_bytes());
-                    }
-                } else if src_str.starts_with('$') {
-                    // movb $imm8, (mem)
-                    let imm: i8 = src_str.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for movb".into())
-                    })?;
-                    let (disp, base) = self.parse_memory(dst_str)?;
-                    if base >= 8 {
-                        code.push(0x41);
-                    }
-                    code.push(0xC6);
-                    if disp == 0 && base != 5 {
-                        code.push(base & 7);
-                    } else if (-128..=127).contains(&disp) {
-                        code.push(0x40 | (base & 7));
-                        code.push(disp as u8);
-                    } else {
-                        code.push(0x80 | (base & 7));
-                        code.extend_from_slice(&disp.to_le_bytes());
-                    }
-                    code.push(imm as u8);
-                } else {
-                    return Err(RasError::EncodingError(
-                        "movb: unsupported operand form".into(),
-                    ));
-                }
+            "movb" | "movw" | "movl" => {
+                let width = match opcode.as_str() {
+                    "movb" => 8,
+                    "movw" => 16,
+                    _ => 32,
+                };
+                code = self.encode_integer_move(width, &inst.operands)?;
             }
             // syscall: 0F 05
             "syscall" => {
@@ -797,13 +808,16 @@ impl InstructionEncoder for X86_64Encoder {
                 code.extend_from_slice(&[0x0F, 0x96, 0xC0 | (reg & 7)]);
             }
             // cmovzq / cmovz (conditional move if ZF=1)
-            "cmovzq" | "cmovz" | "cmoveq" | "cmove" => {
+            "cmovzq" | "cmovz" | "cmoveq" | "cmove" | "cmovel" | "cmovzl" => {
                 if inst.operands.len() != 2 {
                     return Err(RasError::EncodingError("cmovzq requires 2 operands".into()));
                 }
                 let src = self.parse_register(&inst.operands[0])?;
                 let dst = self.parse_register(&inst.operands[1])?;
-                code.push(self.encode_rex(true, dst >> 3, 0, src >> 3));
+                let rex = self.encode_rex(!opcode.ends_with('l'), dst >> 3, 0, src >> 3);
+                if rex != 0x40 {
+                    code.push(rex);
+                }
                 code.extend_from_slice(&[0x0F, 0x44]);
                 code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
             }
@@ -858,6 +872,22 @@ impl InstructionEncoder for X86_64Encoder {
                     ));
                 }
             }
+            "mulss" | "mulsd" => {
+                if inst.operands.len() != 2 {
+                    return Err(RasError::EncodingError(
+                        "Scalar multiply requires two operands".into(),
+                    ));
+                }
+                let src = parse_xmm(&inst.operands[0])
+                    .ok_or_else(|| RasError::EncodingError("Expected XMM source".into()))?;
+                let dst = parse_xmm(&inst.operands[1])
+                    .ok_or_else(|| RasError::EncodingError("Expected XMM destination".into()))?;
+                code.push(if opcode == "mulss" { 0xf3 } else { 0xf2 });
+                if src >= 8 || dst >= 8 {
+                    code.push(self.encode_rex(false, dst >> 3, 0, src >> 3));
+                }
+                code.extend_from_slice(&[0x0f, 0x59, 0xc0 | ((dst & 7) << 3) | (src & 7)]);
+            }
             // xorps: 0F 57 /r
             "xorps" => {
                 if inst.operands.len() != 2 {
@@ -889,22 +919,25 @@ impl InstructionEncoder for X86_64Encoder {
                 code.extend_from_slice(&[0x0F, 0x57]);
                 code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
             }
-            // movzbq: zero-extend byte to 64-bit
-            "movzbq" | "movzbl" | "movzx" => {
+            "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" => {
                 if inst.operands.len() != 2 {
                     return Err(RasError::EncodingError(
-                        "movzbq requires 2 operands".to_string(),
+                        "movzx requires two operands".into(),
                     ));
                 }
-                let src_str = &inst.operands[0];
-                let dst_str = &inst.operands[1];
-                let src = self.parse_register(src_str)?;
-                let dst = self.parse_register(dst_str)?;
-                // REX.W 0F B6 /r
-                code.push(self.encode_rex(true, dst >> 3, 0, src >> 3));
-                code.push(0x0F);
-                code.push(0xB6);
-                code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
+                let dst = self.parse_register(&inst.operands[1])?;
+                let (rm, base) = self.encode_rm(&inst.operands[0], dst)?;
+                let width = if opcode.ends_with('l') { 32 } else { 64 };
+                code = self.move_prefix(width, dst, base, &inst.operands)?;
+                code.extend_from_slice(&[
+                    0x0f,
+                    if opcode.starts_with("movzw") {
+                        0xb7
+                    } else {
+                        0xb6
+                    },
+                ]);
+                code.extend(rm);
             }
             _ => {
                 return Err(RasError::EncodingError(format!(
