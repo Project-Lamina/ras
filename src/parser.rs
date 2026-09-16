@@ -12,6 +12,7 @@ pub struct Section {
     pub name: String,
     pub flags: SectionFlags,
     pub data: Vec<u8>,
+    pub alignment: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,12 @@ pub enum Line {
     Label(Symbol),
     Instruction(ParsedInstruction),
     Data(Vec<u8>),
+    Align {
+        value: usize,
+        directive: String,
+        fill: Option<u8>,
+        max_skip: Option<usize>,
+    },
 }
 
 pub struct ParsedAssembly {
@@ -157,6 +164,7 @@ impl AssemblyParser {
                                 .map_or(name == ".data" || name == ".bss", |f| f.contains('w')),
                         },
                         data: Vec::new(),
+                        alignment: 1,
                     });
                 }
             }
@@ -182,9 +190,56 @@ impl AssemblyParser {
                     self.lines.push(Line::Data(bytes));
                 }
             }
-            ".align" | ".balign" | ".p2align" | ".byte" | ".short" | ".int" | ".long" | ".quad"
-            | ".zero" | ".space" | ".skip" | ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa"
-            | ".size" | ".type" | ".ident" | ".file" => {}
+            ".byte" | ".short" | ".hword" | ".int" | ".long" | ".quad" | ".xword" => {
+                let width = match parts[0] {
+                    ".byte" => 1,
+                    ".short" | ".hword" => 2,
+                    ".quad" | ".xword" => 8,
+                    _ => 4,
+                };
+                let mut bytes = Vec::new();
+                for item in line[parts[0].len()..].split(',') {
+                    let value = parse_integer(item.trim())?;
+                    bytes.extend_from_slice(&value.to_le_bytes()[..width]);
+                }
+                self.lines.push(Line::Data(bytes));
+            }
+            ".zero" | ".space" | ".skip" => {
+                let items: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
+                let count = usize::try_from(parse_integer(items[0])?)
+                    .map_err(|_| RasError::ParseError("Invalid space count".into()))?;
+                let fill = items.get(1).map_or(Ok(0), |s| parse_integer(s))? as u8;
+                self.lines.push(Line::Data(vec![fill; count]));
+            }
+            ".align" | ".balign" | ".p2align" => {
+                let items: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
+                let value = usize::try_from(parse_integer(items[0])?)
+                    .map_err(|_| RasError::ParseError("Invalid alignment".into()))?;
+                let fill = items
+                    .get(1)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| parse_integer(s).map(|n| n as u8))
+                    .transpose()?;
+                let max_skip = items
+                    .get(2)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        parse_integer(s).and_then(|n| {
+                            usize::try_from(n).map_err(|_| {
+                                RasError::ParseError("Invalid maximum alignment padding".into())
+                            })
+                        })
+                    })
+                    .transpose()?;
+                self.lines.push(Line::Align {
+                    value,
+                    directive: parts[0].into(),
+                    fill,
+                    max_skip,
+                });
+            }
+            ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type" | ".ident"
+            | ".file" => {}
             _ => {}
         }
 
@@ -213,6 +268,18 @@ impl AssemblyParser {
         self.lines.push(Line::Instruction(inst));
         Ok(())
     }
+}
+
+fn parse_integer(text: &str) -> Result<i128, RasError> {
+    let (sign, digits) = text.strip_prefix('-').map_or((1, text), |s| (-1, s));
+    let result = if let Some(hex) = digits.strip_prefix("0x") {
+        i128::from_str_radix(hex, 16)
+    } else {
+        digits.parse()
+    };
+    result
+        .map(|n| sign * n)
+        .map_err(|_| RasError::ParseError(format!("Invalid integer: {text}")))
 }
 
 fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
@@ -332,7 +399,7 @@ mod tests {
 
     #[test]
     fn known_no_op_directives_are_silently_ignored() {
-        let asm = parse(".align 16\n.size foo, 4\n.type foo, @function");
+        let asm = parse(".size foo, 4\n.type foo, @function");
         assert!(asm.lines.is_empty());
     }
 

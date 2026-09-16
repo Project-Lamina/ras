@@ -307,7 +307,24 @@ impl ObjectWriter for ElfWriter {
                     write: false,
                 },
                 data: req.code.to_vec(),
+                alignment: 1,
             });
+        }
+        if req.target_arch == TargetArchitecture::X86_64 {
+            for name in [".data", ".bss"] {
+                if !sections.iter().any(|s| s.name == name) {
+                    sections.push(Section {
+                        name: name.into(),
+                        flags: crate::parser::SectionFlags {
+                            alloc: true,
+                            exec: false,
+                            write: true,
+                        },
+                        data: Vec::new(),
+                        alignment: 1,
+                    });
+                }
+            }
         }
         let mut names: Vec<String> = sections.iter().map(|s| s.name.clone()).collect();
         let mut data: Vec<Vec<u8>> = sections.iter().map(|s| s.data.clone()).collect();
@@ -318,7 +335,7 @@ impl ObjectWriter for ElfWriter {
                 flags: u64::from(s.flags.write)
                     | (u64::from(s.flags.alloc) << 1)
                     | (u64::from(s.flags.exec) << 2),
-                addralign: 1,
+                addralign: s.alignment as u64,
                 ..Default::default()
             })
             .collect();
@@ -736,6 +753,7 @@ mod tests {
         let sections = vec![Section {
             name: ".text".to_string(),
             data: code.to_vec(),
+            alignment: 1,
             flags: SectionFlags {
                 alloc: true,
                 exec: true,
@@ -768,6 +786,7 @@ mod tests {
         let sections = vec![Section {
             name: ".text".to_string(),
             data: code.to_vec(),
+            alignment: 1,
             flags: SectionFlags {
                 alloc: true,
                 exec: true,
