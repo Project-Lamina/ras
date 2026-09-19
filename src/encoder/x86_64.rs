@@ -418,6 +418,33 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_sse_shift(&self, digit: u8, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError("shift requires 2 operands".into()));
+        }
+        let imm = operands[0]
+            .trim()
+            .strip_prefix('$')
+            .map(parse_imm)
+            .ok_or_else(|| RasError::EncodingError("shift count must be an immediate".into()))??;
+        let imm = u8::try_from(imm)
+            .map_err(|_| RasError::EncodingError(format!("Shift count out of range: {}", imm)))?;
+        let (dst, _) = self.parse_rm(&operands[1], true)?;
+        if !matches!(dst, Rm::Reg(_)) {
+            return Err(RasError::EncodingError(
+                "shift: destination must be an xmm register".into(),
+            ));
+        }
+        encode_op(Op {
+            legacy: &[0x66],
+            opcode: &[0x0f, 0x73],
+            reg: digit,
+            rm: dst,
+            imm: &[imm],
+            ..Op::default()
+        })
+    }
+
     fn encode_movsxd(&self, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("movslq requires 2 operands".into()));
@@ -595,18 +622,35 @@ impl InstructionEncoder for X86_64Encoder {
                     self.encode_sse_move(&[0xf2], &[0x0f, 0x10], &[0x0f, 0x11], &inst.operands)?;
                 code = self.emit(enc);
             }
-            "addsd" | "addss" | "subsd" | "subss" | "mulsd" | "mulss" | "divsd" | "divss" => {
+            "movapd" => {
+                let enc =
+                    self.encode_sse_move(&[0x66], &[0x0f, 0x28], &[0x0f, 0x29], &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "movdqa" => {
+                let enc =
+                    self.encode_sse_move(&[0x66], &[0x0f, 0x6f], &[0x0f, 0x7f], &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "addsd" | "addss" | "subsd" | "subss" | "mulsd" | "mulss" | "divsd" | "divss"
+            | "paddd" => {
                 let legacy = match opcode.as_str() {
                     "addss" | "subss" | "mulss" | "divss" => 0xf3,
+                    "paddd" => 0x66,
                     _ => 0xf2,
                 };
                 let op = match opcode.as_str() {
                     "addsd" | "addss" => 0x58,
                     "mulsd" | "mulss" => 0x59,
                     "subsd" | "subss" => 0x5c,
-                    _ => 0x5e,
+                    "divsd" | "divss" => 0x5e,
+                    _ => 0xfe,
                 };
                 let enc = self.encode_sse_rm(&[legacy], &[0x0f, op], &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "psrldq" => {
+                let enc = self.encode_sse_shift(3, &inst.operands)?;
                 code = self.emit(enc);
             }
             "cltq" => code.extend_from_slice(&[0x48, 0x98]),
