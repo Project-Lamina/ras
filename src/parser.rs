@@ -254,11 +254,7 @@ impl AssemblyParser {
 
         let opcode = parts[0].to_string();
         let operands: Vec<String> = if parts.len() > 1 {
-            parts[1..]
-                .join(" ")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect()
+            split_operands(&parts[1..].join(" "))
         } else {
             Vec::new()
         };
@@ -306,6 +302,25 @@ fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
         out.push(0);
     }
     Some(out)
+}
+
+fn split_operands(text: &str) -> Vec<String> {
+    let mut operands = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                operands.push(text[start..index].trim().to_string());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    operands.push(text[start..].trim().to_string());
+    operands
 }
 
 #[cfg(test)]
