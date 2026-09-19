@@ -264,6 +264,102 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_alu(
+        &self,
+        stem: &str,
+        width: Option<u8>,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError(format!(
+                "{} requires 2 operands",
+                stem
+            )));
+        }
+        let (src, dst) = (operands[0].trim(), operands[1].trim());
+        let is_test = stem == "test";
+        let digit: u8 = match stem {
+            "or" => 1,
+            "and" => 4,
+            "sub" => 5,
+            "xor" => 6,
+            "cmp" => 7,
+            _ => 0,
+        };
+        let base = digit << 3;
+        if let Some(imm_text) = src.strip_prefix('$') {
+            let imm = parse_imm(imm_text)?;
+            let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
+            let width = operand_width(width, &[dst_gpr])?;
+            check_alu_width(width)?;
+            let imm = if width == 32 {
+                i64::from(imm as u32 as i32)
+            } else {
+                imm
+            };
+            let accumulator = matches!(dst_rm, Rm::Reg(0)) && dst_gpr.is_some_and(|gpr| !gpr.high);
+            let fits8 = (-128..=127).contains(&imm);
+            if accumulator && (is_test || width == 8 || !fits8) {
+                let opcode = match (is_test, width == 8) {
+                    (true, true) => 0xa8,
+                    (true, false) => 0xa9,
+                    (false, true) => base + 4,
+                    (false, false) => base + 5,
+                };
+                let mut bytes = Vec::new();
+                if width == 64 {
+                    bytes.push(0x48);
+                }
+                bytes.push(opcode);
+                bytes.extend(imm_bytes(imm, width)?);
+                return Ok(Encoded { bytes, rip: None });
+            }
+            let (opcode, imm_field) = if width == 8 {
+                (if is_test { 0xf6 } else { 0x80 }, imm_bytes(imm, 8)?)
+            } else if fits8 && !is_test {
+                (0x83, imm_bytes(imm, 8)?)
+            } else {
+                (if is_test { 0xf7 } else { 0x81 }, imm_bytes(imm, width)?)
+            };
+            let (byte_rex, high) = byte_flags(&[dst_gpr]);
+            return encode_op(Op {
+                wide: width == 64,
+                byte_rex,
+                high,
+                opcode: &[opcode],
+                reg: digit,
+                rm: dst_rm,
+                imm: &imm_field,
+                ..Op::default()
+            });
+        }
+        let (src_rm, src_gpr) = self.parse_rm(src, false)?;
+        let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
+        let width = operand_width(width, &[src_gpr, dst_gpr])?;
+        check_alu_width(width)?;
+        let (byte_rex, high) = byte_flags(&[src_gpr, dst_gpr]);
+        let size = u8::from(width != 8);
+        let (opcode, reg, rm) = match (src_rm, dst_rm) {
+            (Rm::Reg(reg), rm) => (if is_test { 0x84 + size } else { base + size }, reg, rm),
+            (Rm::Mem(mem), Rm::Reg(reg)) if is_test => (0x84 + size, reg, Rm::Mem(mem)),
+            (Rm::Mem(mem), Rm::Reg(reg)) => (base + 2 + size, reg, Rm::Mem(mem)),
+            (Rm::Mem(_), Rm::Mem(_)) => {
+                return Err(RasError::EncodingError(
+                    "memory to memory is not encodable".into(),
+                ));
+            }
+        };
+        encode_op(Op {
+            wide: width == 64,
+            byte_rex,
+            high,
+            opcode: &[opcode],
+            reg,
+            rm,
+            ..Op::default()
+        })
+    }
+
     fn encode_lea(&self, width: Option<u8>, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("lea requires 2 operands".into()));
@@ -355,6 +451,12 @@ impl InstructionEncoder for X86_64Encoder {
     fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         self.rip_fixup = None;
         let opcode = inst.opcode.to_lowercase();
+        if let Some((stem, width)) = alu_mnemonic(&opcode) {
+            let encoded = self.encode_alu(stem, width, &inst.operands)?;
+            let bytes = self.emit(encoded);
+            self.position += bytes.len();
+            return Ok(bytes);
+        }
         let mut code = Vec::new();
 
         match opcode.as_str() {
@@ -399,52 +501,6 @@ impl InstructionEncoder for X86_64Encoder {
                 }
             }
             "ret" => code.push(0xC3),
-            "addq" | "add" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "add requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-
-                let (dst_reg, imm_opt) =
-                    if a.starts_with('$') {
-                        let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
-                            RasError::EncodingError("Invalid immediate".to_string())
-                        })?;
-                        (self.parse_register(b)?, Some(imm))
-                    } else if b.starts_with('$') {
-                        let imm: i32 = b.trim_start_matches('$').parse().map_err(|_| {
-                            RasError::EncodingError("Invalid immediate".to_string())
-                        })?;
-                        (self.parse_register(a)?, Some(imm))
-                    } else {
-                        // AT&T order: `add src, dst`. 0x01 is ADD r/m64, r64
-                        // (reg = source added into r/m = destination).
-                        let src_reg = self.parse_register(a)?;
-                        let dst_reg = self.parse_register(b)?;
-                        code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
-                        code.push(0x01);
-                        code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
-                        self.position += code.len();
-                        return Ok(code);
-                    };
-
-                if let Some(imm) = imm_opt {
-                    if (-128..=127).contains(&imm) {
-                        code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
-                        code.push(0x83);
-                        code.push(0xC0 | (dst_reg & 7));
-                        code.push(imm as u8);
-                    } else {
-                        code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
-                        code.push(0x81);
-                        code.push(0xC0 | (dst_reg & 7));
-                        code.extend_from_slice(&imm.to_le_bytes());
-                    }
-                }
-            }
             "pushq" | "push" => {
                 if inst.operands.len() != 1 {
                     return Err(RasError::EncodingError(
@@ -498,50 +554,6 @@ impl InstructionEncoder for X86_64Encoder {
                 code.extend_from_slice(&[0x0F, 0xAF]);
                 code.push(0xC0 | ((dst_reg & 7) << 3) | (src_reg & 7));
             }
-            "subq" | "sub" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "sub requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                let (dst_reg, imm_opt) =
-                    if a.starts_with('$') {
-                        let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
-                            RasError::EncodingError("Invalid immediate".to_string())
-                        })?;
-                        (self.parse_register(b)?, Some(imm))
-                    } else if b.starts_with('$') {
-                        let imm: i32 = b.trim_start_matches('$').parse().map_err(|_| {
-                            RasError::EncodingError("Invalid immediate".to_string())
-                        })?;
-                        (self.parse_register(a)?, Some(imm))
-                    } else {
-                        // AT&T order: `sub src, dst`. 0x29 is SUB r/m64, r64
-                        // (r/m = destination, reg = subtracted source).
-                        let src_reg = self.parse_register(a)?;
-                        let dst_reg = self.parse_register(b)?;
-                        code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
-                        code.push(0x29);
-                        code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
-                        self.position += code.len();
-                        return Ok(code);
-                    };
-                if let Some(imm) = imm_opt {
-                    if (-128..=127).contains(&imm) {
-                        code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
-                        code.push(0x83);
-                        code.push(0xE8 | (dst_reg & 7));
-                        code.push(imm as u8);
-                    } else {
-                        code.push(self.encode_rex(true, 0, 0, dst_reg >> 3));
-                        code.push(0x81);
-                        code.push(0xE8 | (dst_reg & 7));
-                        code.extend_from_slice(&imm.to_le_bytes());
-                    }
-                }
-            }
             // REX.W 0x99: sign-extend rax into rdx:rax (needed before idivq)
             "cqto" | "cqo" => {
                 code.push(0x48); // REX.W
@@ -574,91 +586,6 @@ impl InstructionEncoder for X86_64Encoder {
                 code.push(self.encode_rex(true, 0, 0, reg >> 3));
                 code.push(0xF7);
                 code.push(0xF0 | (reg & 7)); // ModRM: /6 = 110, mod=11
-            }
-            // xorq reg, reg
-            "xorq" | "xor" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "xorq requires 2 operands".to_string(),
-                    ));
-                }
-                // AT&T order: `xor src, dst`. 0x31 is XOR r/m64, r64
-                // (r/m = destination, reg = source).
-                let src = self.parse_register(&inst.operands[0])?;
-                let dst = self.parse_register(&inst.operands[1])?;
-                code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
-                code.push(0x31);
-                code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
-            }
-            // andq reg/imm, reg
-            "andq" | "and" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "andq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                if a.starts_with('$') {
-                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for andq".to_string())
-                    })?;
-                    let dst = self.parse_register(b)?;
-                    if (-128..=127).contains(&imm) {
-                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                        code.push(0x83);
-                        code.push(0xE0 | (dst & 7)); // /4
-                        code.push(imm as u8);
-                    } else {
-                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                        code.push(0x81);
-                        code.push(0xE0 | (dst & 7));
-                        code.extend_from_slice(&imm.to_le_bytes());
-                    }
-                } else {
-                    // AT&T order: `and src, dst`. 0x21 is AND r/m64, r64
-                    // (r/m = destination, reg = source).
-                    let src = self.parse_register(a)?;
-                    let dst = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
-                    code.push(0x21);
-                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
-                }
-            }
-            // orq reg/imm, reg
-            "orq" | "or" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "orq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                if a.starts_with('$') {
-                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for orq".to_string())
-                    })?;
-                    let dst = self.parse_register(b)?;
-                    if (-128..=127).contains(&imm) {
-                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                        code.push(0x83);
-                        code.push(0xC8 | (dst & 7)); // /1
-                        code.push(imm as u8);
-                    } else {
-                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                        code.push(0x81);
-                        code.push(0xC8 | (dst & 7));
-                        code.extend_from_slice(&imm.to_le_bytes());
-                    }
-                } else {
-                    // AT&T order: `or src, dst`. 0x09 is OR r/m64, r64
-                    // (r/m = destination, reg = source).
-                    let src = self.parse_register(a)?;
-                    let dst = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
-                    code.push(0x09);
-                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
-                }
             }
             // sarq / salq / shrq / shlq (shift instructions)
             "sarq" | "sar" => {
@@ -737,64 +664,6 @@ impl InstructionEncoder for X86_64Encoder {
                     return Err(RasError::EncodingError(
                         "shrq: unsupported shift source".to_string(),
                     ));
-                }
-            }
-            // cmpq: compare two values (sets flags)
-            "cmpq" | "cmp" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "cmpq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                let dst = self.parse_register(b)?;
-                if a.starts_with('$') {
-                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for cmpq".to_string())
-                    })?;
-                    if (-128..=127).contains(&imm) {
-                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                        code.push(0x83);
-                        code.push(0xF8 | (dst & 7)); // /7
-                        code.push(imm as u8);
-                    } else {
-                        code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                        code.push(0x81);
-                        code.push(0xF8 | (dst & 7));
-                        code.extend_from_slice(&imm.to_le_bytes());
-                    }
-                } else {
-                    let src = self.parse_register(a)?;
-                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
-                    code.push(0x39);
-                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
-                }
-            }
-            // testq: bitwise AND without storing result (sets flags)
-            "testq" | "test" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "testq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                if a.starts_with('$') {
-                    let imm: i32 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for testq".to_string())
-                    })?;
-                    let dst = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xF7);
-                    code.push(0xC0 | (dst & 7)); // /0
-                    code.extend_from_slice(&imm.to_le_bytes());
-                } else {
-                    let dst = self.parse_register(a)?;
-                    let src = self.parse_register(b)?;
-                    code.push(self.encode_rex(true, src >> 3, 0, dst >> 3));
-                    code.push(0x85);
-                    code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
                 }
             }
             // SETcc instructions (byte result from flags)
@@ -881,20 +750,6 @@ impl InstructionEncoder for X86_64Encoder {
                 code.push(0x0F);
                 code.push(0x9D);
                 code.push(0xC0 | (reg & 7));
-            }
-            // xorl: 32-bit XOR (no REX.W; zeroing a reg also zero-extends to 64-bit)
-            "xorl" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("xorl requires 2 operands".into()));
-                }
-                let src = self.parse_register(&inst.operands[0])?;
-                let dst = self.parse_register(&inst.operands[1])?;
-                // Only REX prefix if accessing r8-r15
-                if src >= 8 || dst >= 8 {
-                    code.push(0x40 | ((src >> 3) << 2) | (dst >> 3));
-                }
-                code.push(0x31);
-                code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
             }
             "movb" | "movw" | "movl" => {
                 let width = match opcode.as_str() {
@@ -1300,6 +1155,17 @@ fn operand_width(width: Option<u8>, gprs: &[Option<Gpr>]) -> Result<u8, RasError
     found.ok_or_else(|| RasError::EncodingError("Cannot infer operand width".into()))
 }
 
+fn check_alu_width(width: u8) -> Result<(), RasError> {
+    if matches!(width, 8 | 32 | 64) {
+        Ok(())
+    } else {
+        Err(RasError::EncodingError(format!(
+            "Unsupported operand width: {}",
+            width
+        )))
+    }
+}
+
 fn byte_flags(gprs: &[Option<Gpr>]) -> (bool, bool) {
     gprs.iter()
         .flatten()
@@ -1310,6 +1176,23 @@ fn byte_flags(gprs: &[Option<Gpr>]) -> (bool, bool) {
             } else {
                 (rex || (4..8).contains(&gpr.num), high)
             }
+        })
+}
+
+const ALU_STEMS: [&str; 7] = ["add", "or", "and", "sub", "xor", "cmp", "test"];
+
+fn alu_mnemonic(name: &str) -> Option<(&'static str, Option<u8>)> {
+    if let Some(stem) = ALU_STEMS.iter().find(|candidate| **candidate == name) {
+        return Some((*stem, None));
+    }
+    [('q', 64), ('l', 32), ('b', 8)]
+        .into_iter()
+        .find_map(|(suffix, width)| {
+            let stem = name.strip_suffix(suffix)?;
+            ALU_STEMS
+                .iter()
+                .find(|candidate| **candidate == stem)
+                .map(|candidate| (*candidate, Some(width)))
         })
 }
 
