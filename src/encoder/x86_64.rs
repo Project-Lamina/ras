@@ -360,6 +360,36 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_movsxd(&self, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError("movslq requires 2 operands".into()));
+        }
+        let (src, src_gpr) = self.parse_rm(&operands[0], false)?;
+        if src_gpr.is_some_and(|gpr| gpr.width != 32) {
+            return Err(RasError::EncodingError(
+                "movslq: source must be 32-bit".into(),
+            ));
+        }
+        let (dst, dst_gpr) = self.parse_rm(&operands[1], false)?;
+        let Rm::Reg(reg) = dst else {
+            return Err(RasError::EncodingError(
+                "movslq: destination must be a register".into(),
+            ));
+        };
+        if dst_gpr.is_none_or(|gpr| gpr.width != 64) {
+            return Err(RasError::EncodingError(
+                "movslq: destination must be 64-bit".into(),
+            ));
+        }
+        encode_op(Op {
+            wide: true,
+            opcode: &[0x63],
+            reg,
+            rm: src,
+            ..Op::default()
+        })
+    }
+
     fn encode_lea(&self, width: Option<u8>, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("lea requires 2 operands".into()));
@@ -501,6 +531,12 @@ impl InstructionEncoder for X86_64Encoder {
                 }
             }
             "ret" => code.push(0xC3),
+            "leave" => code.push(0xC9),
+            "cltq" => code.extend_from_slice(&[0x48, 0x98]),
+            "movslq" => {
+                let enc = self.encode_movsxd(&inst.operands)?;
+                code = self.emit(enc);
+            }
             "pushq" | "push" => {
                 if inst.operands.len() != 1 {
                     return Err(RasError::EncodingError(
