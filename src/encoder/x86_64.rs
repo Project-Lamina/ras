@@ -445,6 +445,35 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_cvttsd2si(&self, wide: bool, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError(
+                "cvttsd2si requires 2 operands".into(),
+            ));
+        }
+        let (src, _) = self.parse_rm(&operands[0], true)?;
+        let (dst, dst_gpr) = self.parse_rm(&operands[1], false)?;
+        let Rm::Reg(reg) = dst else {
+            return Err(RasError::EncodingError(
+                "cvttsd2si: destination must be a register".into(),
+            ));
+        };
+        let expected = if wide { 64 } else { 32 };
+        if dst_gpr.is_none_or(|gpr| gpr.width != expected) {
+            return Err(RasError::EncodingError(
+                "cvttsd2si: destination width does not match suffix".into(),
+            ));
+        }
+        encode_op(Op {
+            legacy: &[0xf2],
+            wide,
+            opcode: &[0x0f, 0x2c],
+            reg,
+            rm: src,
+            ..Op::default()
+        })
+    }
+
     fn encode_movsxd(&self, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("movslq requires 2 operands".into()));
@@ -617,6 +646,10 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "ret" => code.push(0xC3),
             "leave" => code.push(0xC9),
+            "cvttsd2sil" | "cvttsd2siq" => {
+                let enc = self.encode_cvttsd2si(opcode == "cvttsd2siq", &inst.operands)?;
+                code = self.emit(enc);
+            }
             "movsd" => {
                 let enc =
                     self.encode_sse_move(&[0xf2], &[0x0f, 0x10], &[0x0f, 0x11], &inst.operands)?;
