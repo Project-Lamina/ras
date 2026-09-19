@@ -360,6 +360,64 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_sse_rm(
+        &self,
+        legacy: &[u8],
+        opcode: &[u8],
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError("SSE op requires 2 operands".into()));
+        }
+        let (src, _) = self.parse_rm(&operands[0], true)?;
+        let (dst, _) = self.parse_rm(&operands[1], true)?;
+        let Rm::Reg(reg) = dst else {
+            return Err(RasError::EncodingError(
+                "SSE op: destination must be an xmm register".into(),
+            ));
+        };
+        encode_op(Op {
+            legacy,
+            opcode,
+            reg,
+            rm: src,
+            ..Op::default()
+        })
+    }
+
+    fn encode_sse_move(
+        &self,
+        legacy: &[u8],
+        load: &[u8],
+        store: &[u8],
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError(
+                "SSE move requires 2 operands".into(),
+            ));
+        }
+        let (src, _) = self.parse_rm(&operands[0], true)?;
+        let (dst, _) = self.parse_rm(&operands[1], true)?;
+        let (opcode, reg, rm) = match (src, dst) {
+            (Rm::Mem(mem), Rm::Reg(dst_reg)) => (load, dst_reg, Rm::Mem(mem)),
+            (Rm::Reg(src_reg), Rm::Reg(dst_reg)) => (load, dst_reg, Rm::Reg(src_reg)),
+            (Rm::Reg(src_reg), Rm::Mem(mem)) => (store, src_reg, Rm::Mem(mem)),
+            (Rm::Mem(_), Rm::Mem(_)) => {
+                return Err(RasError::EncodingError(
+                    "SSE move: memory to memory is not encodable".into(),
+                ));
+            }
+        };
+        encode_op(Op {
+            legacy,
+            opcode,
+            reg,
+            rm,
+            ..Op::default()
+        })
+    }
+
     fn encode_movsxd(&self, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("movslq requires 2 operands".into()));
@@ -532,6 +590,25 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "ret" => code.push(0xC3),
             "leave" => code.push(0xC9),
+            "movsd" => {
+                let enc =
+                    self.encode_sse_move(&[0xf2], &[0x0f, 0x10], &[0x0f, 0x11], &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "addsd" | "addss" | "subsd" | "subss" | "mulsd" | "mulss" | "divsd" | "divss" => {
+                let legacy = match opcode.as_str() {
+                    "addss" | "subss" | "mulss" | "divss" => 0xf3,
+                    _ => 0xf2,
+                };
+                let op = match opcode.as_str() {
+                    "addsd" | "addss" => 0x58,
+                    "mulsd" | "mulss" => 0x59,
+                    "subsd" | "subss" => 0x5c,
+                    _ => 0x5e,
+                };
+                let enc = self.encode_sse_rm(&[legacy], &[0x0f, op], &inst.operands)?;
+                code = self.emit(enc);
+            }
             "cltq" => code.extend_from_slice(&[0x48, 0x98]),
             "movslq" => {
                 let enc = self.encode_movsxd(&inst.operands)?;
@@ -893,22 +970,6 @@ impl InstructionEncoder for X86_64Encoder {
                     ));
                 }
             }
-            "mulss" | "mulsd" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "Scalar multiply requires two operands".into(),
-                    ));
-                }
-                let src = parse_xmm(&inst.operands[0])
-                    .ok_or_else(|| RasError::EncodingError("Expected XMM source".into()))?;
-                let dst = parse_xmm(&inst.operands[1])
-                    .ok_or_else(|| RasError::EncodingError("Expected XMM destination".into()))?;
-                code.push(if opcode == "mulss" { 0xf3 } else { 0xf2 });
-                if src >= 8 || dst >= 8 {
-                    code.push(self.encode_rex(false, dst >> 3, 0, src >> 3));
-                }
-                code.extend_from_slice(&[0x0f, 0x59, 0xc0 | ((dst & 7) << 3) | (src & 7)]);
-            }
             // xorps: 0F 57 /r
             "xorps" => {
                 if inst.operands.len() != 2 {
@@ -1107,10 +1168,11 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
             "High byte registers cannot use REX".into(),
         ));
     }
-    let mut bytes = op.legacy.to_vec();
+    let mut bytes = Vec::new();
     if seg {
         bytes.push(0x64);
     }
+    bytes.extend_from_slice(op.legacy);
     if needs_rex {
         bytes.push(rex);
     }
