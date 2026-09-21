@@ -77,6 +77,7 @@ enum PatchPoint {
     X86Rel32 {
         offset: usize,
         target: String,
+        relocate: bool,
     },
     X86RipRel32 {
         offset: usize,
@@ -471,6 +472,7 @@ impl RasAssembler {
                         patch_points.push(PatchPoint::X86Rel32 {
                             offset: current_offset + 2,
                             target: target.to_string(),
+                            relocate: false,
                         });
                         current_offset += 6;
                         continue;
@@ -496,6 +498,7 @@ impl RasAssembler {
                             patch_points.push(PatchPoint::X86Rel32 {
                                 offset: current_offset + 1,
                                 target: target.to_string(),
+                                relocate: is_call && lines.iter().any(|line| matches!(line, Line::Label(s) if s.global && s.name == target)),
                             });
                             current_offset += 5;
                         } else {
@@ -656,7 +659,10 @@ impl RasAssembler {
                 continue;
             }
             let target = reloc_symbol(target);
-            if let Some(&target_offset) = symbol_offsets.get(target) {
+            if let Some(&target_offset) = symbol_offsets
+                .get(target)
+                .filter(|_| !matches!(patch, PatchPoint::X86Rel32 { relocate: true, .. }))
+            {
                 match patch {
                     PatchPoint::Data { .. } | PatchPoint::AArch64 { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
