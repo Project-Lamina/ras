@@ -61,6 +61,7 @@ pub struct AssemblyParser {
     instructions: Vec<ParsedInstruction>,
     lines: Vec<Line>,
     pending_globals: HashSet<String>,
+    symbol_names: HashSet<String>,
 }
 
 impl Default for AssemblyParser {
@@ -78,6 +79,7 @@ impl AssemblyParser {
             instructions: Vec::new(),
             lines: Vec::new(),
             pending_globals: HashSet::new(),
+            symbol_names: HashSet::new(),
         }
     }
 
@@ -94,7 +96,7 @@ impl AssemblyParser {
                 let before = &line[..colon_pos];
                 if !before.is_empty() && !before.contains(char::is_whitespace) {
                     let label = before.trim();
-                    if !is_numeric_label(label) && self.symbols.iter().any(|s| s.name == label) {
+                    if !is_numeric_label(label) && !self.symbol_names.insert(label.to_string()) {
                         return Err(RasError::ParseError(format!(
                             "Symbol already defined: {label}"
                         )));
@@ -143,7 +145,7 @@ impl AssemblyParser {
                 && is_numeric_label(&symbol.name)
             {
                 let mut name = format!(".Lras_numeric_{index}");
-                while self.symbols.iter().any(|s| s.name == name) {
+                while self.symbol_names.contains(&name) {
                     name.push('_');
                 }
                 definitions.push((index, symbol.name.clone(), name));
