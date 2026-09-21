@@ -331,7 +331,13 @@ impl ObjectWriter for ElfWriter {
         let mut headers: Vec<Elf64SectionHeader> = sections
             .iter()
             .map(|s| Elf64SectionHeader {
-                section_type: if s.name == ".bss" { 8 } else { SHT_PROGBITS },
+                section_type: if s.name == ".bss" {
+                    8
+                } else if s.name.starts_with(".note.") && s.name != ".note.GNU-stack" {
+                    7
+                } else {
+                    SHT_PROGBITS
+                },
                 flags: u64::from(s.flags.write)
                     | (u64::from(s.flags.alloc) << 1)
                     | (u64::from(s.flags.exec) << 2),

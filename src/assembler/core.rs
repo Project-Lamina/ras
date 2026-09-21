@@ -14,7 +14,7 @@ use crate::{
         ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
         object_writer_for_os,
     },
-    parser::{AssemblyParser, Line},
+    parser::{AssemblyParser, DataExpression, Line, parse_data_expression},
     target::unsupported_target_hint,
 };
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
@@ -60,6 +60,12 @@ pub struct RasAssembler {
 }
 
 enum PatchPoint {
+    Data {
+        offset: usize,
+        width: usize,
+        expression: String,
+        arch: TargetArchitecture,
+    },
     AArch64 {
         offset: usize,
         target: String,
@@ -297,6 +303,7 @@ impl RasAssembler {
                 let mode = match line {
                     Line::Instruction(_) => "$x",
                     Line::Data(bytes) if !bytes.is_empty() => "$d",
+                    Line::DataExpression { .. } => "$d",
                     _ => mapping_mode,
                 };
                 if mode != mapping_mode {
@@ -348,6 +355,16 @@ impl RasAssembler {
                 Line::Data(bytes) => {
                     code.extend_from_slice(bytes);
                     current_offset += bytes.len();
+                }
+                Line::DataExpression { width, expression } => {
+                    patch_points.push(PatchPoint::Data {
+                        offset: current_offset,
+                        width: *width,
+                        expression: expression.clone(),
+                        arch: self.target_arch,
+                    });
+                    code.resize(code.len() + width, 0);
+                    current_offset += width;
                 }
                 Line::Instruction(inst) => {
                     let opcode = inst.opcode.to_lowercase();
@@ -543,7 +560,62 @@ impl RasAssembler {
         let mut external_relocs: Vec<ExternalReloc> = Vec::new();
 
         for patch in &patch_points {
+            if let PatchPoint::Data {
+                offset,
+                width,
+                expression,
+                arch,
+            } = patch
+            {
+                match parse_data_expression(expression)? {
+                    DataExpression::Constant(value) => {
+                        code[*offset..*offset + width]
+                            .copy_from_slice(&value.to_le_bytes()[..*width]);
+                    }
+                    DataExpression::Difference(left, right) => {
+                        let lookup = |name: &str| {
+                            symbol_offsets.get(name).copied().ok_or_else(|| {
+                                RasError::EncodingError(format!(
+                                    "Undefined or cross-section label in difference: {name}"
+                                ))
+                            })
+                        };
+                        let value = lookup(&left)? as i128 - lookup(&right)? as i128;
+                        code[*offset..*offset + width]
+                            .copy_from_slice(&value.to_le_bytes()[..*width]);
+                    }
+                    DataExpression::Symbol(symbol, addend) => {
+                        let kind = match (arch, width) {
+                            (TargetArchitecture::X86_64, 1) => 14,
+                            (TargetArchitecture::X86_64, 2) => 12,
+                            (TargetArchitecture::X86_64, 4) => 10,
+                            (TargetArchitecture::X86_64, 8) => 1,
+                            (TargetArchitecture::Aarch64, 2) => 259,
+                            (TargetArchitecture::Aarch64, 4) => 258,
+                            (TargetArchitecture::Aarch64, 8) => 257,
+                            _ => {
+                                return Err(RasError::EncodingError(
+                                    "Unsupported data relocation width or architecture".into(),
+                                ));
+                            }
+                        };
+                        external_relocs.push(ExternalReloc {
+                            offset: *offset,
+                            symbol,
+                            section: String::new(),
+                            kind,
+                            addend: i64::try_from(addend).map_err(|_| {
+                                RasError::EncodingError(
+                                    "Data relocation addend out of range".into(),
+                                )
+                            })?,
+                        });
+                    }
+                }
+                continue;
+            }
             let target = match patch {
+                PatchPoint::Data { .. } => unreachable!(),
                 PatchPoint::AArch64 { target, .. }
                 | PatchPoint::X86Rel32 { target, .. }
                 | PatchPoint::X86RipRel32 { target, .. }
@@ -586,7 +658,7 @@ impl RasAssembler {
             let target = reloc_symbol(target);
             if let Some(&target_offset) = symbol_offsets.get(target) {
                 match patch {
-                    PatchPoint::AArch64 { .. } => unreachable!(),
+                    PatchPoint::Data { .. } | PatchPoint::AArch64 { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
