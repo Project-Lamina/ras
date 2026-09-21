@@ -559,6 +559,7 @@ impl RasAssembler {
                 relocate,
             } = patch
             {
+                let target = reloc_symbol(target);
                 if !relocate && let Some(&target_offset) = symbol_offsets.get(target) {
                     let delta = target_offset as i64 - *offset as i64;
                     if delta % 4 != 0
@@ -574,7 +575,7 @@ impl RasAssembler {
                 } else {
                     external_relocs.push(ExternalReloc {
                         offset: *offset,
-                        symbol: target.clone(),
+                        symbol: target.to_string(),
                         section: String::new(),
                         kind: *kind,
                         addend: 0,
@@ -582,6 +583,7 @@ impl RasAssembler {
                 }
                 continue;
             }
+            let target = reloc_symbol(target);
             if let Some(&target_offset) = symbol_offsets.get(target) {
                 match patch {
                     PatchPoint::AArch64 { .. } => unreachable!(),
@@ -618,23 +620,21 @@ impl RasAssembler {
             } else {
                 // Unresolved symbol → external relocation for the linker.
                 match patch {
-                    PatchPoint::X86Rel32 { offset, target } => {
+                    PatchPoint::X86Rel32 { offset, .. } => {
                         external_relocs.push(ExternalReloc {
                             offset: *offset,
-                            symbol: target.clone(),
+                            symbol: target.to_string(),
                             section: String::new(),
                             kind: 4,
                             addend: -4,
                         });
                     }
                     PatchPoint::X86RipRel32 {
-                        offset,
-                        target,
-                        trailing,
+                        offset, trailing, ..
                     } => {
                         external_relocs.push(ExternalReloc {
                             offset: *offset,
-                            symbol: target.clone(),
+                            symbol: target.to_string(),
                             section: String::new(),
                             kind: 2,
                             addend: -(4 + *trailing as i64),
@@ -830,6 +830,12 @@ impl RasAssembler {
             ))),
         }
     }
+}
+
+/// `call puts@PLT` names the symbol `puts`; the suffix selects the relocation,
+/// it is not part of the name.
+fn reloc_symbol(target: &str) -> &str {
+    target.split_once('@').map_or(target, |(name, _)| name)
 }
 
 fn arx64_label_patch(
