@@ -338,15 +338,10 @@ impl RasAssembler {
                         for _ in 0..padding / 4 {
                             code.extend_from_slice(&0xd503_201fu32.to_le_bytes());
                         }
+                    } else if executable && self.target_arch == TargetArchitecture::X86_64 {
+                        x86_nop_padding(&mut code, padding);
                     } else {
-                        code.resize(
-                            code.len() + padding,
-                            if executable && self.target_arch == TargetArchitecture::X86_64 {
-                                0x90
-                            } else {
-                                0
-                            },
-                        );
+                        code.resize(code.len() + padding, 0);
                     }
                     current_offset += padding;
                 }
@@ -1020,6 +1015,28 @@ fn arx64_b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8) -> u32 {
 
 /// Maps x86 conditional-jump mnemonic to the second opcode byte of the `0F 8x rel32` encoding.
 /// Returns `None` for non-conditional-jump mnemonics.
+fn x86_nop_padding(code: &mut Vec<u8>, mut padding: usize) {
+    const NOPS: [&[u8]; 12] = [
+        &[],
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0],
+        &[0x0f, 0x1f, 0x40, 0],
+        &[0x0f, 0x1f, 0x44, 0, 0],
+        &[0x66, 0x0f, 0x1f, 0x44, 0, 0],
+        &[0x0f, 0x1f, 0x80, 0, 0, 0, 0],
+        &[0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0],
+        &[0x66, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0],
+        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0],
+        &[0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0],
+    ];
+    while padding != 0 {
+        let size = padding.min(11);
+        code.extend_from_slice(NOPS[size]);
+        padding -= size;
+    }
+}
+
 fn x86_cond_jmp_byte(opcode: &str) -> Option<u8> {
     match opcode {
         "jo" => Some(0x80),

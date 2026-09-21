@@ -35,6 +35,13 @@ fn move_widths_extensions_and_scalar_operations_match_gas() {
     }
     asm.push_str("movl %r9d, %r10d\nmovw %r9w, %r10w\nmovb %r9b, %r10b\nmovb %ah, %cl\nmovb %spl, %dil\nmovq $42, %rax\nmovq $4294967295, %rax\nmovq $-42, %r9\nmovzbl (%rsp), %ecx\nmovzbq (%rax), %r9\nmovzwq (%r13), %r10\nmovzwl 8(%r12), %ecx\ncmovel %eax, %ecx\ncmovel %r9d, %r10d\nmulss %xmm1, %xmm0\nmulsd %xmm10, %xmm9\nret\n");
     asm.push_str(".globl callee\ncallee: call callee\ncall .Llocal\n.Llocal: ret\n");
+    for padding in 1..32 {
+        asm.push_str(".p2align 5\n");
+        for _ in 0..32 - padding {
+            asm.push_str("ret\n");
+        }
+        asm.push_str(".p2align 5\n");
+    }
     std::fs::write(&source, &asm).unwrap();
     let result = Command::new("as")
         .arg("--64")
