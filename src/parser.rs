@@ -35,6 +35,10 @@ pub enum Line {
     Label(Symbol),
     Instruction(ParsedInstruction),
     Data(Vec<u8>),
+    DataExpression {
+        width: usize,
+        expression: String,
+    },
     Align {
         value: usize,
         directive: String,
@@ -90,12 +94,12 @@ impl AssemblyParser {
                 let before = &line[..colon_pos];
                 if !before.is_empty() && !before.contains(char::is_whitespace) {
                     let label = before.trim();
-                    if self.symbols.iter().any(|s| s.name == label) {
+                    if !is_numeric_label(label) && self.symbols.iter().any(|s| s.name == label) {
                         return Err(RasError::ParseError(format!(
                             "Symbol already defined: {label}"
                         )));
                     }
-                    let global = self.pending_globals.remove(label);
+                    let global = !is_numeric_label(label) && self.pending_globals.remove(label);
                     let sym = Symbol {
                         name: label.to_string(),
                         global,
@@ -122,12 +126,64 @@ impl AssemblyParser {
             }
         }
 
+        self.resolve_numeric_labels()?;
+
         Ok(ParsedAssembly {
             sections: self.sections.clone(),
             symbols: self.symbols.clone(),
             instructions: self.instructions.clone(),
             lines: self.lines.clone(),
         })
+    }
+
+    fn resolve_numeric_labels(&mut self) -> Result<(), RasError> {
+        let mut definitions = Vec::new();
+        for (index, line) in self.lines.iter().enumerate() {
+            if let Line::Label(symbol) = line
+                && is_numeric_label(&symbol.name)
+            {
+                let mut name = format!(".Lras_numeric_{index}");
+                while self.symbols.iter().any(|s| s.name == name) {
+                    name.push('_');
+                }
+                definitions.push((index, symbol.name.clone(), name));
+            }
+        }
+        for (index, line) in self.lines.iter_mut().enumerate() {
+            match line {
+                Line::Label(symbol) => {
+                    if let Some((_, _, name)) = definitions.iter().find(|d| d.0 == index) {
+                        symbol.name = name.clone();
+                    }
+                }
+                Line::Instruction(inst) => {
+                    for operand in &mut inst.operands {
+                        *operand = resolve_numeric_references(operand, index, &definitions)?;
+                    }
+                }
+                Line::DataExpression { expression, .. } => {
+                    *expression = resolve_numeric_references(expression, index, &definitions)?;
+                }
+                _ => {}
+            }
+        }
+        self.symbols = self
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Label(symbol) => Some(symbol.clone()),
+                _ => None,
+            })
+            .collect();
+        self.instructions = self
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Instruction(inst) => Some(inst.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok(())
     }
 
     fn parse_directive(&mut self, line: &str) -> Result<(), RasError> {
@@ -197,12 +253,19 @@ impl AssemblyParser {
                     ".quad" | ".xword" => 8,
                     _ => 4,
                 };
-                let mut bytes = Vec::new();
                 for item in line[parts[0].len()..].split(',') {
-                    let value = parse_integer(item.trim())?;
-                    bytes.extend_from_slice(&value.to_le_bytes()[..width]);
+                    let expression = item.trim();
+                    if let Ok(value) = parse_integer(expression) {
+                        self.lines
+                            .push(Line::Data(value.to_le_bytes()[..width].to_vec()));
+                    } else {
+                        parse_data_expression(expression)?;
+                        self.lines.push(Line::DataExpression {
+                            width,
+                            expression: expression.into(),
+                        });
+                    }
                 }
-                self.lines.push(Line::Data(bytes));
             }
             ".zero" | ".space" | ".skip" => {
                 let items: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
@@ -264,6 +327,97 @@ impl AssemblyParser {
         self.lines.push(Line::Instruction(inst));
         Ok(())
     }
+}
+
+fn is_numeric_label(name: &str) -> bool {
+    name.len() == 1 && name.as_bytes()[0].is_ascii_digit()
+}
+
+fn resolve_numeric_references(
+    text: &str,
+    position: usize,
+    definitions: &[(usize, String, String)],
+) -> Result<String, RasError> {
+    let mut result = String::new();
+    let mut start = 0;
+    for (end, ch) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if ch.is_alphanumeric() || matches!(ch, '_' | '.' | '$') {
+            continue;
+        }
+        if start < end {
+            let token = &text[start..end];
+            if token.len() == 2
+                && token.as_bytes()[0].is_ascii_digit()
+                && matches!(token.as_bytes()[1], b'f' | b'b')
+            {
+                let digit = &token[..1];
+                let definition = if token.ends_with('f') {
+                    definitions.iter().find(|d| d.1 == digit && d.0 >= position)
+                } else {
+                    definitions
+                        .iter()
+                        .rev()
+                        .find(|d| d.1 == digit && d.0 < position)
+                }
+                .ok_or_else(|| RasError::ParseError(format!("Undefined numeric label: {token}")))?;
+                result.push_str(&definition.2);
+            } else {
+                result.push_str(token);
+            }
+        }
+        if end < text.len() {
+            result.push(ch);
+        }
+        start = end + ch.len_utf8();
+    }
+    Ok(result)
+}
+
+pub(crate) enum DataExpression {
+    Constant(i128),
+    Symbol(String, i128),
+    Difference(String, String),
+}
+
+pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasError> {
+    if let Ok(value) = parse_integer(text) {
+        return Ok(DataExpression::Constant(value));
+    }
+    let symbol = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+            && !s.as_bytes()[0].is_ascii_digit()
+    };
+    let operand = |s: &str| {
+        symbol(s)
+            || (s.len() == 2
+                && s.as_bytes()[0].is_ascii_digit()
+                && matches!(s.as_bytes()[1], b'f' | b'b'))
+    };
+    if let Some((index, op)) = text.char_indices().find(|(_, c)| matches!(c, '+' | '-')) {
+        let left = text[..index].trim();
+        let right = text[index + 1..].trim();
+        if operand(left) {
+            if let Ok(value) = parse_integer(right) {
+                return Ok(DataExpression::Symbol(
+                    left.into(),
+                    if op == '-' { -value } else { value },
+                ));
+            }
+            if op == '-' && operand(right) {
+                return Ok(DataExpression::Difference(left.into(), right.into()));
+            }
+        }
+    } else if operand(text) {
+        return Ok(DataExpression::Symbol(text.into(), 0));
+    }
+    Err(RasError::ParseError(format!(
+        "Invalid data expression: {text}"
+    )))
 }
 
 fn parse_integer(text: &str) -> Result<i128, RasError> {

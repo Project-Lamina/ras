@@ -117,3 +117,95 @@ fn numeric_data_alignment_and_bss_match_gas() {
     assert_eq!(inspect(&output), inspect(&reference));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn numeric_labels_and_deferred_data_match_gas() {
+    let dir = std::env::temp_dir().join(format!("ras_label_expressions_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("input.s");
+    let reference = dir.join("gas.o");
+    let output = dir.join("ras.o");
+    let asm = ".text\njmp 1f\n0: ret\n1: jmp 0b\n0: jmp 1f\n1: ret\n.data\n0: .byte 7\n.byte 1f-0b\n.short 1f-0b\n.long 1f-0b\n.quad 1f-0b\n.balign 16\n1: .long 0b-1b\n.byte ext+3\n.short ext-2\n.long ext\n.quad ext+8\n.section .note.gnu.property,\"a\"\n.align 8\n.long 1f-0f\n.long 4f-1f\n.long 5\n0: .string \"GNU\"\n1: .long 0xc0000002\n.long 3f-2f\n2: .long 3\n3: .align 8\n4:\n";
+    std::fs::write(&source, asm).unwrap();
+    let result = std::process::Command::new("as")
+        .args(["--64"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&reference)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(asm, &output)
+        .unwrap();
+    let inspect = |path: &std::path::Path| {
+        let bytes = std::fs::read(path).unwrap();
+        let headers = u64_at(&bytes, 40) as usize;
+        let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+        let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+        let names = &bytes[u64_at(&bytes, headers + strings * 64 + 24) as usize..];
+        let mut sections = std::collections::BTreeMap::new();
+        for i in 1..count {
+            let h = headers + i * 64;
+            let n = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+            let name = names[n..].split(|b| *b == 0).next().unwrap();
+            if [
+                b".text".as_slice(),
+                b".data",
+                b".note.gnu.property",
+                b".rela.data",
+            ]
+            .contains(&name)
+            {
+                let start = u64_at(&bytes, h + 24) as usize;
+                let mut data = bytes[start..start + u64_at(&bytes, h + 32) as usize].to_vec();
+                if name == b".rela.data" {
+                    for reloc in data.chunks_exact_mut(24) {
+                        reloc[12..16].fill(0);
+                    }
+                }
+                sections.insert(
+                    name.to_vec(),
+                    (bytes[h + 4..h + 16].to_vec(), u64_at(&bytes, h + 48), data),
+                );
+            }
+            if name == b".symtab" {
+                let start = u64_at(&bytes, h + 24) as usize;
+                let symbols = &bytes[start..start + u64_at(&bytes, h + 32) as usize];
+                let globals: Vec<_> = symbols
+                    .chunks_exact(24)
+                    .filter(|sym| sym[4] >> 4 == 1)
+                    .collect();
+                assert_eq!(globals.len(), 1);
+                assert_eq!(&globals[0][6..8], &[0, 0]);
+            }
+        }
+        sections
+    };
+    assert_eq!(inspect(&output), inspect(&reference));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn undefined_numeric_labels_and_cross_section_differences_fail() {
+    let path = std::env::temp_dir().join(format!("ras_invalid_labels_{}.o", std::process::id()));
+    for (asm, error) in [
+        (".long 1f", "Undefined numeric label: 1f"),
+        ("jmp 1b\n1: ret", "Undefined numeric label: 1b"),
+        (
+            ".data\nx: .long y-x\n.text\ny: ret",
+            "Undefined or cross-section label in difference: y",
+        ),
+    ] {
+        let result = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .unwrap()
+            .assemble(asm, &path);
+        assert!(result.unwrap_err().to_string().contains(error));
+    }
+    assert!(!path.exists());
+}
