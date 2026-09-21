@@ -25,7 +25,7 @@ fn move_widths_extensions_and_scalar_operations_match_gas() {
     let source = dir.join("input.s");
     let reference = dir.join("reference.o");
     let output = dir.join("ras.o");
-    let mut asm = String::from(".text\n");
+    let mut asm = String::from(".text\nendbr64\n");
     for (width, reg) in [("b", "%al"), ("w", "%ax"), ("l", "%eax"), ("q", "%rax")] {
         for base in ["%rsp", "%rbp", "%r12", "%r13", "%r11"] {
             for offset in [0, 8, -8, 256, -256] {

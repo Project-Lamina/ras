@@ -645,6 +645,7 @@ impl InstructionEncoder for X86_64Encoder {
                 }
             }
             "ret" => code.push(0xC3),
+            "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
             "leave" => code.push(0xC9),
             "cvttsd2sil" | "cvttsd2siq" => {
                 let enc = self.encode_cvttsd2si(opcode == "cvttsd2siq", &inst.operands)?;
