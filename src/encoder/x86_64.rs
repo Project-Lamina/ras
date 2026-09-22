@@ -264,6 +264,25 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_movabs(&self, operands: &[String]) -> Result<Encoded, RasError> {
+        let [src, dst] = operands else {
+            return Err(RasError::EncodingError(
+                "movabsq requires 2 operands".into(),
+            ));
+        };
+        let imm = src
+            .trim()
+            .strip_prefix('$')
+            .ok_or_else(|| RasError::EncodingError("movabsq: source must be immediate".into()))?;
+        let imm = parse_imm(imm)?;
+        let dst = gpr(dst)
+            .filter(|gpr| gpr.width == 64 && !gpr.high)
+            .ok_or_else(|| RasError::EncodingError("movabsq: destination must be 64-bit".into()))?;
+        let mut bytes = vec![0x48 | (dst.num >> 3), 0xb8 | (dst.num & 7)];
+        bytes.extend_from_slice(&imm.to_le_bytes());
+        Ok(Encoded { bytes, rip: None })
+    }
+
     fn encode_alu(
         &self,
         stem: &str,
@@ -643,6 +662,9 @@ impl InstructionEncoder for X86_64Encoder {
                         code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
                     }
                 }
+            }
+            "movabsq" => {
+                code = self.emit(self.encode_movabs(&inst.operands)?);
             }
             "ret" => code.push(0xC3),
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
@@ -1428,5 +1450,27 @@ mod tests {
         assert_eq!(load("(%rbp)"), vec![0x48, 0x8b, 0x45, 0x00]);
 
         assert_eq!(load("(%r12)"), vec![0x49, 0x8b, 0x04, 0x24]);
+    }
+
+    fn encode_one(opcode: &str, operands: &[&str]) -> Vec<u8> {
+        let inst = ParsedInstruction {
+            opcode: opcode.to_string(),
+            operands: operands.iter().map(|op| op.to_string()).collect(),
+        };
+        X86_64Encoder::new()
+            .encode_instruction(&inst)
+            .expect("encode")
+    }
+
+    #[test]
+    fn movabsq_matches_gnu_as() {
+        assert_eq!(
+            encode_one("movabsq", &["$5", "%rax"]),
+            vec![0x48, 0xb8, 5, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            encode_one("movabsq", &["$4294967296", "%r9"]),
+            vec![0x49, 0xb9, 0, 0, 0, 0, 1, 0, 0, 0]
+        );
     }
 }
