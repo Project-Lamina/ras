@@ -724,10 +724,33 @@ impl InstructionEncoder for X86_64Encoder {
                 };
                 code = self.emit(self.encode_lea(width, &inst.operands)?);
             }
-            "imulq" | "imul" => {
+            "imulq" | "imull" | "imul" => {
+                let wide = opcode != "imull";
+                // Three-operand form: imul $imm, src, dst
+                if inst.operands.len() == 3 {
+                    let imm = parse_imm(inst.operands[0].trim_start_matches('$'))?;
+                    let src_reg = self.parse_register(&inst.operands[1])?;
+                    let dst_reg = self.parse_register(&inst.operands[2])?;
+                    let rex = self.encode_rex(wide, dst_reg >> 3, 0, src_reg >> 3);
+                    if wide || rex != 0x40 {
+                        code.push(rex);
+                    }
+                    let modrm = 0xC0 | ((dst_reg & 7) << 3) | (src_reg & 7);
+                    if (-128..=127).contains(&imm) {
+                        code.push(0x6B);
+                        code.push(modrm);
+                        code.push(imm as u8);
+                    } else {
+                        code.push(0x69);
+                        code.push(modrm);
+                        code.extend_from_slice(&(imm as i32).to_le_bytes());
+                    }
+                    self.position += code.len();
+                    return Ok(code);
+                }
                 if inst.operands.len() != 2 {
                     return Err(RasError::EncodingError(
-                        "imul requires 2 operands".to_string(),
+                        "imul requires 2 or 3 operands".to_string(),
                     ));
                 }
                 let a = &inst.operands[0];
@@ -741,7 +764,10 @@ impl InstructionEncoder for X86_64Encoder {
                 // the reg field is the destination and r/m is the source.
                 let src_reg = self.parse_register(a)?;
                 let dst_reg = self.parse_register(b)?;
-                code.push(self.encode_rex(true, dst_reg >> 3, 0, src_reg >> 3));
+                let rex = self.encode_rex(wide, dst_reg >> 3, 0, src_reg >> 3);
+                if wide || rex != 0x40 {
+                    code.push(rex);
+                }
                 code.extend_from_slice(&[0x0F, 0xAF]);
                 code.push(0xC0 | ((dst_reg & 7) << 3) | (src_reg & 7));
             }
