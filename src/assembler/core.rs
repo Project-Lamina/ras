@@ -291,6 +291,13 @@ impl RasAssembler {
         executable: bool,
         long_jumps: &HashSet<usize>,
     ) -> Result<Layout, RasError> {
+        let global_labels: HashSet<&str> = lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Label(s) if s.global => Some(s.name.as_str()),
+                _ => None,
+            })
+            .collect();
         let mut symbol_offsets: HashMap<String, usize> = HashMap::new();
         let mut patch_points: Vec<PatchPoint> = Vec::new();
         let mut code = Vec::new();
@@ -493,7 +500,7 @@ impl RasAssembler {
                             patch_points.push(PatchPoint::X86Rel32 {
                                 offset: current_offset + 1,
                                 target: target.to_string(),
-                                relocate: is_call && lines.iter().any(|line| matches!(line, Line::Label(s) if s.global && s.name == target)),
+                                relocate: is_call && global_labels.contains(target),
                             });
                             current_offset += 5;
                         } else {
