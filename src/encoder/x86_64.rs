@@ -683,6 +683,20 @@ impl InstructionEncoder for X86_64Encoder {
                     self.encode_sse_move(&[0x66], &[0x0f, 0x28], &[0x0f, 0x29], &inst.operands)?;
                 code = self.emit(enc);
             }
+            "movaps" => {
+                let enc =
+                    self.encode_sse_move(&[], &[0x0f, 0x28], &[0x0f, 0x29], &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "movups" => {
+                let enc =
+                    self.encode_sse_move(&[], &[0x0f, 0x10], &[0x0f, 0x11], &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "pxor" => {
+                let enc = self.encode_sse_rm(&[0x66], &[0x0f, 0xef], &inst.operands)?;
+                code = self.emit(enc);
+            }
             "movdqa" => {
                 let enc =
                     self.encode_sse_move(&[0x66], &[0x0f, 0x6f], &[0x0f, 0x7f], &inst.operands)?;
@@ -1471,6 +1485,26 @@ mod tests {
         assert_eq!(
             encode_one("movabsq", &["$4294967296", "%r9"]),
             vec![0x49, 0xb9, 0, 0, 0, 0, 1, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn sse_moves_match_gnu_as() {
+        assert_eq!(
+            encode_one("movaps", &["%xmm0", "112(%rsp)"]),
+            vec![0x0f, 0x29, 0x44, 0x24, 0x70]
+        );
+        assert_eq!(
+            encode_one("movaps", &["%xmm9", "%xmm1"]),
+            vec![0x41, 0x0f, 0x28, 0xc9]
+        );
+        assert_eq!(
+            encode_one("movups", &["%xmm0", "297(%rsp)"]),
+            vec![0x0f, 0x11, 0x84, 0x24, 0x29, 0x01, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode_one("pxor", &["%xmm10", "%xmm3"]),
+            vec![0x66, 0x41, 0x0f, 0xef, 0xda]
         );
     }
 }
