@@ -669,10 +669,10 @@ impl X86_64Encoder {
             ));
         }
         let (src_bits, dst_width): (Option<u8>, Option<u8>) = match opcode {
-            "movzbq" => (Some(8), Some(64)),
-            "movzbl" => (Some(8), Some(32)),
-            "movzwq" => (Some(16), Some(64)),
-            "movzwl" => (Some(16), Some(32)),
+            "movzbq" | "movsbq" => (Some(8), Some(64)),
+            "movzbl" | "movsbl" => (Some(8), Some(32)),
+            "movzwq" | "movswq" => (Some(16), Some(64)),
+            "movzwl" | "movswl" => (Some(16), Some(32)),
             _ => (None, None),
         };
         let (src, src_gpr) = self.parse_rm(&operands[0], false)?;
@@ -706,7 +706,15 @@ impl X86_64Encoder {
             wide: width == 64,
             byte_rex,
             high,
-            opcode: &[0x0f, if src_bits == 8 { 0xb6 } else { 0xb7 }],
+            opcode: &[
+                0x0f,
+                match (opcode.starts_with("movs"), src_bits == 8) {
+                    (false, true) => 0xb6,
+                    (false, false) => 0xb7,
+                    (true, true) => 0xbe,
+                    (true, false) => 0xbf,
+                },
+            ],
             reg,
             rm: src,
             ..Op::default()
@@ -1186,7 +1194,8 @@ impl InstructionEncoder for X86_64Encoder {
                 code.extend_from_slice(&[0x0F, 0x57]);
                 code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
             }
-            "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" => {
+            "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" | "movsbl" | "movsbq"
+            | "movswl" | "movswq" => {
                 code = self.emit(self.encode_movzx(&opcode, &inst.operands)?);
             }
             _ => {
@@ -1670,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn imul_matches_gnu_as() {
+    fn imul_movsx_match_gnu_as() {
         assert_eq!(
             encode_one("imull", &["-12(%rbp)", "%eax"]),
             vec![0x0f, 0xaf, 0x45, 0xf4]
@@ -1678,6 +1687,10 @@ mod tests {
         assert_eq!(
             encode_one("imul", &["%ecx", "%eax"]),
             vec![0x0f, 0xaf, 0xc1]
+        );
+        assert_eq!(
+            encode_one("movsbl", &["-36(%rbp)", "%edx"]),
+            vec![0x0f, 0xbe, 0x55, 0xdc]
         );
     }
 }
