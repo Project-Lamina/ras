@@ -907,12 +907,21 @@ impl InstructionEncoder for X86_64Encoder {
                 code = self.emit(self.encode_lea(width, &inst.operands)?);
             }
             "imulq" | "imull" | "imul" => {
-                let wide = opcode != "imull";
+                let suffix_width = match opcode.as_str() {
+                    "imull" => Some(32),
+                    "imulq" => Some(64),
+                    _ => None,
+                };
                 // Three-operand form: imul $imm, src, dst
                 if inst.operands.len() == 3 {
                     let imm = parse_imm(inst.operands[0].trim_start_matches('$'))?;
                     let src_reg = self.parse_register(&inst.operands[1])?;
                     let dst_reg = self.parse_register(&inst.operands[2])?;
+                    let width = operand_width(
+                        suffix_width,
+                        &[gpr(&inst.operands[1]), gpr(&inst.operands[2])],
+                    )?;
+                    let wide = width == 64;
                     let rex = self.encode_rex(wide, dst_reg >> 3, 0, src_reg >> 3);
                     if wide || rex != 0x40 {
                         code.push(rex);
@@ -935,23 +944,30 @@ impl InstructionEncoder for X86_64Encoder {
                         "imul requires 2 or 3 operands".to_string(),
                     ));
                 }
-                let a = &inst.operands[0];
-                let b = &inst.operands[1];
-                if self.is_memory(a) || self.is_memory(b) {
+                // AT&T order: `imul src, dst`. 0F AF is IMUL r, r/m where the
+                // reg field is the destination and r/m is the source.
+                let (src_rm, src_gpr) = self.parse_rm(&inst.operands[0], false)?;
+                let (dst_rm, dst_gpr) = self.parse_rm(&inst.operands[1], false)?;
+                let Rm::Reg(reg) = dst_rm else {
                     return Err(RasError::EncodingError(
-                        "imul reg,reg only supported".to_string(),
+                        "imul: destination must be a register".to_string(),
                     ));
+                };
+                let width = operand_width(suffix_width, &[src_gpr, dst_gpr])?;
+                if width != 32 && width != 64 {
+                    return Err(RasError::EncodingError(format!(
+                        "imul: unsupported operand width: {}",
+                        width
+                    )));
                 }
-                // AT&T order: `imul src, dst`. 0F AF is IMUL r64, r/m64 where
-                // the reg field is the destination and r/m is the source.
-                let src_reg = self.parse_register(a)?;
-                let dst_reg = self.parse_register(b)?;
-                let rex = self.encode_rex(wide, dst_reg >> 3, 0, src_reg >> 3);
-                if wide || rex != 0x40 {
-                    code.push(rex);
-                }
-                code.extend_from_slice(&[0x0F, 0xAF]);
-                code.push(0xC0 | ((dst_reg & 7) << 3) | (src_reg & 7));
+                let enc = encode_op(Op {
+                    wide: width == 64,
+                    opcode: &[0x0f, 0xaf],
+                    reg,
+                    rm: src_rm,
+                    ..Op::default()
+                })?;
+                code = self.emit(enc);
             }
             // REX.W 0x99: sign-extend rax into rdx:rax (needed before idivq)
             "cqto" | "cqo" => {
@@ -1651,5 +1667,17 @@ mod tests {
         assert_eq!(encode_one("call", &["*16(%rax)"]), vec![0xff, 0x50, 0x10]);
         assert_eq!(encode_one("call", &["*%r12"]), vec![0x41, 0xff, 0xd4]);
         assert_eq!(encode_one("jmp", &["*%rax"]), vec![0xff, 0xe0]);
+    }
+
+    #[test]
+    fn imul_matches_gnu_as() {
+        assert_eq!(
+            encode_one("imull", &["-12(%rbp)", "%eax"]),
+            vec![0x0f, 0xaf, 0x45, 0xf4]
+        );
+        assert_eq!(
+            encode_one("imul", &["%ecx", "%eax"]),
+            vec![0x0f, 0xaf, 0xc1]
+        );
     }
 }
