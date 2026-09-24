@@ -379,6 +379,82 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_shift(
+        &self,
+        digit: u8,
+        width: Option<u8>,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        let (count, dst) = match operands {
+            [dst] => (None, dst),
+            [count, dst] => (Some(count.trim()), dst),
+            _ => {
+                return Err(RasError::EncodingError(
+                    "shift requires 1 or 2 operands".into(),
+                ));
+            }
+        };
+        let (rm, gpr) = self.parse_rm(dst, false)?;
+        let width = operand_width(width, &[gpr])?;
+        check_alu_width(width)?;
+        let byte = width == 8;
+        let (byte_rex, high) = byte_flags(&[gpr]);
+        let mut imm = Vec::new();
+        let opcode = match count {
+            None => [if byte { 0xd0 } else { 0xd1 }],
+            Some("%cl" | "cl") => [if byte { 0xd2 } else { 0xd3 }],
+            Some(text) => {
+                let value = parse_imm(text.strip_prefix('$').ok_or_else(|| {
+                    RasError::EncodingError("shift count must be an immediate or %cl".into())
+                })?)?;
+                if value == 1 {
+                    [if byte { 0xd0 } else { 0xd1 }]
+                } else {
+                    imm.push(u8::try_from(value).map_err(|_| {
+                        RasError::EncodingError(format!("Shift count out of range: {}", value))
+                    })?);
+                    [if byte { 0xc0 } else { 0xc1 }]
+                }
+            }
+        };
+        encode_op(Op {
+            wide: width == 64,
+            byte_rex,
+            high,
+            opcode: &opcode,
+            reg: digit,
+            rm,
+            imm: &imm,
+            ..Op::default()
+        })
+    }
+
+    fn encode_unary(
+        &self,
+        digit: u8,
+        width: Option<u8>,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        let [operand] = operands else {
+            return Err(RasError::EncodingError(
+                "unary op requires 1 operand".into(),
+            ));
+        };
+        let (rm, gpr) = self.parse_rm(operand, false)?;
+        let width = operand_width(width, &[gpr])?;
+        check_alu_width(width)?;
+        let (byte_rex, high) = byte_flags(&[gpr]);
+        encode_op(Op {
+            wide: width == 64,
+            byte_rex,
+            high,
+            opcode: &[if width == 8 { 0xf6 } else { 0xf7 }],
+            reg: digit,
+            rm,
+            ..Op::default()
+        })
+    }
+
     fn encode_sse_rm(
         &self,
         legacy: &[u8],
@@ -620,6 +696,18 @@ impl InstructionEncoder for X86_64Encoder {
             self.position += bytes.len();
             return Ok(bytes);
         }
+        if let Some((digit, width)) = shift_mnemonic(&opcode) {
+            let encoded = self.encode_shift(digit, width, &inst.operands)?;
+            let bytes = self.emit(encoded);
+            self.position += bytes.len();
+            return Ok(bytes);
+        }
+        if let Some((digit, width)) = unary_mnemonic(&opcode) {
+            let encoded = self.encode_unary(digit, width, &inst.operands)?;
+            let bytes = self.emit(encoded);
+            self.position += bytes.len();
+            return Ok(bytes);
+        }
         let mut code = Vec::new();
 
         match opcode.as_str() {
@@ -815,109 +903,6 @@ impl InstructionEncoder for X86_64Encoder {
             // REX.W 0x99 for 32-bit sign-extend eax into edx:eax
             "cdq" => {
                 code.push(0x99);
-            }
-            // idivq %reg: REX.W F7 /7
-            "idivq" | "idiv" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "idivq requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                code.push(self.encode_rex(true, 0, 0, reg >> 3));
-                code.push(0xF7);
-                code.push(0xF8 | (reg & 7)); // ModRM: /7 = 111, mod=11
-            }
-            // divq %reg: REX.W F7 /6 (unsigned divide)
-            "divq" | "div" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "divq requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                code.push(self.encode_rex(true, 0, 0, reg >> 3));
-                code.push(0xF7);
-                code.push(0xF0 | (reg & 7)); // ModRM: /6 = 110, mod=11
-            }
-            // sarq / salq / shrq / shlq (shift instructions)
-            "sarq" | "sar" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "sarq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let dst = self.parse_register(&inst.operands[1])?;
-                if a.starts_with('$') {
-                    let imm: u8 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for sarq".to_string())
-                    })?;
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xC1);
-                    code.push(0xF8 | (dst & 7)); // /7
-                    code.push(imm);
-                } else if a == "%cl" || a == "cl" {
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xD3);
-                    code.push(0xF8 | (dst & 7));
-                } else {
-                    return Err(RasError::EncodingError(
-                        "sarq: unsupported shift source".to_string(),
-                    ));
-                }
-            }
-            "shlq" | "salq" | "shl" | "sal" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "shlq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let dst = self.parse_register(&inst.operands[1])?;
-                if a.starts_with('$') {
-                    let imm: u8 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for shlq".to_string())
-                    })?;
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xC1);
-                    code.push(0xE0 | (dst & 7)); // /4
-                    code.push(imm);
-                } else if a == "%cl" || a == "cl" {
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xD3);
-                    code.push(0xE0 | (dst & 7));
-                } else {
-                    return Err(RasError::EncodingError(
-                        "shlq: unsupported shift source".to_string(),
-                    ));
-                }
-            }
-            "shrq" | "shr" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "shrq requires 2 operands".to_string(),
-                    ));
-                }
-                let a = &inst.operands[0];
-                let dst = self.parse_register(&inst.operands[1])?;
-                if a.starts_with('$') {
-                    let imm: u8 = a.trim_start_matches('$').parse().map_err(|_| {
-                        RasError::EncodingError("Invalid immediate for shrq".to_string())
-                    })?;
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xC1);
-                    code.push(0xE8 | (dst & 7)); // /5
-                    code.push(imm);
-                } else if a == "%cl" || a == "cl" {
-                    code.push(self.encode_rex(true, 0, 0, dst >> 3));
-                    code.push(0xD3);
-                    code.push(0xE8 | (dst & 7));
-                } else {
-                    return Err(RasError::EncodingError(
-                        "shrq: unsupported shift source".to_string(),
-                    ));
-                }
             }
             // SETcc instructions (byte result from flags)
             "sete" | "setz" => {
@@ -1434,6 +1419,30 @@ fn alu_mnemonic(name: &str) -> Option<(&'static str, Option<u8>)> {
         })
 }
 
+fn sized_stem(opcode: &str, stem: &str) -> Option<Option<u8>> {
+    if opcode == stem {
+        return Some(None);
+    }
+    match opcode.strip_prefix(stem)? {
+        "b" => Some(Some(8)),
+        "l" => Some(Some(32)),
+        "q" => Some(Some(64)),
+        _ => None,
+    }
+}
+
+fn shift_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
+    [("sar", 7), ("shl", 4), ("sal", 4), ("shr", 5)]
+        .into_iter()
+        .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
+}
+
+fn unary_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
+    [("neg", 3), ("mul", 4), ("idiv", 7), ("div", 6)]
+        .into_iter()
+        .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
+}
+
 fn parse_xmm(s: &str) -> Option<u8> {
     let s = s.trim_start_matches('%');
     let s = s.strip_prefix("xmm")?;
@@ -1505,6 +1514,27 @@ mod tests {
         assert_eq!(
             encode_one("pxor", &["%xmm10", "%xmm3"]),
             vec![0x66, 0x41, 0x0f, 0xef, 0xda]
+        );
+    }
+
+    #[test]
+    fn shifts_and_unary_match_gnu_as() {
+        assert_eq!(encode_one("sarl", &["$31", "%eax"]), vec![0xc1, 0xf8, 0x1f]);
+        assert_eq!(encode_one("sarl", &["%ecx"]), vec![0xd1, 0xf9]);
+        assert_eq!(
+            encode_one("sarl", &["$1", "-4(%rbp)"]),
+            vec![0xd1, 0x7d, 0xfc]
+        );
+        assert_eq!(encode_one("shll", &["%cl", "%r9d"]), vec![0x41, 0xd3, 0xe1]);
+        assert_eq!(encode_one("sall", &["$2", "%eax"]), vec![0xc1, 0xe0, 0x02]);
+        assert_eq!(encode_one("shrl", &["%eax"]), vec![0xd1, 0xe8]);
+        assert_eq!(encode_one("negq", &["%rdx"]), vec![0x48, 0xf7, 0xda]);
+        assert_eq!(encode_one("negl", &["%r13d"]), vec![0x41, 0xf7, 0xdd]);
+        assert_eq!(encode_one("negl", &["-4(%rbp)"]), vec![0xf7, 0x5d, 0xfc]);
+        assert_eq!(encode_one("mulq", &["%rcx"]), vec![0x48, 0xf7, 0xe1]);
+        assert_eq!(
+            encode_one("divq", &["-8(%rbp)"]),
+            vec![0x48, 0xf7, 0x75, 0xf8]
         );
     }
 }
