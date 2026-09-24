@@ -480,7 +480,10 @@ impl RasAssembler {
                         continue;
                     }
 
-                    if is_jmp_call && inst.operands.len() == 1 {
+                    if is_jmp_call
+                        && inst.operands.len() == 1
+                        && !inst.operands[0].trim().starts_with('*')
+                    {
                         let target = inst.operands[0].trim();
                         if self.target_arch == TargetArchitecture::X86_64 {
                             let is_call = opcode == "call";
@@ -520,7 +523,7 @@ impl RasAssembler {
                             && let Some(label) = inst
                                 .operands
                                 .iter()
-                                .find_map(|op| extract_rip_label(op.trim()))
+                                .find_map(|op| extract_rip_label(op.trim().trim_start_matches('*')))
                         {
                             patch_points.push(PatchPoint::X86RipRel32 {
                                 offset: current_offset + fixup.disp_offset,
