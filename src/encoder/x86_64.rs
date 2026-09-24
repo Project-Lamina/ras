@@ -455,6 +455,38 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_cmov(
+        &self,
+        cc: u8,
+        width: Option<u8>,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        let [src, dst] = operands else {
+            return Err(RasError::EncodingError("cmov requires 2 operands".into()));
+        };
+        let (src_rm, src_gpr) = self.parse_rm(src, false)?;
+        let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
+        let Rm::Reg(reg) = dst_rm else {
+            return Err(RasError::EncodingError(
+                "cmov: destination must be a register".into(),
+            ));
+        };
+        let width = operand_width(width, &[src_gpr, dst_gpr])?;
+        if width != 32 && width != 64 {
+            return Err(RasError::EncodingError(format!(
+                "cmov: unsupported operand width: {}",
+                width
+            )));
+        }
+        encode_op(Op {
+            wide: width == 64,
+            opcode: &[0x0f, 0x40 | cc],
+            reg,
+            rm: src_rm,
+            ..Op::default()
+        })
+    }
+
     fn encode_sse_rm(
         &self,
         legacy: &[u8],
@@ -704,6 +736,12 @@ impl InstructionEncoder for X86_64Encoder {
         }
         if let Some((digit, width)) = unary_mnemonic(&opcode) {
             let encoded = self.encode_unary(digit, width, &inst.operands)?;
+            let bytes = self.emit(encoded);
+            self.position += bytes.len();
+            return Ok(bytes);
+        }
+        if let Some((cc, width)) = cmov_mnemonic(&opcode) {
+            let encoded = self.encode_cmov(cc, width, &inst.operands)?;
             let bytes = self.emit(encoded);
             self.position += bytes.len();
             return Ok(bytes);
@@ -1029,20 +1067,6 @@ impl InstructionEncoder for X86_64Encoder {
                     code.push(0x40 | (reg >> 3));
                 }
                 code.extend_from_slice(&[0x0F, 0x96, 0xC0 | (reg & 7)]);
-            }
-            // cmovzq / cmovz (conditional move if ZF=1)
-            "cmovzq" | "cmovz" | "cmoveq" | "cmove" | "cmovel" | "cmovzl" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("cmovzq requires 2 operands".into()));
-                }
-                let src = self.parse_register(&inst.operands[0])?;
-                let dst = self.parse_register(&inst.operands[1])?;
-                let rex = self.encode_rex(!opcode.ends_with('l'), dst >> 3, 0, src >> 3);
-                if rex != 0x40 {
-                    code.push(rex);
-                }
-                code.extend_from_slice(&[0x0F, 0x44]);
-                code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
             }
             // movd: move 32/64-bit GPR to/from XMM  (66 [REX] 0F 6E /r)
             "movd" | "movq_xmm" => {
@@ -1437,6 +1461,41 @@ fn shift_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
         .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
 }
 
+fn condition_code(name: &str) -> Option<u8> {
+    Some(match name {
+        "o" => 0x0,
+        "no" => 0x1,
+        "b" | "c" | "nae" => 0x2,
+        "ae" | "nb" | "nc" => 0x3,
+        "e" | "z" => 0x4,
+        "ne" | "nz" => 0x5,
+        "be" | "na" => 0x6,
+        "a" | "nbe" => 0x7,
+        "s" => 0x8,
+        "ns" => 0x9,
+        "p" | "pe" => 0xa,
+        "np" | "po" => 0xb,
+        "l" | "nge" => 0xc,
+        "ge" | "nl" => 0xd,
+        "le" | "ng" => 0xe,
+        "g" | "nle" => 0xf,
+        _ => return None,
+    })
+}
+
+fn cmov_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
+    let rest = opcode.strip_prefix("cmov")?;
+    if let Some(cc) = condition_code(rest) {
+        return Some((cc, None));
+    }
+    let (name, width) = if let Some(name) = rest.strip_suffix('q') {
+        (name, 64)
+    } else {
+        (rest.strip_suffix('l')?, 32)
+    };
+    condition_code(name).map(|cc| (cc, Some(width)))
+}
+
 fn unary_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
     [("neg", 3), ("mul", 4), ("idiv", 7), ("div", 6)]
         .into_iter()
@@ -1535,6 +1594,34 @@ mod tests {
         assert_eq!(
             encode_one("divq", &["-8(%rbp)"]),
             vec![0x48, 0xf7, 0x75, 0xf8]
+        );
+    }
+
+    #[test]
+    fn cmov_matches_gnu_as() {
+        assert_eq!(
+            encode_one("cmova", &["%rax", "%rcx"]),
+            vec![0x48, 0x0f, 0x47, 0xc8]
+        );
+        assert_eq!(
+            encode_one("cmovbe", &["%rax", "%r14"]),
+            vec![0x4c, 0x0f, 0x46, 0xf0]
+        );
+        assert_eq!(
+            encode_one("cmovl", &["%eax", "%ebx"]),
+            vec![0x0f, 0x4c, 0xd8]
+        );
+        assert_eq!(
+            encode_one("cmovnle", &["%rdx", "%rsi"]),
+            vec![0x48, 0x0f, 0x4f, 0xf2]
+        );
+        assert_eq!(
+            encode_one("cmovzl", &["%eax", "%edx"]),
+            vec![0x0f, 0x44, 0xd0]
+        );
+        assert_eq!(
+            encode_one("cmoveq", &["%r8", "%rdx"]),
+            vec![0x49, 0x0f, 0x44, 0xd0]
         );
     }
 }
