@@ -792,6 +792,26 @@ impl InstructionEncoder for X86_64Encoder {
             "movabsq" => {
                 code = self.emit(self.encode_movabs(&inst.operands)?);
             }
+            "call" | "jmp" => {
+                let [target] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError(format!(
+                        "{} requires 1 operand",
+                        opcode
+                    )));
+                };
+                let target = target.trim().strip_prefix('*').ok_or_else(|| {
+                    RasError::EncodingError(format!("{}: expected indirect operand", opcode))
+                })?;
+                let (rm, _) = self.parse_rm(target, false)?;
+                let digit = if opcode == "call" { 2 } else { 4 };
+                let enc = encode_op(Op {
+                    opcode: &[0xff],
+                    reg: digit,
+                    rm,
+                    ..Op::default()
+                })?;
+                code = self.emit(enc);
+            }
             "ret" => code.push(0xC3),
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
             "leave" => code.push(0xC9),
@@ -1623,5 +1643,13 @@ mod tests {
             encode_one("cmoveq", &["%r8", "%rdx"]),
             vec![0x49, 0x0f, 0x44, 0xd0]
         );
+    }
+
+    #[test]
+    fn indirect_branches_match_gnu_as() {
+        assert_eq!(encode_one("call", &["*%rdx"]), vec![0xff, 0xd2]);
+        assert_eq!(encode_one("call", &["*16(%rax)"]), vec![0xff, 0x50, 0x10]);
+        assert_eq!(encode_one("call", &["*%r12"]), vec![0x41, 0xff, 0xd4]);
+        assert_eq!(encode_one("jmp", &["*%rax"]), vec![0xff, 0xe0]);
     }
 }
