@@ -1,6 +1,5 @@
 //! Assembler: assembly text to object file, MIR to binary (JIT)
 
-pub mod common;
 pub mod core;
 
 #[cfg(feature = "encoder")]
