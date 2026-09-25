@@ -977,6 +977,20 @@ impl InstructionEncoder for X86_64Encoder {
                 })?;
                 code = self.emit(enc);
             }
+            "rep" => {
+                if inst.operands.len() != 1 || inst.operands[0] != "movsb" {
+                    return Err(RasError::EncodingError(
+                        "rep: only `rep movsb` is supported".to_string(),
+                    ));
+                }
+                code.extend_from_slice(&[0xf3, 0xa4]);
+            }
+            "nop" => {
+                if !inst.operands.is_empty() {
+                    return Err(RasError::EncodingError("nop takes no operands".to_string()));
+                }
+                code.push(0x90);
+            }
             // REX.W 0x99: sign-extend rax into rdx:rax (needed before idivq)
             "cqto" | "cqo" => {
                 code.push(0x48); // REX.W
@@ -1692,5 +1706,11 @@ mod tests {
             encode_one("movsbl", &["-36(%rbp)", "%edx"]),
             vec![0x0f, 0xbe, 0x55, 0xdc]
         );
+    }
+
+    #[test]
+    fn rep_and_nop_match_gnu_as() {
+        assert_eq!(encode_one("nop", &[]), vec![0x90]);
+        assert_eq!(encode_one("rep", &["movsb"]), vec![0xf3, 0xa4]);
     }
 }
