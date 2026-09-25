@@ -104,7 +104,9 @@ impl X86_64Encoder {
         if !disp_text.is_empty() {
             match parse_imm(disp_text) {
                 Ok(value) => mem.disp = value,
-                Err(_) if is_symbol(disp_text) => mem.label = Some(disp_text.to_string()),
+                Err(_) if is_symbol(disp_text) || is_got_symbol(disp_text) => {
+                    mem.label = Some(disp_text.to_string())
+                }
                 Err(_) => return Err(invalid()),
             }
         }
@@ -1418,6 +1420,10 @@ fn parse_imm(text: &str) -> Result<i64, RasError> {
     Ok(if negative { -magnitude } else { magnitude })
 }
 
+fn is_got_symbol(text: &str) -> bool {
+    text.strip_suffix("@GOTPCREL").is_some_and(is_symbol)
+}
+
 fn is_symbol(text: &str) -> bool {
     let mut chars = text.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '.')
@@ -1712,5 +1718,13 @@ mod tests {
     fn rep_and_nop_match_gnu_as() {
         assert_eq!(encode_one("nop", &[]), vec![0x90]);
         assert_eq!(encode_one("rep", &["movsb"]), vec![0xf3, 0xa4]);
+    }
+
+    #[test]
+    fn got_load_matches_gnu_as() {
+        assert_eq!(
+            encode_one("movq", &["foo@GOTPCREL(%rip)", "%rax"]),
+            vec![0x48, 0x8b, 0x05, 0, 0, 0, 0]
+        );
     }
 }
