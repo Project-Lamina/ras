@@ -18,6 +18,8 @@ use crate::{
     target::unsupported_target_hint,
 };
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+const R_X86_64_REX_GOTPCRELX: u32 = 42;
 use std::collections::{HashMap, HashSet};
 
 /// Return type of the two-pass encoding pass.
@@ -663,10 +665,11 @@ impl RasAssembler {
                 }
                 continue;
             }
+            let got = target.ends_with("@GOTPCREL");
             let target = reloc_symbol(target);
             if let Some(&target_offset) = symbol_offsets
                 .get(target)
-                .filter(|_| !matches!(patch, PatchPoint::X86Rel32 { relocate: true, .. }))
+                .filter(|_| !got && !matches!(patch, PatchPoint::X86Rel32 { relocate: true, .. }))
             {
                 match patch {
                     PatchPoint::Data { .. } | PatchPoint::AArch64 { .. } => unreachable!(),
@@ -719,7 +722,7 @@ impl RasAssembler {
                             offset: *offset,
                             symbol: target.to_string(),
                             section: String::new(),
-                            kind: 2,
+                            kind: if got { R_X86_64_REX_GOTPCRELX } else { 2 },
                             addend: -(4 + *trailing as i64),
                         });
                     }
