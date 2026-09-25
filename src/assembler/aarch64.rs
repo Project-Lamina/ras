@@ -2,12 +2,12 @@
 //!
 //! This module handles compilation of MIR to AArch64 binary machine code.
 
-use crate::aarch64_encoding::{
+use crate::encoder::aarch64::fixed::{
     enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr_aarch64, encode_and_rrr_aarch64,
     encode_and_w_rrr_aarch64, encode_msub_aarch64, encode_msub_aarch64_w,
 };
 use crate::{
-    aarch64_ldst_imm64::{
+    encoder::aarch64::ldst_imm64::{
         AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
         encode_str_imm64, encode_str_scalar,
     },
