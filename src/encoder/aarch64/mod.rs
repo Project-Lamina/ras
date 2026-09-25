@@ -1,5 +1,8 @@
+pub mod fixed;
+pub mod ldst_imm64;
+
 use crate::{
-    aarch64_encoding::*,
+    encoder::aarch64::fixed::*,
     encoder::traits::{InstructionEncoder, ParsedInstruction},
     error::RasError,
 };
