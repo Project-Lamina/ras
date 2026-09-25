@@ -3,8 +3,8 @@
 //! This module handles compilation of MIR to AArch64 binary machine code.
 
 use crate::encoder::aarch64::fixed::{
-    enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr_aarch64, encode_and_rrr_aarch64,
-    encode_and_w_rrr_aarch64, encode_msub_aarch64, encode_msub_aarch64_w,
+    enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr, encode_and_rrr,
+    encode_and_w_rrr, encode_msub, encode_msub_w,
 };
 use crate::{
     encoder::aarch64::ldst_imm64::{
@@ -111,7 +111,7 @@ pub fn compile_mir_aarch64_function(
         let aligned_stack_size = (stack_size + 15) & !15;
 
         // Generate function prologue (binary encoded)
-        let prologue = encode_prologue_aarch64(aligned_stack_size)?;
+        let prologue = encode_prologue(aligned_stack_size)?;
         code.extend_from_slice(&prologue);
 
         // Handle function parameters: spill ABI arg registers to the FrameMap stack slots.
@@ -128,7 +128,7 @@ pub fn compile_mir_aarch64_function(
                     if index < arg_regs.len() {
                         // Store x0-x7 directly to the virtual register stack slot.
                         let str_bytes =
-                            encode_str_aarch64(arg_regs[index], 29 /* x29 (FP) */, *slot_off)?;
+                            encode_str(arg_regs[index], 29 /* x29 (FP) */, *slot_off)?;
                         code.extend_from_slice(&str_bytes);
                     } else {
                         // Handle stack arguments (AAPCS64: stack args start at caller's [sp, #0])
@@ -137,9 +137,9 @@ pub fn compile_mir_aarch64_function(
                         // First stack arg (arg8) is at [x29, #16], second at [x29, #24], etc.
                         let stack_arg_index = index - arg_regs.len();
                         let caller_off = (16 + stack_arg_index * 8) as i32; // 16 for saved fp/lr
-                        let ldr1 = encode_ldr_aarch64("x10", 29, caller_off)?;
+                        let ldr1 = encode_ldr("x10", 29, caller_off)?;
                         code.extend_from_slice(&ldr1);
-                        let str1 = encode_str_aarch64("x10", 29, *slot_off)?;
+                        let str1 = encode_str("x10", 29, *slot_off)?;
                         code.extend_from_slice(&str1);
                     }
                 }
@@ -249,7 +249,7 @@ pub fn compile_mir_aarch64_function(
                 lamina_mir::Instruction::Ret { value } => {
                     if let Some(v) = value {
                         if let Some(rt) = &func.sig.ret_ty {
-                            materialize_return_value_aarch64(
+                            materialize_return_value(
                                 assembler,
                                 v,
                                 rt,
@@ -259,7 +259,7 @@ pub fn compile_mir_aarch64_function(
                                 aligned_stack_size,
                             )?;
                         } else {
-                            materialize_operand_aarch64(
+                            materialize_operand(
                                 assembler,
                                 v,
                                 0,
@@ -294,8 +294,8 @@ pub fn compile_mir_aarch64_function(
                 } => {
                     // Load condition value and branch on non-zero.
                     let cond_reg_str = reg_alloc.alloc_scratch().unwrap_or("x9");
-                    let cond_reg = parse_register_aarch64(cond_reg_str)?;
-                    materialize_operand_aarch64(
+                    let cond_reg = parse_register(cond_reg_str)?;
+                    materialize_operand(
                         assembler,
                         &lamina_mir::Operand::Register(cond.clone()),
                         cond_reg,
@@ -353,8 +353,8 @@ pub fn compile_mir_aarch64_function(
 
                     let arg_regs = AArch64ABI::ARG_REGISTERS;
                     for (i, arg) in args.iter().enumerate().take(8) {
-                        let dst = parse_register_aarch64(arg_regs[i])?;
-                        materialize_operand_aarch64(
+                        let dst = parse_register(arg_regs[i])?;
+                        materialize_operand(
                             assembler,
                             arg,
                             dst,
@@ -366,7 +366,7 @@ pub fn compile_mir_aarch64_function(
                     }
                     for (i, arg) in args.iter().enumerate().skip(8) {
                         let caller_off = 16i32 + (i as i32 - 8) * 8;
-                        materialize_operand_aarch64(
+                        materialize_operand(
                             assembler,
                             arg,
                             11,
@@ -375,10 +375,10 @@ pub fn compile_mir_aarch64_function(
                             &mut code,
                             aligned_stack_size,
                         )?;
-                        code.extend_from_slice(&encode_str_aarch64("x11", 29, caller_off)?);
+                        code.extend_from_slice(&encode_str("x11", 29, caller_off)?);
                     }
 
-                    let epilogue_tail = encode_epilogue_aarch64(aligned_stack_size)?;
+                    let epilogue_tail = encode_epilogue(aligned_stack_size)?;
                     code.extend_from_slice(&epilogue_tail);
 
                     let b_pc = code.len();
@@ -389,7 +389,7 @@ pub fn compile_mir_aarch64_function(
                     });
                 }
                 lamina_mir::Instruction::Unreachable => {
-                    code.extend_from_slice(&encode_brk_aarch64(0));
+                    code.extend_from_slice(&encode_brk(0));
                 }
                 other => {
                     return Err(RasError::EncodingError(format!(
@@ -425,11 +425,11 @@ pub fn compile_mir_aarch64_function(
         }
 
         // Generate function epilogue (must pass aligned_stack_size to restore SP)
-        let epilogue = encode_epilogue_aarch64(aligned_stack_size)?;
+        let epilogue = encode_epilogue(aligned_stack_size)?;
         code.extend_from_slice(&epilogue);
 
         // RET instruction (x30 is LR)
-        code.extend_from_slice(&encode_ret_aarch64(30)?);
+        code.extend_from_slice(&encode_ret(30)?);
     }
 
     // Patch BL fixups now that all functions have their final offsets.
@@ -530,7 +530,7 @@ pub fn compile_mir_aarch64_function(
 /// ldp Xt, Xt2, [Xn|SP], #imm
 
 /// Encode AArch64 prologue
-fn encode_prologue_aarch64(stack_size: usize) -> Result<Vec<u8>, RasError> {
+fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
 
     // stp x29, x30, [sp, #-16]!
@@ -566,7 +566,7 @@ fn encode_prologue_aarch64(stack_size: usize) -> Result<Vec<u8>, RasError> {
 
 /// Encode AArch64 epilogue
 /// Must restore SP before LDP (undo the SUB sp, sp, #aligned_size from prologue)
-fn encode_epilogue_aarch64(aligned_stack_size: usize) -> Result<Vec<u8>, RasError> {
+fn encode_epilogue(aligned_stack_size: usize) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
 
     if aligned_stack_size > 0 {
@@ -590,17 +590,17 @@ fn encode_epilogue_aarch64(aligned_stack_size: usize) -> Result<Vec<u8>, RasErro
     Ok(code)
 }
 
-fn encode_str_aarch64(src_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
-    let src = parse_register_aarch64(src_reg)?;
+fn encode_str(src_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
+    let src = parse_register(src_reg)?;
     encode_str_imm64(src, base_reg, offset)
 }
 
-fn encode_ldr_aarch64(dst_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
-    let dst = parse_register_aarch64(dst_reg)?;
+fn encode_ldr(dst_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
+    let dst = parse_register(dst_reg)?;
     encode_ldr_imm64(dst, base_reg, offset)
 }
 
-fn mir_scalar_ld_kind_aarch64(ty: &lamina_mir::MirType) -> Result<AArch64ScalarLdKind, RasError> {
+fn mir_scalar_ld_kind(ty: &lamina_mir::MirType) -> Result<AArch64ScalarLdKind, RasError> {
     match ty {
         MirType::Scalar(ScalarType::I1) => Ok(AArch64ScalarLdKind::I8U),
         MirType::Scalar(ScalarType::I8) => Ok(AArch64ScalarLdKind::I8S),
@@ -617,7 +617,7 @@ fn mir_scalar_ld_kind_aarch64(ty: &lamina_mir::MirType) -> Result<AArch64ScalarL
     }
 }
 
-fn mir_scalar_st_kind_aarch64(ty: &lamina_mir::MirType) -> Result<AArch64ScalarStKind, RasError> {
+fn mir_scalar_st_kind(ty: &lamina_mir::MirType) -> Result<AArch64ScalarStKind, RasError> {
     match ty {
         MirType::Scalar(ScalarType::I1 | ScalarType::I8) => Ok(AArch64ScalarStKind::I8),
         MirType::Scalar(ScalarType::I16) => Ok(AArch64ScalarStKind::I16),
@@ -633,31 +633,31 @@ fn mir_scalar_st_kind_aarch64(ty: &lamina_mir::MirType) -> Result<AArch64ScalarS
     }
 }
 
-fn encode_ldr_typed_aarch64(
+fn encode_ldr_typed(
     dst_reg: &str,
     base_reg: u8,
     offset: i32,
     ty: &lamina_mir::MirType,
 ) -> Result<Vec<u8>, RasError> {
-    let dst = parse_register_aarch64(dst_reg)?;
-    let kind = mir_scalar_ld_kind_aarch64(ty)?;
+    let dst = parse_register(dst_reg)?;
+    let kind = mir_scalar_ld_kind(ty)?;
     encode_ldr_scalar(dst, base_reg, offset, kind)
 }
 
-fn encode_str_typed_aarch64(
+fn encode_str_typed(
     src_reg: &str,
     base_reg: u8,
     offset: i32,
     ty: &lamina_mir::MirType,
 ) -> Result<Vec<u8>, RasError> {
-    let src = parse_register_aarch64(src_reg)?;
-    let kind = mir_scalar_st_kind_aarch64(ty)?;
+    let src = parse_register(src_reg)?;
+    let kind = mir_scalar_st_kind(ty)?;
     encode_str_scalar(src, base_reg, offset, kind)
 }
 
 /// Encode RET instruction (AArch64)
 /// RET Xn = 0xD65F0000 | (n << 5)
-fn encode_ret_aarch64(reg: u8) -> Result<Vec<u8>, RasError> {
+fn encode_ret(reg: u8) -> Result<Vec<u8>, RasError> {
     let instr: u32 = 0xD65F_0000 | ((reg as u32) << 5);
     Ok(instr.to_le_bytes().to_vec())
 }
@@ -665,24 +665,24 @@ fn encode_ret_aarch64(reg: u8) -> Result<Vec<u8>, RasError> {
 /// Encode BR instruction (AArch64)
 /// BR Xn = 0xD61F0000 | (n << 5)
 #[allow(dead_code)]
-fn encode_br_aarch64(reg: u8) -> Result<Vec<u8>, RasError> {
+fn encode_br(reg: u8) -> Result<Vec<u8>, RasError> {
     let instr: u32 = 0xD61F_0000 | ((reg as u32) << 5);
     Ok(instr.to_le_bytes().to_vec())
 }
 
 /// Encode BLR instruction (AArch64)
 /// BLR Xn = 0xD63F0000 | (n << 5)
-fn encode_blr_aarch64(reg: u8) -> Result<Vec<u8>, RasError> {
+fn encode_blr(reg: u8) -> Result<Vec<u8>, RasError> {
     let instr: u32 = 0xD63F_0000 | ((reg as u32) << 5);
     Ok(instr.to_le_bytes().to_vec())
 }
 
-fn encode_brk_aarch64(imm16: u16) -> Vec<u8> {
+fn encode_brk(imm16: u16) -> Vec<u8> {
     let w = 0xD420_0000u32 | (((imm16 as u32) & 0xFFFF) << 5);
     w.to_le_bytes().to_vec()
 }
 
-fn encode_nop_aarch64() -> Vec<u8> {
+fn encode_nop() -> Vec<u8> {
     0xD503_201Fu32.to_le_bytes().to_vec()
 }
 
@@ -716,8 +716,8 @@ fn aarch64_apply_i32_offset_to_reg(
         return Ok(());
     }
     let imm_reg_str = reg_alloc.alloc_scratch().unwrap_or("x14");
-    let imm_reg = parse_register_aarch64(imm_reg_str)?;
-    materialize_operand_aarch64(
+    let imm_reg = parse_register(imm_reg_str)?;
+    materialize_operand(
         assembler,
         &Operand::Immediate(Immediate::I64(o)),
         imm_reg,
@@ -726,7 +726,7 @@ fn aarch64_apply_i32_offset_to_reg(
         code,
         stack_size,
     )?;
-    code.extend_from_slice(&encode_add_rrr_aarch64(base_reg, base_reg, imm_reg));
+    code.extend_from_slice(&encode_add_rrr(base_reg, base_reg, imm_reg));
     reg_alloc.free_scratch(imm_reg_str);
     Ok(())
 }
@@ -738,7 +738,7 @@ fn aarch64_apply_i32_offset_to_reg(
 /// AND Xd, Xn, Xm (no shift)
 
 /// SBFM Xd, Xn, #immr, #imms (64-bit); used for sign-extension of low (imms+1) bits.
-fn encode_sbfm64_aarch64(rd: u8, rn: u8, immr: u8, imms: u8) -> Vec<u8> {
+fn encode_sbfm64(rd: u8, rn: u8, immr: u8, imms: u8) -> Vec<u8> {
     let w = 0x9340_0000u32
         | ((immr as u32) << 16)
         | ((imms as u32) << 10)
@@ -754,7 +754,7 @@ enum ShiftVKind {
 }
 
 /// LSLV / LSRV / ASRV Xd, Xn, Xm (64-bit variable shift; shift amount uses low 6 bits of Xm)
-fn encode_shiftv_aarch64(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
+fn encode_shiftv(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let op = match which {
         ShiftVKind::Lsl => 0x9AC02000u32,
         ShiftVKind::Lsr => 0x9AC02400u32,
@@ -789,12 +789,12 @@ fn aarch64_load_base_gpr(
                 RasError::EncodingError(format!("No stack slot for base register: {:?}", base))
             })?;
             let scratch = reg_alloc.alloc_scratch().unwrap_or("x11");
-            code.extend_from_slice(&encode_ldr_aarch64(scratch, 29, *base_offset)?);
-            let rn = parse_register_aarch64(scratch)?;
+            code.extend_from_slice(&encode_ldr(scratch, 29, *base_offset)?);
+            let rn = parse_register(scratch)?;
             Ok((rn, Some(scratch)))
         }
         Register::Physical(p) => {
-            let rn = parse_register_aarch64(p.name)?;
+            let rn = parse_register(p.name)?;
             Ok((rn, None))
         }
     }
@@ -820,19 +820,19 @@ fn aarch64_emit_indexed_address(
 
     let base_s = reg_alloc.alloc_scratch().unwrap_or("x13");
     let idx_s = reg_alloc.alloc_scratch().unwrap_or("x14");
-    let base_r = parse_register_aarch64(base_s)?;
-    let idx_r = parse_register_aarch64(idx_s)?;
-    let out_r = parse_register_aarch64(out_addr_scratch)?;
+    let base_r = parse_register(base_s)?;
+    let idx_r = parse_register(idx_s)?;
+    let out_r = parse_register(out_addr_scratch)?;
 
     match base {
         Register::Virtual(v) => {
             let off = stack_slots.get(v).ok_or_else(|| {
                 RasError::EncodingError("indexed address: missing base stack slot".into())
             })?;
-            code.extend_from_slice(&encode_ldr_aarch64(base_s, 29, *off)?);
+            code.extend_from_slice(&encode_ldr(base_s, 29, *off)?);
         }
         Register::Physical(p) => {
-            let br = parse_register_aarch64(p.name)?;
+            let br = parse_register(p.name)?;
             if br != base_r {
                 code.extend_from_slice(&mov_x_dst_src(base_r, br));
             }
@@ -844,10 +844,10 @@ fn aarch64_emit_indexed_address(
             let off = stack_slots.get(v).ok_or_else(|| {
                 RasError::EncodingError("indexed address: missing index stack slot".into())
             })?;
-            code.extend_from_slice(&encode_ldr_aarch64(idx_s, 29, *off)?);
+            code.extend_from_slice(&encode_ldr(idx_s, 29, *off)?);
         }
         Register::Physical(p) => {
-            let ir = parse_register_aarch64(p.name)?;
+            let ir = parse_register(p.name)?;
             if ir != idx_r {
                 code.extend_from_slice(&mov_x_dst_src(idx_r, ir));
             }
@@ -856,14 +856,14 @@ fn aarch64_emit_indexed_address(
 
     if log2_scale > 0 {
         let sh_s = reg_alloc.alloc_scratch().unwrap_or("x15");
-        let sh_r = parse_register_aarch64(sh_s)?;
+        let sh_r = parse_register(sh_s)?;
         let movz = 0xD280_0000u32 | (((log2_scale as u32) & 0xFFFF) << 5) | (sh_r as u32);
         code.extend_from_slice(&movz.to_le_bytes());
-        code.extend_from_slice(&encode_shiftv_aarch64(ShiftVKind::Lsl, idx_r, idx_r, sh_r));
+        code.extend_from_slice(&encode_shiftv(ShiftVKind::Lsl, idx_r, idx_r, sh_r));
         reg_alloc.free_scratch(sh_s);
     }
 
-    code.extend_from_slice(&encode_add_rrr_aarch64(out_r, base_r, idx_r));
+    code.extend_from_slice(&encode_add_rrr(out_r, base_r, idx_r));
 
     reg_alloc.free_scratch(base_s);
     reg_alloc.free_scratch(idx_s);
@@ -872,7 +872,7 @@ fn aarch64_emit_indexed_address(
 }
 
 /// Parse register name to encoding (AArch64)
-fn parse_register_aarch64(reg: &str) -> Result<u8, RasError> {
+fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {
         "x0" | "w0" => Ok(0),
@@ -920,7 +920,7 @@ fn parse_register_aarch64(reg: &str) -> Result<u8, RasError> {
 /// but generates binary instead of assembly text.
 #[cfg(feature = "encoder")]
 #[allow(dead_code)]
-fn encode_mir_instruction_aarch64(
+fn encode_mir_instruction(
     assembler: &mut RasAssembler,
     inst: &lamina_mir::Instruction,
     reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
@@ -962,7 +962,7 @@ fn encode_mir_instruction_aarch64_with_context(
         lamina_mir::Instruction::Ret { value } => {
             if let Some(v) = value {
                 if let Some(rt) = fn_ret_ty {
-                    materialize_return_value_aarch64(
+                    materialize_return_value(
                         assembler,
                         v,
                         rt,
@@ -972,7 +972,7 @@ fn encode_mir_instruction_aarch64_with_context(
                         stack_size,
                     )?;
                 } else {
-                    materialize_operand_aarch64(
+                    materialize_operand(
                         assembler,
                         v,
                         0,
@@ -994,15 +994,15 @@ fn encode_mir_instruction_aarch64_with_context(
             let lhs_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let rhs_reg_str = reg_alloc.alloc_scratch().unwrap_or("x11");
             let dst_reg_str = reg_alloc.alloc_scratch().unwrap_or("x12");
-            let lhs_reg = parse_register_aarch64(lhs_reg_str)?;
-            let rhs_reg = parse_register_aarch64(rhs_reg_str)?;
-            let dst_reg = parse_register_aarch64(dst_reg_str)?;
+            let lhs_reg = parse_register(lhs_reg_str)?;
+            let rhs_reg = parse_register(rhs_reg_str)?;
+            let dst_reg = parse_register(dst_reg_str)?;
 
             let unsigned_atom = matches!(op, IntBinOp::UDiv | IntBinOp::URem);
 
             match ty {
                 MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
-                    materialize_operand_aarch64(
+                    materialize_operand(
                         assembler,
                         lhs,
                         lhs_reg,
@@ -1011,7 +1011,7 @@ fn encode_mir_instruction_aarch64_with_context(
                         &mut code,
                         stack_size,
                     )?;
-                    materialize_operand_aarch64(
+                    materialize_operand(
                         assembler,
                         rhs,
                         rhs_reg,
@@ -1024,7 +1024,7 @@ fn encode_mir_instruction_aarch64_with_context(
                     match op {
                         IntBinOp::URem | IntBinOp::SRem => {
                             let quot_str = reg_alloc.alloc_scratch().unwrap_or("x14");
-                            let quot_reg = parse_register_aarch64(quot_str)?;
+                            let quot_reg = parse_register(quot_str)?;
                             let div_op = if matches!(op, IntBinOp::URem) {
                                 0x9AC0_0800u32
                             } else {
@@ -1035,13 +1035,13 @@ fn encode_mir_instruction_aarch64_with_context(
                                 | ((lhs_reg as u32) << 5)
                                 | (quot_reg as u32);
                             code.extend_from_slice(&div_inst.to_le_bytes());
-                            code.extend_from_slice(&encode_msub_aarch64(
+                            code.extend_from_slice(&encode_msub(
                                 dst_reg, quot_reg, rhs_reg, lhs_reg,
                             ));
                             reg_alloc.free_scratch(quot_str);
                         }
                         IntBinOp::Shl => {
-                            code.extend_from_slice(&encode_shiftv_aarch64(
+                            code.extend_from_slice(&encode_shiftv(
                                 ShiftVKind::Lsl,
                                 dst_reg,
                                 lhs_reg,
@@ -1049,7 +1049,7 @@ fn encode_mir_instruction_aarch64_with_context(
                             ));
                         }
                         IntBinOp::LShr => {
-                            code.extend_from_slice(&encode_shiftv_aarch64(
+                            code.extend_from_slice(&encode_shiftv(
                                 ShiftVKind::Lsr,
                                 dst_reg,
                                 lhs_reg,
@@ -1057,7 +1057,7 @@ fn encode_mir_instruction_aarch64_with_context(
                             ));
                         }
                         IntBinOp::AShr => {
-                            code.extend_from_slice(&encode_shiftv_aarch64(
+                            code.extend_from_slice(&encode_shiftv(
                                 ShiftVKind::Asr,
                                 dst_reg,
                                 lhs_reg,
@@ -1092,7 +1092,7 @@ fn encode_mir_instruction_aarch64_with_context(
                     if let Register::Virtual(vreg) = dst
                         && let Some(offset) = stack_slots.get(vreg)
                     {
-                        code.extend_from_slice(&encode_str_aarch64(dst_reg_str, 29, *offset)?);
+                        code.extend_from_slice(&encode_str(dst_reg_str, 29, *offset)?);
                     }
                 }
                 MirType::Scalar(
@@ -1124,7 +1124,7 @@ fn encode_mir_instruction_aarch64_with_context(
                     match op {
                         IntBinOp::URem | IntBinOp::SRem => {
                             let quot_str = reg_alloc.alloc_scratch().unwrap_or("x14");
-                            let quot_reg = parse_register_aarch64(quot_str)?;
+                            let quot_reg = parse_register(quot_str)?;
                             let div_op = if matches!(op, IntBinOp::URem) {
                                 0x1AC0_0800u32
                             } else {
@@ -1135,7 +1135,7 @@ fn encode_mir_instruction_aarch64_with_context(
                                 | ((lhs_reg as u32) << 5)
                                 | (quot_reg as u32);
                             code.extend_from_slice(&div_inst.to_le_bytes());
-                            code.extend_from_slice(&encode_msub_aarch64_w(
+                            code.extend_from_slice(&encode_msub_w(
                                 dst_reg, quot_reg, rhs_reg, lhs_reg,
                             ));
                             reg_alloc.free_scratch(quot_str);
@@ -1191,9 +1191,9 @@ fn encode_mir_instruction_aarch64_with_context(
 
                     if matches!(ty, MirType::Scalar(ScalarType::I1)) {
                         let mask_str = reg_alloc.alloc_scratch().unwrap_or("x13");
-                        let mask_reg = parse_register_aarch64(mask_str)?;
-                        code.extend_from_slice(&mov_imm_to_w_aarch64(mask_reg, 1));
-                        code.extend_from_slice(&encode_and_w_rrr_aarch64(
+                        let mask_reg = parse_register(mask_str)?;
+                        code.extend_from_slice(&mov_imm_to_w(mask_reg, 1));
+                        code.extend_from_slice(&encode_and_w_rrr(
                             dst_reg, dst_reg, mask_reg,
                         ));
                         reg_alloc.free_scratch(mask_str);
@@ -1202,7 +1202,7 @@ fn encode_mir_instruction_aarch64_with_context(
                     if let Register::Virtual(vreg) = dst
                         && let Some(offset) = stack_slots.get(vreg)
                     {
-                        code.extend_from_slice(&encode_str_typed_aarch64(
+                        code.extend_from_slice(&encode_str_typed(
                             dst_reg_str,
                             29,
                             *offset,
@@ -1234,7 +1234,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 AddressMode::BaseOffset { base, offset } => {
                     let (base_reg, opt_scratch) =
                         aarch64_load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
-                    code.extend_from_slice(&encode_ldr_typed_aarch64(
+                    code.extend_from_slice(&encode_ldr_typed(
                         tmp_reg_str,
                         base_reg,
                         i32::from(*offset),
@@ -1274,8 +1274,8 @@ fn encode_mir_instruction_aarch64_with_context(
                         stack_size,
                         addr_scratch,
                     )?;
-                    let addr_reg = parse_register_aarch64(addr_scratch)?;
-                    code.extend_from_slice(&encode_ldr_typed_aarch64(
+                    let addr_reg = parse_register(addr_scratch)?;
+                    code.extend_from_slice(&encode_ldr_typed(
                         tmp_reg_str,
                         addr_reg,
                         i32::from(*offset),
@@ -1286,10 +1286,10 @@ fn encode_mir_instruction_aarch64_with_context(
             }
 
             if matches!(ty, MirType::Scalar(ScalarType::I1)) {
-                let tmp_r = parse_register_aarch64(tmp_reg_str)?;
+                let tmp_r = parse_register(tmp_reg_str)?;
                 let m_str = reg_alloc.alloc_scratch().unwrap_or("x14");
-                let m_r = parse_register_aarch64(m_str)?;
-                materialize_operand_aarch64(
+                let m_r = parse_register(m_str)?;
+                materialize_operand(
                     assembler,
                     &Operand::Immediate(lamina_mir::Immediate::I64(1)),
                     m_r,
@@ -1298,14 +1298,14 @@ fn encode_mir_instruction_aarch64_with_context(
                     &mut code,
                     stack_size,
                 )?;
-                code.extend_from_slice(&encode_and_rrr_aarch64(tmp_r, tmp_r, m_r));
+                code.extend_from_slice(&encode_and_rrr(tmp_r, tmp_r, m_r));
                 reg_alloc.free_scratch(m_str);
             }
 
             if let Register::Virtual(vreg) = dst
                 && let Some(offset) = stack_slots.get(vreg)
             {
-                code.extend_from_slice(&encode_str_aarch64(tmp_reg_str, 29, *offset)?);
+                code.extend_from_slice(&encode_str(tmp_reg_str, 29, *offset)?);
             }
 
             reg_alloc.free_scratch(tmp_reg_str);
@@ -1313,9 +1313,9 @@ fn encode_mir_instruction_aarch64_with_context(
         lamina_mir::Instruction::Store { src, addr, ty, .. } => {
             // Store from source to memory address
             let src_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
-            let src_reg = parse_register_aarch64(src_reg_str)?;
+            let src_reg = parse_register(src_reg_str)?;
 
-            materialize_operand_aarch64(
+            materialize_operand(
                 assembler,
                 src,
                 src_reg,
@@ -1329,7 +1329,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 AddressMode::BaseOffset { base, offset } => {
                     let (base_reg, opt_scratch) =
                         aarch64_load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
-                    code.extend_from_slice(&encode_str_typed_aarch64(
+                    code.extend_from_slice(&encode_str_typed(
                         src_reg_str,
                         base_reg,
                         i32::from(*offset),
@@ -1369,8 +1369,8 @@ fn encode_mir_instruction_aarch64_with_context(
                         stack_size,
                         addr_scratch,
                     )?;
-                    let addr_reg = parse_register_aarch64(addr_scratch)?;
-                    code.extend_from_slice(&encode_str_typed_aarch64(
+                    let addr_reg = parse_register(addr_scratch)?;
+                    code.extend_from_slice(&encode_str_typed(
                         src_reg_str,
                         addr_reg,
                         i32::from(*offset),
@@ -1384,8 +1384,8 @@ fn encode_mir_instruction_aarch64_with_context(
         }
         lamina_mir::Instruction::Lea { dst, base, offset } => {
             let base_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
-            let base_reg = parse_register_aarch64(base_reg_str)?;
-            materialize_operand_aarch64(
+            let base_reg = parse_register(base_reg_str)?;
+            materialize_operand(
                 assembler,
                 &Operand::Register(base.clone()),
                 base_reg,
@@ -1406,7 +1406,7 @@ fn encode_mir_instruction_aarch64_with_context(
             if let Register::Virtual(vreg) = dst
                 && let Some(slot_off) = stack_slots.get(vreg)
             {
-                code.extend_from_slice(&encode_str_aarch64(base_reg_str, 29, *slot_off)?);
+                code.extend_from_slice(&encode_str(base_reg_str, 29, *slot_off)?);
             }
             reg_alloc.free_scratch(base_reg_str);
         }
@@ -1421,11 +1421,11 @@ fn encode_mir_instruction_aarch64_with_context(
             let f_str = reg_alloc.alloc_scratch().unwrap_or("x11");
             let c_str = reg_alloc.alloc_scratch().unwrap_or("x12");
             let d_str = reg_alloc.alloc_scratch().unwrap_or("x13");
-            let t_reg = parse_register_aarch64(t_str)?;
-            let f_reg = parse_register_aarch64(f_str)?;
-            let c_reg = parse_register_aarch64(c_str)?;
-            let d_reg = parse_register_aarch64(d_str)?;
-            materialize_operand_aarch64(
+            let t_reg = parse_register(t_str)?;
+            let f_reg = parse_register(f_str)?;
+            let c_reg = parse_register(c_str)?;
+            let d_reg = parse_register(d_str)?;
+            materialize_operand(
                 assembler,
                 false_val,
                 f_reg,
@@ -1434,7 +1434,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 &mut code,
                 stack_size,
             )?;
-            materialize_operand_aarch64(
+            materialize_operand(
                 assembler,
                 true_val,
                 t_reg,
@@ -1443,7 +1443,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 &mut code,
                 stack_size,
             )?;
-            materialize_operand_aarch64(
+            materialize_operand(
                 assembler,
                 &Operand::Register(cond.clone()),
                 c_reg,
@@ -1463,7 +1463,7 @@ fn encode_mir_instruction_aarch64_with_context(
             if let Register::Virtual(vreg) = dst
                 && let Some(slot_off) = stack_slots.get(vreg)
             {
-                code.extend_from_slice(&encode_str_aarch64(d_str, 29, *slot_off)?);
+                code.extend_from_slice(&encode_str(d_str, 29, *slot_off)?);
             }
             reg_alloc.free_scratch(t_str);
             reg_alloc.free_scratch(f_str);
@@ -1471,10 +1471,10 @@ fn encode_mir_instruction_aarch64_with_context(
             reg_alloc.free_scratch(d_str);
         }
         lamina_mir::Instruction::Unreachable => {
-            code.extend_from_slice(&encode_brk_aarch64(0));
+            code.extend_from_slice(&encode_brk(0));
         }
         lamina_mir::Instruction::SafePoint => {
-            code.extend_from_slice(&encode_nop_aarch64());
+            code.extend_from_slice(&encode_nop());
         }
         lamina_mir::Instruction::Comment { .. }
         | lamina_mir::Instruction::StackMap { .. }
@@ -1489,11 +1489,11 @@ fn encode_mir_instruction_aarch64_with_context(
             let lhs_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let rhs_reg_str = reg_alloc.alloc_scratch().unwrap_or("x11");
             let dst_reg_str = reg_alloc.alloc_scratch().unwrap_or("x12");
-            let lhs_reg = parse_register_aarch64(lhs_reg_str)?;
-            let rhs_reg = parse_register_aarch64(rhs_reg_str)?;
-            let dst_reg = parse_register_aarch64(dst_reg_str)?;
+            let lhs_reg = parse_register(lhs_reg_str)?;
+            let rhs_reg = parse_register(rhs_reg_str)?;
+            let dst_reg = parse_register(dst_reg_str)?;
 
-            materialize_operand_aarch64(
+            materialize_operand(
                 assembler,
                 lhs,
                 lhs_reg,
@@ -1502,7 +1502,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 &mut code,
                 stack_size,
             )?;
-            materialize_operand_aarch64(
+            materialize_operand(
                 assembler,
                 rhs,
                 rhs_reg,
@@ -1556,13 +1556,13 @@ fn encode_mir_instruction_aarch64_with_context(
                     IntCmpOp::SLt | IntCmpOp::SLe | IntCmpOp::SGt | IntCmpOp::SGe
                 );
                 if signed_cmp {
-                    code.extend_from_slice(&encode_sbfm64_aarch64(lhs_reg, lhs_reg, 0, imms));
-                    code.extend_from_slice(&encode_sbfm64_aarch64(rhs_reg, rhs_reg, 0, imms));
+                    code.extend_from_slice(&encode_sbfm64(lhs_reg, lhs_reg, 0, imms));
+                    code.extend_from_slice(&encode_sbfm64(rhs_reg, rhs_reg, 0, imms));
                 } else {
                     let mask_reg_str = reg_alloc.alloc_scratch().unwrap_or("x14");
-                    let mask_reg = parse_register_aarch64(mask_reg_str)?;
+                    let mask_reg = parse_register(mask_reg_str)?;
                     let mask_u64 = (1u64 << u32::from(bits)) - 1;
-                    materialize_operand_aarch64(
+                    materialize_operand(
                         assembler,
                         &Operand::Immediate(Immediate::I64(mask_u64 as i64)),
                         mask_reg,
@@ -1571,8 +1571,8 @@ fn encode_mir_instruction_aarch64_with_context(
                         &mut code,
                         stack_size,
                     )?;
-                    code.extend_from_slice(&encode_and_rrr_aarch64(lhs_reg, lhs_reg, mask_reg));
-                    code.extend_from_slice(&encode_and_rrr_aarch64(rhs_reg, rhs_reg, mask_reg));
+                    code.extend_from_slice(&encode_and_rrr(lhs_reg, lhs_reg, mask_reg));
+                    code.extend_from_slice(&encode_and_rrr(rhs_reg, rhs_reg, mask_reg));
                     reg_alloc.free_scratch(mask_reg_str);
                 }
             }
@@ -1608,7 +1608,7 @@ fn encode_mir_instruction_aarch64_with_context(
             if let Register::Virtual(vreg) = dst
                 && let Some(offset) = stack_slots.get(vreg)
             {
-                code.extend_from_slice(&encode_str_typed_aarch64(dst_reg_str, 29, *offset, ty)?);
+                code.extend_from_slice(&encode_str_typed(dst_reg_str, 29, *offset, ty)?);
             }
 
             reg_alloc.free_scratch(lhs_reg_str);
@@ -1622,8 +1622,8 @@ fn encode_mir_instruction_aarch64_with_context(
             let arg_regs = AArch64ABI::ARG_REGISTERS;
             for (i, arg) in args.iter().enumerate().take(8) {
                 let arg_reg_str = arg_regs[i];
-                let arg_reg = parse_register_aarch64(arg_reg_str)?;
-                materialize_operand_aarch64(
+                let arg_reg = parse_register(arg_reg_str)?;
+                materialize_operand(
                     assembler,
                     arg,
                     arg_reg,
@@ -1653,8 +1653,8 @@ fn encode_mir_instruction_aarch64_with_context(
                 for (i, arg) in stack_args.iter().enumerate() {
                     let offset = i * 8;
                     let scratch_str = reg_alloc.alloc_scratch().unwrap_or("x9");
-                    let scratch = parse_register_aarch64(scratch_str)?;
-                    materialize_operand_aarch64(
+                    let scratch = parse_register(scratch_str)?;
+                    materialize_operand(
                         assembler,
                         arg,
                         scratch,
@@ -1664,7 +1664,7 @@ fn encode_mir_instruction_aarch64_with_context(
                         stack_size,
                     )?;
 
-                    code.extend_from_slice(&encode_str_aarch64(
+                    code.extend_from_slice(&encode_str(
                         scratch_str,
                         31, // sp
                         offset as i32,
@@ -1741,7 +1741,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 code.extend_from_slice(&sub_sp.to_le_bytes());
 
                 // Spill the variadic integer argument to the home area at [sp].
-                materialize_operand_aarch64(
+                materialize_operand(
                     assembler,
                     &args[0],
                     8, // x8
@@ -1750,11 +1750,11 @@ fn encode_mir_instruction_aarch64_with_context(
                     &mut code,
                     stack_size,
                 )?;
-                code.extend_from_slice(&encode_str_aarch64("x8", 31, 0)?);
+                code.extend_from_slice(&encode_str("x8", 31, 0)?);
 
                 // Load format string pointer into x0.
                 let fmt_ptr = PRINT_I64_FORMAT.as_ptr() as u64;
-                materialize_operand_aarch64(
+                materialize_operand(
                     assembler,
                     &lamina_mir::Operand::Immediate(lamina_mir::Immediate::I64(fmt_ptr as i64)),
                     0, // x0
@@ -1765,7 +1765,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 )?;
 
                 // Load printf address into x16 and call via BLR.
-                materialize_operand_aarch64(
+                materialize_operand(
                     assembler,
                     &lamina_mir::Operand::Immediate(lamina_mir::Immediate::I64(printf_addr as i64)),
                     16, // x16
@@ -1774,7 +1774,7 @@ fn encode_mir_instruction_aarch64_with_context(
                     &mut code,
                     stack_size,
                 )?;
-                code.extend_from_slice(&encode_blr_aarch64(16)?);
+                code.extend_from_slice(&encode_blr(16)?);
 
                 // Restore SP.
                 let add_sp = 0x9100_03FFu32 | ((home_area_size & 0xFFF) << 10);
@@ -1811,7 +1811,7 @@ fn encode_mir_instruction_aarch64_with_context(
                     && let Register::Virtual(vreg) = dst
                     && let Some(offset) = stack_slots.get(vreg)
                 {
-                    code.extend_from_slice(&encode_str_aarch64(
+                    code.extend_from_slice(&encode_str(
                         "x0", 29, // x29 (FP)
                         *offset,
                     )?);
@@ -1858,7 +1858,7 @@ fn aarch64_narrow_imm_i64(bits: u8, raw: i64, signed_style: bool) -> i64 {
 }
 
 #[cfg(feature = "encoder")]
-fn mov_imm_to_w_aarch64(dst: u8, v: i32) -> Vec<u8> {
+fn mov_imm_to_w(dst: u8, v: i32) -> Vec<u8> {
     let u = v as u32;
     let lo = u & 0xFFFF;
     let hi = (u >> 16) & 0xFFFF;
@@ -1917,7 +1917,7 @@ fn materialize_scalar_operand_aarch64_int_binary(
                     ));
                 }
             };
-            code.extend_from_slice(&mov_imm_to_w_aarch64(dst_reg, v));
+            code.extend_from_slice(&mov_imm_to_w(dst_reg, v));
         }
         Operand::Register(Register::Virtual(vreg)) => {
             let off = stack_slots.get(vreg).copied().ok_or_else(|| {
@@ -1930,7 +1930,7 @@ fn materialize_scalar_operand_aarch64_int_binary(
                     ));
                 }
                 MirType::Scalar(_) => {
-                    code.extend_from_slice(&encode_ldr_typed_aarch64(&dst_w, 29, off, ty)?);
+                    code.extend_from_slice(&encode_ldr_typed(&dst_w, 29, off, ty)?);
                 }
                 _ => {
                     return Err(RasError::EncodingError(format!(
@@ -1951,7 +1951,7 @@ fn materialize_scalar_operand_aarch64_int_binary(
 
 /// Place the return value in `x0` per AAPCS64 (narrow integers are sign-extended in `x0`).
 #[cfg(feature = "encoder")]
-fn materialize_return_value_aarch64(
+fn materialize_return_value(
     assembler: &mut RasAssembler,
     op: &lamina_mir::Operand,
     ret_ty: &lamina_mir::MirType,
@@ -1967,13 +1967,13 @@ fn materialize_return_value_aarch64(
             })?;
             match ret_ty {
                 MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
-                    code.extend_from_slice(&encode_ldr_typed_aarch64("x0", 29, offset, ret_ty)?);
+                    code.extend_from_slice(&encode_ldr_typed("x0", 29, offset, ret_ty)?);
                 }
                 MirType::Scalar(
                     ScalarType::I32 | ScalarType::I16 | ScalarType::I8 | ScalarType::I1,
                 ) => {
-                    code.extend_from_slice(&encode_ldr_typed_aarch64("w0", 29, offset, ret_ty)?);
-                    code.extend_from_slice(&encode_sbfm64_aarch64(0, 0, 0, 31));
+                    code.extend_from_slice(&encode_ldr_typed("w0", 29, offset, ret_ty)?);
+                    code.extend_from_slice(&encode_sbfm64(0, 0, 0, 31));
                 }
                 _ => {
                     return Err(RasError::EncodingError(format!(
@@ -1985,7 +1985,7 @@ fn materialize_return_value_aarch64(
             Ok(())
         }
         Operand::Immediate(_) | Operand::Register(Register::Physical(_)) => {
-            materialize_operand_aarch64(assembler, op, 0, stack_slots, reg_alloc, code, stack_size)
+            materialize_operand(assembler, op, 0, stack_slots, reg_alloc, code, stack_size)
         }
     }
 }
@@ -1993,7 +1993,7 @@ fn materialize_return_value_aarch64(
 /// Materialize an operand into a register (AArch64)
 /// Loads from stack slot if operand is a virtual register, or moves immediate
 #[cfg(feature = "encoder")]
-fn materialize_operand_aarch64(
+fn materialize_operand(
     _assembler: &mut RasAssembler,
     op: &lamina_mir::Operand,
     dst_reg: u8,
@@ -2054,7 +2054,7 @@ fn materialize_operand_aarch64(
             // FrameMap stack slots are FP-relative offsets (negative for locals).
             if let Some(offset) = stack_slots.get(vreg) {
                 let dst_reg_str = format!("x{}", dst_reg);
-                code.extend_from_slice(&encode_ldr_aarch64(
+                code.extend_from_slice(&encode_ldr(
                     &dst_reg_str,
                     29, // x29 (FP)
                     *offset,

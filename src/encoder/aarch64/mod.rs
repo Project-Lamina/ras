@@ -163,7 +163,7 @@ impl AArch64Encoder {
                     }
                     0x1100_0000 | sf | flags | ((imm as u32) << 10) | (rn << 5) | rd
                 } else if op == "add" && wide {
-                    return Ok(encode_add_rrr_aarch64(
+                    return Ok(encode_add_rrr(
                         rd as u8,
                         rn as u8,
                         register(operand)?,
@@ -179,17 +179,17 @@ impl AArch64Encoder {
             }
             "and" => {
                 return Ok(if wide {
-                    encode_and_rrr_aarch64(r(0)? as u8, r(1)? as u8, r(2)? as u8)
+                    encode_and_rrr(r(0)? as u8, r(1)? as u8, r(2)? as u8)
                 } else {
-                    encode_and_w_rrr_aarch64(r(0)? as u8, r(1)? as u8, r(2)? as u8)
+                    encode_and_w_rrr(r(0)? as u8, r(1)? as u8, r(2)? as u8)
                 });
             }
             "mul" => rrr(0x1b00_7c00)?,
             "msub" => {
                 return Ok(if wide {
-                    encode_msub_aarch64(r(0)? as u8, r(1)? as u8, r(2)? as u8, r(3)? as u8)
+                    encode_msub(r(0)? as u8, r(1)? as u8, r(2)? as u8, r(3)? as u8)
                 } else {
-                    encode_msub_aarch64_w(r(0)? as u8, r(1)? as u8, r(2)? as u8, r(3)? as u8)
+                    encode_msub_w(r(0)? as u8, r(1)? as u8, r(2)? as u8, r(3)? as u8)
                 });
             }
             "sdiv" => rrr(0x1ac0_0c00)?,
