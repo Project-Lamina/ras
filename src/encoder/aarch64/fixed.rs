@@ -40,7 +40,7 @@ pub(crate) fn enc_ldp_post_64(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> Result
     Ok(0xA8C0_0000 | (imm7_bits << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | (rt as u32))
 }
 
-pub(crate) fn encode_msub_aarch64(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
+pub(crate) fn encode_msub(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
     let w = 0x9B008000u32
         | ((rm as u32) << 16)
         | ((ra as u32) << 10)
@@ -49,17 +49,17 @@ pub(crate) fn encode_msub_aarch64(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
     w.to_le_bytes().to_vec()
 }
 
-pub(crate) fn encode_add_rrr_aarch64(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
+pub(crate) fn encode_add_rrr(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let w = 0x8B000000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
 }
 
-pub(crate) fn encode_and_rrr_aarch64(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
+pub(crate) fn encode_and_rrr(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let w = 0x8A000000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
 }
 
-pub(crate) fn encode_msub_aarch64_w(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
+pub(crate) fn encode_msub_w(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
     let w = 0x1B00_8000u32
         | ((rm as u32) << 16)
         | ((ra as u32) << 10)
@@ -68,7 +68,7 @@ pub(crate) fn encode_msub_aarch64_w(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
     w.to_le_bytes().to_vec()
 }
 
-pub(crate) fn encode_and_w_rrr_aarch64(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
+pub(crate) fn encode_and_w_rrr(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let w = 0x0A00_0000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
 }
