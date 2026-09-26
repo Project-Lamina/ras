@@ -230,7 +230,7 @@ pub fn compile_mir_aarch64_function(
                     )));
                 }
                 let current_offset = code.len();
-                let inst_bytes = encode_mir_instruction_aarch64_with_context(
+                let inst_bytes = encode_mir_instruction_with_context(
                     assembler,
                     inst,
                     &mut reg_alloc,
@@ -687,7 +687,7 @@ fn encode_nop() -> Vec<u8> {
 }
 
 #[cfg(feature = "encoder")]
-fn aarch64_apply_i32_offset_to_reg(
+fn apply_i32_offset_to_reg(
     assembler: &mut RasAssembler,
     reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
     stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
@@ -766,7 +766,7 @@ fn encode_shiftv(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
 
 /// MSUB Wd, Wn, Wm, Wa
 
-fn encode_shiftv_aarch64_w(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
+fn encode_shiftv_w(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let op = match which {
         ShiftVKind::Lsl => 0x1AC0_2000u32,
         ShiftVKind::Lsr => 0x1AC0_2400u32,
@@ -777,7 +777,7 @@ fn encode_shiftv_aarch64_w(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8>
 }
 
 #[cfg(feature = "encoder")]
-fn aarch64_load_base_gpr(
+fn load_base_gpr(
     base: &lamina_mir::Register,
     stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
     reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
@@ -802,7 +802,7 @@ fn aarch64_load_base_gpr(
 
 #[cfg(feature = "encoder")]
 #[allow(clippy::too_many_arguments)]
-fn aarch64_emit_indexed_address(
+fn emit_indexed_address(
     _assembler: &mut RasAssembler,
     base: &lamina_mir::Register,
     index: &lamina_mir::Register,
@@ -929,7 +929,7 @@ fn encode_mir_instruction(
     func_name: &str,
 ) -> Result<Vec<u8>, RasError> {
     let mut bl_fixups = Vec::<BlFixup>::new();
-    encode_mir_instruction_aarch64_with_context(
+    encode_mir_instruction_with_context(
         assembler,
         inst,
         reg_alloc,
@@ -944,7 +944,7 @@ fn encode_mir_instruction(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_mir_instruction_aarch64_with_context(
+fn encode_mir_instruction_with_context(
     assembler: &mut RasAssembler,
     inst: &lamina_mir::Instruction,
     reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
@@ -1098,7 +1098,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 MirType::Scalar(
                     ScalarType::I32 | ScalarType::I16 | ScalarType::I8 | ScalarType::I1,
                 ) => {
-                    materialize_scalar_operand_aarch64_int_binary(
+                    materialize_scalar_operand_int_binary(
                         assembler,
                         lhs,
                         lhs_reg,
@@ -1109,7 +1109,7 @@ fn encode_mir_instruction_aarch64_with_context(
                         &mut code,
                         stack_size,
                     )?;
-                    materialize_scalar_operand_aarch64_int_binary(
+                    materialize_scalar_operand_int_binary(
                         assembler,
                         rhs,
                         rhs_reg,
@@ -1141,7 +1141,7 @@ fn encode_mir_instruction_aarch64_with_context(
                             reg_alloc.free_scratch(quot_str);
                         }
                         IntBinOp::Shl => {
-                            code.extend_from_slice(&encode_shiftv_aarch64_w(
+                            code.extend_from_slice(&encode_shiftv_w(
                                 ShiftVKind::Lsl,
                                 dst_reg,
                                 lhs_reg,
@@ -1149,7 +1149,7 @@ fn encode_mir_instruction_aarch64_with_context(
                             ));
                         }
                         IntBinOp::LShr => {
-                            code.extend_from_slice(&encode_shiftv_aarch64_w(
+                            code.extend_from_slice(&encode_shiftv_w(
                                 ShiftVKind::Lsr,
                                 dst_reg,
                                 lhs_reg,
@@ -1157,7 +1157,7 @@ fn encode_mir_instruction_aarch64_with_context(
                             ));
                         }
                         IntBinOp::AShr => {
-                            code.extend_from_slice(&encode_shiftv_aarch64_w(
+                            code.extend_from_slice(&encode_shiftv_w(
                                 ShiftVKind::Asr,
                                 dst_reg,
                                 lhs_reg,
@@ -1233,7 +1233,7 @@ fn encode_mir_instruction_aarch64_with_context(
             match addr {
                 AddressMode::BaseOffset { base, offset } => {
                     let (base_reg, opt_scratch) =
-                        aarch64_load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
+                        load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
                     code.extend_from_slice(&encode_ldr_typed(
                         tmp_reg_str,
                         base_reg,
@@ -1263,7 +1263,7 @@ fn encode_mir_instruction_aarch64_with_context(
                         }
                     };
                     let addr_scratch = reg_alloc.alloc_scratch().unwrap_or("x12");
-                    aarch64_emit_indexed_address(
+                    emit_indexed_address(
                         assembler,
                         base,
                         index,
@@ -1328,7 +1328,7 @@ fn encode_mir_instruction_aarch64_with_context(
             match addr {
                 AddressMode::BaseOffset { base, offset } => {
                     let (base_reg, opt_scratch) =
-                        aarch64_load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
+                        load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
                     code.extend_from_slice(&encode_str_typed(
                         src_reg_str,
                         base_reg,
@@ -1358,7 +1358,7 @@ fn encode_mir_instruction_aarch64_with_context(
                         }
                     };
                     let addr_scratch = reg_alloc.alloc_scratch().unwrap_or("x12");
-                    aarch64_emit_indexed_address(
+                    emit_indexed_address(
                         assembler,
                         base,
                         index,
@@ -1394,7 +1394,7 @@ fn encode_mir_instruction_aarch64_with_context(
                 &mut code,
                 stack_size,
             )?;
-            aarch64_apply_i32_offset_to_reg(
+            apply_i32_offset_to_reg(
                 assembler,
                 reg_alloc,
                 stack_slots,
@@ -1842,7 +1842,7 @@ fn encode_mir_instruction_aarch64_with_context(
 }
 
 #[cfg(feature = "encoder")]
-fn aarch64_narrow_imm_i64(bits: u8, raw: i64, signed_style: bool) -> i64 {
+fn narrow_imm_i64(bits: u8, raw: i64, signed_style: bool) -> i64 {
     if bits == 0 || bits >= 64 {
         return raw;
     }
@@ -1875,7 +1875,7 @@ fn mov_imm_to_w(dst: u8, v: i32) -> Vec<u8> {
 /// Narrow integer scalar operands for W-width `IntBinary` (I32 / I16 / I8 / I1).
 #[cfg(feature = "encoder")]
 #[allow(clippy::too_many_arguments)]
-fn materialize_scalar_operand_aarch64_int_binary(
+fn materialize_scalar_operand_int_binary(
     _assembler: &mut RasAssembler,
     op: &lamina_mir::Operand,
     dst_reg: u8,
@@ -1905,10 +1905,10 @@ fn materialize_scalar_operand_aarch64_int_binary(
             let v: i32 = match ty {
                 MirType::Scalar(ScalarType::I32) => raw as i32,
                 MirType::Scalar(ScalarType::I16) => {
-                    aarch64_narrow_imm_i64(16, raw, signed_style) as i32
+                    narrow_imm_i64(16, raw, signed_style) as i32
                 }
                 MirType::Scalar(ScalarType::I8) => {
-                    aarch64_narrow_imm_i64(8, raw, signed_style) as i32
+                    narrow_imm_i64(8, raw, signed_style) as i32
                 }
                 MirType::Scalar(ScalarType::I1) => (raw & 1) as i32,
                 _ => {
