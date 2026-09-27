@@ -1445,15 +1445,15 @@ mod x86_64_jit_inst_tests {
         let out = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("t")
             .with_params(vec![
-                Parameter::new(a.clone(), i32_ty.clone()),
-                Parameter::new(b.clone(), i32_ty.clone()),
+                Parameter::new(a.clone(), i32_ty),
+                Parameter::new(b.clone(), i32_ty),
             ])
-            .with_return(i32_ty.clone());
+            .with_return(i32_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op,
-            ty: i32_ty.clone(),
+            ty: i32_ty,
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
             rhs: Operand::Register(b.clone()),
@@ -1478,15 +1478,15 @@ mod x86_64_jit_inst_tests {
         let out = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("t")
             .with_params(vec![
-                Parameter::new(a.clone(), i64_ty.clone()),
-                Parameter::new(b.clone(), i64_ty.clone()),
+                Parameter::new(a.clone(), i64_ty),
+                Parameter::new(b.clone(), i64_ty),
             ])
-            .with_return(i64_ty.clone());
+            .with_return(i64_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op,
-            ty: i64_ty.clone(),
+            ty: i64_ty,
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
             rhs: Operand::Register(b.clone()),
@@ -1533,8 +1533,8 @@ mod x86_64_jit_inst_tests {
         let lea_v = Register::Virtual(VirtualReg::gpr(1));
         let sel_v = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("mix")
-            .with_params(vec![Parameter::new(base_v.clone(), i64_ty.clone())])
-            .with_return(i64_ty.clone());
+            .with_params(vec![Parameter::new(base_v.clone(), i64_ty)])
+            .with_return(i64_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::Lea {
@@ -1543,7 +1543,7 @@ mod x86_64_jit_inst_tests {
             offset: -8,
         });
         entry.push(Instruction::Select {
-            ty: i64_ty.clone(),
+            ty: i64_ty,
             dst: sel_v.clone(),
             cond: lea_v.clone(),
             true_val: Operand::Immediate(Immediate::I64(1)),
@@ -1571,7 +1571,7 @@ mod x86_64_jit_inst_tests {
     #[test]
     fn compile_mir_x86_64_unreachable_terminator_skips_ret() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
-        let sig = Signature::new("ud2_fn").with_return(i64_ty.clone());
+        let sig = Signature::new("ud2_fn").with_return(i64_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::Unreachable);
@@ -1599,10 +1599,10 @@ mod x86_64_jit_inst_tests {
         let out = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("cmp32")
             .with_params(vec![
-                Parameter::new(a.clone(), i32_ty.clone()),
-                Parameter::new(b.clone(), i32_ty.clone()),
+                Parameter::new(a.clone(), i32_ty),
+                Parameter::new(b.clone(), i32_ty),
             ])
-            .with_return(i64_ty.clone());
+            .with_return(i64_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::Comment {
@@ -1610,7 +1610,7 @@ mod x86_64_jit_inst_tests {
         });
         entry.push(Instruction::IntCmp {
             op: IntCmpOp::ULt,
-            ty: i32_ty.clone(),
+            ty: i32_ty,
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
             rhs: Operand::Register(b.clone()),
@@ -1642,15 +1642,15 @@ mod x86_64_jit_inst_tests {
         let out = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("add32")
             .with_params(vec![
-                Parameter::new(a.clone(), i32_ty.clone()),
-                Parameter::new(b.clone(), i32_ty.clone()),
+                Parameter::new(a.clone(), i32_ty),
+                Parameter::new(b.clone(), i32_ty),
             ])
-            .with_return(i32_ty.clone());
+            .with_return(i32_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op: IntBinOp::Add,
-            ty: i32_ty.clone(),
+            ty: i32_ty,
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
             rhs: Operand::Register(b.clone()),
@@ -1733,15 +1733,15 @@ mod x86_64_jit_inst_tests {
         let out = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("add8")
             .with_params(vec![
-                Parameter::new(a.clone(), i8_ty.clone()),
-                Parameter::new(b.clone(), i8_ty.clone()),
+                Parameter::new(a.clone(), i8_ty),
+                Parameter::new(b.clone(), i8_ty),
             ])
-            .with_return(i8_ty.clone());
+            .with_return(i8_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op: IntBinOp::Add,
-            ty: i8_ty.clone(),
+            ty: i8_ty,
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
             rhs: Operand::Register(b.clone()),

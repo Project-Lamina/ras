@@ -442,12 +442,12 @@ mod jit_host_exec_tests {
     fn module_scalar_binop(scalar: ScalarType, op: IntBinOp, lhs: Operand, rhs: Operand) -> Module {
         let ty = MirType::Scalar(scalar);
         let out = Register::Virtual(VirtualReg::gpr(0));
-        let sig = Signature::new("f").with_return(ty.clone());
+        let sig = Signature::new("f").with_return(ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op,
-            ty: ty.clone(),
+            ty,
             dst: out.clone(),
             lhs,
             rhs,
@@ -468,15 +468,15 @@ mod jit_host_exec_tests {
         let out = Register::Virtual(VirtualReg::gpr(2));
         let sig = Signature::new("g")
             .with_params(vec![
-                Parameter::new(a.clone(), i64_ty.clone()),
-                Parameter::new(b.clone(), i64_ty.clone()),
+                Parameter::new(a.clone(), i64_ty),
+                Parameter::new(b.clone(), i64_ty),
             ])
-            .with_return(i64_ty.clone());
+            .with_return(i64_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
             op,
-            ty: i64_ty.clone(),
+            ty: i64_ty,
             dst: out.clone(),
             lhs: Operand::Register(a.clone()),
             rhs: Operand::Register(b.clone()),
@@ -493,12 +493,12 @@ mod jit_host_exec_tests {
     fn module_i32_cmp_eq(lhs: Operand, rhs: Operand) -> Module {
         let i32_ty = MirType::Scalar(ScalarType::I32);
         let out = Register::Virtual(VirtualReg::gpr(0));
-        let sig = Signature::new("cmp").with_return(i32_ty.clone());
+        let sig = Signature::new("cmp").with_return(i32_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntCmp {
             op: IntCmpOp::Eq,
-            ty: i32_ty.clone(),
+            ty: i32_ty,
             dst: out.clone(),
             lhs,
             rhs,
