@@ -210,6 +210,7 @@ fn parse_args() -> Result<Options, String> {
                 options.verbose = true;
                 i += 1;
             }
+            "--64" | "--32" | "--x32" => i += 1,
             "--version" => return Err("version".to_string()),
             "-h" | "--help" => return Err("help".to_string()),
             _ => {
