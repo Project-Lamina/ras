@@ -1153,7 +1153,7 @@ fn encode_mir_instruction_x86_64(
             };
             let ld_kind = mir_ty_x86_gp_load_kind(ty)?;
             match addr {
-                AddressMode::BaseOffset { base, offset } => {
+                AddressMode::BaseOffset { base, offset, .. } => {
                     code.extend_from_slice(&materialize_reg_pointer(stack_slots, base, "rax")?);
                     let b = parse_register_x86_64("rax")?;
                     let d = parse_register_x86_64("rbx")?;
@@ -1173,6 +1173,7 @@ fn encode_mir_instruction_x86_64(
                     index,
                     scale,
                     offset,
+                    ..
                 } => {
                     let sh = match *scale {
                         1 => 0u8,
@@ -1212,7 +1213,7 @@ fn encode_mir_instruction_x86_64(
             let st_kind = mir_ty_x86_gp_store_kind(ty)?;
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rbx")?);
             match addr {
-                AddressMode::BaseOffset { base, offset } => {
+                AddressMode::BaseOffset { base, offset, .. } => {
                     code.extend_from_slice(&materialize_reg_pointer(stack_slots, base, "rax")?);
                     let b = parse_register_x86_64("rax")?;
                     let s = parse_register_x86_64("rbx")?;
@@ -1228,6 +1229,7 @@ fn encode_mir_instruction_x86_64(
                     index,
                     scale,
                     offset,
+                    ..
                 } => {
                     let sh = match *scale {
                         1 => 0u8,
