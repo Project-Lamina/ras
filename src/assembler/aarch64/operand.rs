@@ -1,9 +1,8 @@
 //! Materialising MIR operands into AArch64 registers.
 
-use super::encode::{encode_ldr, encode_str, parse_register};
+use super::encode::{encode_ldr, encode_ldr_typed, encode_sbfm64};
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
-use lamina_codegen::aarch64::FrameMap;
 use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
 
 pub(super) fn narrow_imm_i64(bits: u8, raw: i64, signed_style: bool) -> i64 {

@@ -9,17 +9,9 @@ use encode::*;
 use operand::*;
 
 use crate::encoder::aarch64::fixed::{
-    enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr, encode_and_rrr,
-    encode_and_w_rrr, encode_msub, encode_msub_w,
+    encode_and_rrr, encode_and_w_rrr, encode_msub, encode_msub_w,
 };
-use crate::{
-    encoder::aarch64::ldst_imm64::{
-        AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
-        encode_str_imm64, encode_str_scalar,
-    },
-    assembler::core::RasAssembler,
-    error::RasError,
-};
+use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_codegen::aarch64::{A64RegAlloc, AArch64ABI, FrameMap};
 use lamina_mir::{
     AddressMode, Immediate, IntBinOp, IntCmpOp, MirType, Operand, Register, ScalarType,
@@ -528,12 +520,6 @@ pub fn compile_mir_aarch64_function(
 }
 
 // Encoding functions extracted from backup file
-
-/// Encode STP 64-bit pre-index instruction
-/// stp Xt, Xt2, [Xn|SP, #imm]!
-
-/// Encode LDP 64-bit post-index instruction
-/// ldp Xt, Xt2, [Xn|SP], #imm
 
 /// Encode MIR instruction to binary (AArch64)
 ///

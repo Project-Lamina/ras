@@ -1,12 +1,14 @@
 //! AArch64 instruction encoding helpers used when lowering MIR.
 
-use crate::encoder::aarch64::fixed::encode_add_rrr;
+use super::operand::materialize_operand;
+use crate::assembler::core::RasAssembler;
+use crate::encoder::aarch64::fixed::{enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr};
 use crate::encoder::aarch64::ldst_imm64::{
     AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar, encode_str_imm64,
     encode_str_scalar,
 };
 use crate::error::RasError;
-use lamina_mir::{MirType, ScalarType};
+use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
 
 /// Encode AArch64 prologue
 pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
@@ -210,12 +212,6 @@ pub(super) fn apply_i32_offset_to_reg(
     Ok(())
 }
 
-/// MSUB Xd, Xn, Xm, Xa: Xd = Xa - (Xn * Xm)
-
-/// ADD Xd, Xn, Xm (no shift)
-
-/// AND Xd, Xn, Xm (no shift)
-
 /// SBFM Xd, Xn, #immr, #imms (64-bit); used for sign-extension of low (imms+1) bits.
 pub(super) fn encode_sbfm64(rd: u8, rn: u8, immr: u8, imms: u8) -> Vec<u8> {
     let w = 0x9340_0000u32
@@ -242,8 +238,6 @@ pub(super) fn encode_shiftv(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8
     let w = op | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
 }
-
-/// MSUB Wd, Wn, Wm, Wa
 
 pub(super) fn encode_shiftv_w(which: ShiftVKind, rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let op = match which {
