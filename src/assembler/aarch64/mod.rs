@@ -838,7 +838,7 @@ fn encode_mir_instruction_with_context(
             let tmp_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
 
             match addr {
-                AddressMode::BaseOffset { base, offset } => {
+                AddressMode::BaseOffset { base, offset, .. } => {
                     let (base_reg, opt_scratch) =
                         load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
                     code.extend_from_slice(&encode_ldr_typed(
@@ -856,6 +856,7 @@ fn encode_mir_instruction_with_context(
                     index,
                     scale,
                     offset,
+                    ..
                 } => {
                     let log2 = match *scale {
                         1 => 0u16,
@@ -933,7 +934,7 @@ fn encode_mir_instruction_with_context(
             )?;
 
             match addr {
-                AddressMode::BaseOffset { base, offset } => {
+                AddressMode::BaseOffset { base, offset, .. } => {
                     let (base_reg, opt_scratch) =
                         load_base_gpr(base, stack_slots, reg_alloc, &mut code)?;
                     code.extend_from_slice(&encode_str_typed(
@@ -951,6 +952,7 @@ fn encode_mir_instruction_with_context(
                     index,
                     scale,
                     offset,
+                    ..
                 } => {
                     let log2 = match *scale {
                         1 => 0u16,
