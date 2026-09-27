@@ -5,7 +5,7 @@
 //! for two-pass assembly (jmp/call with label resolution).
 
 use crate::{encoder::traits::ParsedInstruction, error::RasError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Section {
@@ -47,7 +47,13 @@ pub enum Line {
     },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SymbolAttributes {
+    pub weak: bool,
+}
+
 pub struct ParsedAssembly {
+    pub attributes: HashMap<String, SymbolAttributes>,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
     pub instructions: Vec<ParsedInstruction>,
@@ -60,6 +66,7 @@ pub struct AssemblyParser {
     symbols: Vec<Symbol>,
     instructions: Vec<ParsedInstruction>,
     lines: Vec<Line>,
+    attributes: HashMap<String, SymbolAttributes>,
     pending_globals: HashSet<String>,
     symbol_names: HashSet<String>,
 }
@@ -78,6 +85,7 @@ impl AssemblyParser {
             symbols: Vec::new(),
             instructions: Vec::new(),
             lines: Vec::new(),
+            attributes: HashMap::new(),
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
         }
@@ -131,6 +139,7 @@ impl AssemblyParser {
         self.resolve_numeric_labels()?;
 
         Ok(ParsedAssembly {
+            attributes: self.attributes.clone(),
             sections: self.sections.clone(),
             symbols: self.symbols.clone(),
             instructions: self.instructions.clone(),
@@ -224,6 +233,14 @@ impl AssemblyParser {
                         data: Vec::new(),
                         alignment: 1,
                     });
+                }
+            }
+            ".weak" => {
+                for name in line[parts[0].len()..].split(',').map(str::trim) {
+                    if name.is_empty() {
+                        return Err(RasError::ParseError(".weak requires symbol".into()));
+                    }
+                    self.attributes.entry(name.into()).or_default().weak = true;
                 }
             }
             ".global" | ".globl" => {

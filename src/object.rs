@@ -28,6 +28,7 @@ impl Default for ObjectWriteOptions {
 /// object file symbol table. Built by the assembler after two-pass resolution.
 #[derive(Debug, Clone)]
 pub struct ObjectSymbol {
+    pub attributes: crate::parser::SymbolAttributes,
     pub name: String,
     pub global: bool,
     pub section: String,
@@ -349,25 +350,36 @@ impl ObjectWriter for ElfWriter {
         let mut symtab = vec![0; ELF64_SYM_SIZE as usize];
         let mut sym_indices = std::collections::HashMap::new();
         let mut defined: Vec<_> = req.symbols.iter().collect();
-        defined.sort_by_key(|s| s.global);
-        let first_global = 1 + defined.iter().filter(|s| !s.global).count() as u32;
+        defined.sort_by_key(|s| s.global || s.attributes.weak);
+        let first_global = 1 + defined
+            .iter()
+            .filter(|s| !s.global && !s.attributes.weak)
+            .count() as u32;
         for sym in defined {
             let index = symtab.len() / ELF64_SYM_SIZE as usize;
             sym_indices.insert(sym.name.as_str(), index as u32);
             let name = strtab.len() as u32;
             strtab.extend_from_slice(sym.name.as_bytes());
             strtab.push(0);
-            let section = names
-                .iter()
-                .position(|n| n == &sym.section)
-                .ok_or_else(|| {
-                    RasError::ObjectError(format!("Unknown symbol section: {}", sym.section))
-                })?
-                + 1;
+            let section = if sym.section.is_empty() {
+                0
+            } else {
+                names
+                    .iter()
+                    .position(|n| n == &sym.section)
+                    .ok_or_else(|| {
+                        RasError::ObjectError(format!("Unknown symbol section: {}", sym.section))
+                    })?
+                    + 1
+            };
             write_elf64_symbol(
                 &mut symtab,
                 name,
-                u8::from(sym.global),
+                if sym.attributes.weak {
+                    2
+                } else {
+                    u8::from(sym.global)
+                },
                 0,
                 section as u16,
                 sym.value,

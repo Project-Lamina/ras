@@ -229,6 +229,20 @@ impl RasAssembler {
             symbols.append(&mut syms);
             relocs.append(&mut relocations);
         }
+        for (name, attributes) in &parsed.attributes {
+            if let Some(sym) = symbols.iter_mut().find(|s| &s.name == name) {
+                sym.attributes = attributes.clone();
+                sym.global |= attributes.weak;
+            } else {
+                symbols.push(ObjectSymbol {
+                    name: name.clone(),
+                    global: true,
+                    section: String::new(),
+                    value: 0,
+                    attributes: attributes.clone(),
+                });
+            }
+        }
         let code = &sections.iter().find(|s| s.name == ".text").unwrap().data;
 
         self.object_writer
@@ -318,6 +332,7 @@ impl RasAssembler {
                 };
                 if mode != mapping_mode {
                     mapping_symbols.push(ObjectSymbol {
+                        attributes: Default::default(),
                         name: format!("{mode}.{}", mapping_symbols.len()),
                         global: false,
                         section: String::new(),
@@ -740,6 +755,7 @@ impl RasAssembler {
             .iter()
             .filter_map(|l| match l {
                 Line::Label(s) => Some(ObjectSymbol {
+                    attributes: Default::default(),
                     name: s.name.clone(),
                     global: s.global,
                     section: s.section.clone(),
