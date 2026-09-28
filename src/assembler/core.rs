@@ -598,16 +598,44 @@ impl RasAssembler {
                             .copy_from_slice(&value.to_le_bytes()[..*width]);
                     }
                     DataExpression::Difference(left, right) => {
-                        let lookup = |name: &str| {
-                            symbol_offsets.get(name).copied().ok_or_else(|| {
-                                RasError::EncodingError(format!(
-                                    "Undefined or cross-section label in difference: {name}"
-                                ))
-                            })
+                        let left_value = if left == "." {
+                            Some(*offset)
+                        } else {
+                            symbol_offsets.get(&left).copied()
                         };
-                        let value = lookup(&left)? as i128 - lookup(&right)? as i128;
-                        code[*offset..*offset + width]
-                            .copy_from_slice(&value.to_le_bytes()[..*width]);
+                        let right_value = if right == "." {
+                            Some(*offset)
+                        } else {
+                            symbol_offsets.get(&right).copied()
+                        };
+                        if let (Some(left), Some(right)) = (left_value, right_value) {
+                            let value = left as i128 - right as i128;
+                            code[*offset..*offset + width]
+                                .copy_from_slice(&value.to_le_bytes()[..*width]);
+                        } else if let Some(right) = right_value {
+                            let kind = match (arch, width) {
+                                (TargetArchitecture::X86_64, 4) => 2,
+                                (TargetArchitecture::X86_64, 8) => 24,
+                                (TargetArchitecture::Aarch64, 4) => 261,
+                                (TargetArchitecture::Aarch64, 8) => 260,
+                                _ => {
+                                    return Err(RasError::EncodingError(
+                                        "Unsupported relative data relocation".into(),
+                                    ));
+                                }
+                            };
+                            external_relocs.push(ExternalReloc {
+                                offset: *offset,
+                                symbol: left,
+                                section: String::new(),
+                                kind,
+                                addend: *offset as i64 - right as i64,
+                            });
+                        } else {
+                            return Err(RasError::EncodingError(format!(
+                                "Undefined or cross-section label in difference: {right}"
+                            )));
+                        }
                     }
                     DataExpression::Symbol(symbol, addend) => {
                         let kind = match (arch, width) {
