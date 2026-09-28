@@ -262,6 +262,7 @@ fn write_elf64_symbol<W: Write>(
     name_offset: u32,
     bind: u8,
     sym_type: u8,
+    hidden: bool,
     section_index: u16,
     value: u64,
 ) -> Result<(), RasError> {
@@ -269,7 +270,7 @@ fn write_elf64_symbol<W: Write>(
     w.write_all(&name_offset.to_le_bytes()).map_err(map)?;
     w.write_all(&[(bind << 4) | (sym_type & 0xf)])
         .map_err(map)?;
-    w.write_all(&[0u8]).map_err(map)?; // st_other
+    w.write_all(&[if hidden { 2 } else { 0 }]).map_err(map)?;
     w.write_all(&section_index.to_le_bytes()).map_err(map)?;
     w.write_all(&value.to_le_bytes()).map_err(map)?;
     w.write_all(&0u64.to_le_bytes()).map_err(map)?; // st_size
@@ -381,6 +382,7 @@ impl ObjectWriter for ElfWriter {
                     u8::from(sym.global)
                 },
                 0,
+                sym.attributes.hidden,
                 section as u16,
                 sym.value,
             )?;
@@ -394,7 +396,7 @@ impl ObjectWriter for ElfWriter {
                 let name = strtab.len() as u32;
                 strtab.extend_from_slice(reloc.symbol.as_bytes());
                 strtab.push(0);
-                write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, 0, 0)?;
+                write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, false, 0, 0)?;
             }
         }
         let mut rela_sections = Vec::new();
