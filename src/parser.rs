@@ -50,6 +50,7 @@ pub enum Line {
 #[derive(Debug, Clone, Default)]
 pub struct SymbolAttributes {
     pub weak: bool,
+    pub hidden: bool,
 }
 
 pub struct ParsedAssembly {
@@ -233,6 +234,14 @@ impl AssemblyParser {
                         data: Vec::new(),
                         alignment: 1,
                     });
+                }
+            }
+            ".hidden" => {
+                for name in line[parts[0].len()..].split(',').map(str::trim) {
+                    if name.is_empty() {
+                        return Err(RasError::ParseError(".hidden requires symbol".into()));
+                    }
+                    self.attributes.entry(name.into()).or_default().hidden = true;
                 }
             }
             ".weak" => {
