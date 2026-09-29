@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Section {
+    pub group: Option<String>,
     pub name: String,
     pub flags: SectionFlags,
     pub data: Vec<u8>,
@@ -221,6 +222,17 @@ impl AssemblyParser {
                 if !self.sections.iter().any(|s| s.name == name) {
                     let explicit = line.split('"').nth(1);
                     self.sections.push(Section {
+                        group: if explicit.is_some_and(|f| f.contains('G')) {
+                            let fields: Vec<_> = line.split(',').map(str::trim).collect();
+                            if fields.len() != 5 || fields[4] != "comdat" || fields[3].is_empty() {
+                                return Err(RasError::ParseError(
+                                    "Unsupported section group".into(),
+                                ));
+                            }
+                            Some(fields[3].into())
+                        } else {
+                            None
+                        },
                         name: name.to_string(),
                         flags: SectionFlags {
                             alloc: explicit.map_or(
