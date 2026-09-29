@@ -379,7 +379,9 @@ impl ObjectWriter for ElfWriter {
             let name = strtab.len() as u32;
             strtab.extend_from_slice(sym.name.as_bytes());
             strtab.push(0);
-            let section = if sym.section.is_empty() {
+            let section = if sym.section == "*COM*" {
+                0xfff2
+            } else if sym.section.is_empty() {
                 0
             } else {
                 names
@@ -403,6 +405,10 @@ impl ObjectWriter for ElfWriter {
                 section as u16,
                 sym.value,
             )?;
+            if let Some((size, _)) = sym.attributes.common {
+                let end = symtab.len();
+                symtab[end - 8..].copy_from_slice(&size.to_le_bytes());
+            }
         }
         for reloc in req.relocations {
             if !sym_indices.contains_key(reloc.symbol.as_str()) {

@@ -230,7 +230,47 @@ impl RasAssembler {
             symbols.append(&mut syms);
             relocs.append(&mut relocations);
         }
-        for (name, attributes) in &parsed.attributes {
+        let mut ordered_attributes: Vec<_> = parsed.attributes.iter().collect();
+        ordered_attributes.sort_by_key(|(name, _)| {
+            parsed
+                .common_order
+                .iter()
+                .position(|n| n == *name)
+                .unwrap_or(usize::MAX)
+        });
+        for (name, attributes) in ordered_attributes {
+            if let Some((size, alignment)) = attributes.common {
+                let (section, value) = if attributes.local {
+                    if !sections.iter().any(|s| s.name == ".bss") {
+                        sections.push(crate::parser::Section {
+                            group: None,
+                            name: ".bss".into(),
+                            flags: crate::parser::SectionFlags {
+                                alloc: true,
+                                exec: false,
+                                write: true,
+                            },
+                            data: Vec::new(),
+                            alignment: 1,
+                        });
+                    }
+                    let section = sections.iter_mut().find(|s| s.name == ".bss").unwrap();
+                    section.alignment = section.alignment.max(alignment as usize);
+                    let value = (section.data.len() as u64).div_ceil(alignment) * alignment;
+                    section.data.resize((value + size) as usize, 0);
+                    (".bss", value)
+                } else {
+                    ("*COM*", alignment)
+                };
+                symbols.push(ObjectSymbol {
+                    name: name.clone(),
+                    global: !attributes.local,
+                    section: section.into(),
+                    value,
+                    attributes: attributes.clone(),
+                });
+                continue;
+            }
             if let Some(sym) = symbols.iter_mut().find(|s| &s.name == name) {
                 sym.attributes = attributes.clone();
                 sym.global = !attributes.local && (sym.global || attributes.weak);

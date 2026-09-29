@@ -53,9 +53,11 @@ pub struct SymbolAttributes {
     pub weak: bool,
     pub hidden: bool,
     pub local: bool,
+    pub common: Option<(u64, u64)>,
 }
 
 pub struct ParsedAssembly {
+    pub common_order: Vec<String>,
     pub attributes: HashMap<String, SymbolAttributes>,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
@@ -64,6 +66,7 @@ pub struct ParsedAssembly {
 }
 
 pub struct AssemblyParser {
+    common_order: Vec<String>,
     current_section: String,
     sections: Vec<Section>,
     symbols: Vec<Symbol>,
@@ -83,6 +86,7 @@ impl Default for AssemblyParser {
 impl AssemblyParser {
     pub fn new() -> Self {
         Self {
+            common_order: Vec::new(),
             current_section: ".text".to_string(),
             sections: Vec::new(),
             symbols: Vec::new(),
@@ -142,6 +146,7 @@ impl AssemblyParser {
         self.resolve_numeric_labels()?;
 
         Ok(ParsedAssembly {
+            common_order: self.common_order.clone(),
             attributes: self.attributes.clone(),
             sections: self.sections.clone(),
             symbols: self.symbols.clone(),
@@ -247,6 +252,30 @@ impl AssemblyParser {
                         data: Vec::new(),
                         alignment: 1,
                     });
+                }
+            }
+            ".comm" => {
+                let fields: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
+                if !(2..=3).contains(&fields.len()) || fields[0].is_empty() {
+                    return Err(RasError::ParseError("Invalid .comm operands".into()));
+                }
+                let size = u64::try_from(parse_integer(fields[1])?)
+                    .map_err(|_| RasError::ParseError("Invalid common size".into()))?;
+                let alignment = if let Some(value) = fields.get(2) {
+                    u64::try_from(parse_integer(value)?)
+                        .map_err(|_| RasError::ParseError("Invalid common alignment".into()))?
+                } else {
+                    size.next_power_of_two().min(16)
+                };
+                if !alignment.is_power_of_two() {
+                    return Err(RasError::ParseError("Invalid common alignment".into()));
+                }
+                let attributes = self.attributes.entry(fields[0].into()).or_default();
+                if let Some((old_size, old_alignment)) = attributes.common {
+                    attributes.common = Some((size.max(old_size), alignment.max(old_alignment)));
+                } else {
+                    self.common_order.push(fields[0].into());
+                    attributes.common = Some((size, alignment));
                 }
             }
             ".local" => {
