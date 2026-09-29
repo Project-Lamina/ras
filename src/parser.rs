@@ -58,6 +58,7 @@ pub struct SymbolAttributes {
 
 pub struct ParsedAssembly {
     pub common_order: Vec<String>,
+    pub aliases: Vec<(String, String)>,
     pub attributes: HashMap<String, SymbolAttributes>,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
@@ -67,6 +68,7 @@ pub struct ParsedAssembly {
 
 pub struct AssemblyParser {
     common_order: Vec<String>,
+    aliases: Vec<(String, String)>,
     current_section: String,
     sections: Vec<Section>,
     symbols: Vec<Symbol>,
@@ -87,6 +89,7 @@ impl AssemblyParser {
     pub fn new() -> Self {
         Self {
             common_order: Vec::new(),
+            aliases: Vec::new(),
             current_section: ".text".to_string(),
             sections: Vec::new(),
             symbols: Vec::new(),
@@ -147,6 +150,7 @@ impl AssemblyParser {
 
         Ok(ParsedAssembly {
             common_order: self.common_order.clone(),
+            aliases: self.aliases.clone(),
             attributes: self.attributes.clone(),
             sections: self.sections.clone(),
             symbols: self.symbols.clone(),
@@ -253,6 +257,15 @@ impl AssemblyParser {
                         alignment: 1,
                     });
                 }
+            }
+            ".set" => {
+                let (name, expression) =
+                    line[parts[0].len()..].split_once(',').ok_or_else(|| {
+                        RasError::ParseError(".set requires symbol and expression".into())
+                    })?;
+                parse_data_expression(expression.trim())?;
+                self.aliases
+                    .push((name.trim().into(), expression.trim().into()));
             }
             ".comm" => {
                 let fields: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
