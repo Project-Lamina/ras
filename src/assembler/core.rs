@@ -188,31 +188,66 @@ impl RasAssembler {
                 },
             );
         }
+        let section_lines: Vec<Vec<Line>> = sections
+            .iter()
+            .map(|section| {
+                let mut current = ".text";
+                parsed
+                    .lines
+                    .iter()
+                    .filter(|line| {
+                        if let Line::Section(name) = line {
+                            current = name;
+                            return false;
+                        }
+                        current == section.name
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        let mut positions = HashMap::new();
+        let mut layouts = Vec::new();
+        for iteration in 0..64 {
+            layouts.clear();
+            let mut next = HashMap::new();
+            for (section, lines) in sections.iter().zip(&section_lines) {
+                let layout = self.layout_two_pass(lines, section.flags.exec, &positions)?;
+                for (name, offset) in &layout.symbol_offsets {
+                    next.insert(name.clone(), (section.name.clone(), *offset));
+                }
+                layouts.push(layout);
+            }
+            if next == positions {
+                break;
+            }
+            if iteration == 63 {
+                return Err(RasError::EncodingError(
+                    "Section layout did not converge".into(),
+                ));
+            }
+            positions = next;
+        }
         let mut symbols = Vec::new();
         let mut relocs = Vec::new();
-        for section in &mut sections {
-            let mut current = ".text";
-            let lines: Vec<_> = parsed
-                .lines
-                .iter()
-                .filter(|line| {
-                    if let Line::Section(name) = line {
-                        current = name;
-                        return false;
+        for ((section, lines), layout) in sections.iter_mut().zip(&section_lines).zip(layouts) {
+            for line in lines {
+                if let Line::Leb128 { expression, signed } = line {
+                    let value = absolute_expression(expression, &positions)?;
+                    if !signed && value < 0 {
+                        return Err(RasError::EncodingError("Negative unsigned LEB128".into()));
                     }
-                    current == section.name
-                })
-                .cloned()
-                .collect();
+                }
+            }
             let (data, mut syms, mut relocations) =
-                self.encode_lines_two_pass(&lines, section.flags.exec)?;
+                Self::finish_layout(layout, lines, &positions, &section.name)?;
             section.alignment =
                 if self.target_arch == TargetArchitecture::Aarch64 && section.flags.exec {
                     4
                 } else {
                     1
                 };
-            for line in &lines {
+            for line in lines {
                 if let Line::Align {
                     value, directive, ..
                 } = line
@@ -351,10 +386,15 @@ impl RasAssembler {
             .ok_or_else(|| RasError::EncodingError("Invalid section alignment".into()))
     }
 
-    fn encode_lines_two_pass(&mut self, lines: &[Line], executable: bool) -> EncodeResult {
+    fn layout_two_pass(
+        &mut self,
+        lines: &[Line],
+        executable: bool,
+        positions: &HashMap<String, (String, usize)>,
+    ) -> Result<Layout, RasError> {
         let mut long_jumps = HashSet::new();
         let layout = loop {
-            let layout = self.layout_lines(lines, executable, &long_jumps)?;
+            let layout = self.layout_lines(lines, executable, &long_jumps, positions)?;
             let grown: Vec<usize> = layout
                 .short_jumps
                 .iter()
@@ -373,7 +413,7 @@ impl RasAssembler {
             }
             long_jumps.extend(grown);
         };
-        Self::finish_layout(layout, lines)
+        Ok(layout)
     }
 
     fn layout_lines(
@@ -381,6 +421,7 @@ impl RasAssembler {
         lines: &[Line],
         executable: bool,
         long_jumps: &HashSet<usize>,
+        positions: &HashMap<String, (String, usize)>,
     ) -> Result<Layout, RasError> {
         let global_labels: HashSet<&str> = lines
             .iter()
@@ -446,6 +487,15 @@ impl RasAssembler {
                 }
                 Line::Label(sym) => {
                     symbol_offsets.insert(sym.name.clone(), current_offset);
+                }
+                Line::Leb128 { expression, signed } => {
+                    let value = absolute_expression(expression, positions).unwrap_or(0);
+                    if !signed && value < 0 {
+                        return Err(RasError::EncodingError("Negative unsigned LEB128".into()));
+                    }
+                    let bytes = crate::parser::leb128(value, *signed);
+                    current_offset += bytes.len();
+                    code.extend(bytes);
                 }
                 Line::Data(bytes) => {
                     code.extend_from_slice(bytes);
@@ -639,7 +689,12 @@ impl RasAssembler {
         })
     }
 
-    fn finish_layout(layout: Layout, lines: &[Line]) -> EncodeResult {
+    fn finish_layout(
+        layout: Layout,
+        lines: &[Line],
+        positions: &HashMap<String, (String, usize)>,
+        section: &str,
+    ) -> EncodeResult {
         let Layout {
             mut code,
             symbol_offsets,
@@ -673,21 +728,25 @@ impl RasAssembler {
                             .copy_from_slice(&value.to_le_bytes()[..*width]);
                     }
                     DataExpression::Difference(left, right) => {
-                        let left_value = if left == "." {
-                            Some(*offset)
-                        } else {
-                            symbol_offsets.get(&left).copied()
+                        let lookup = |name: &str| {
+                            if name == "." {
+                                Some((section.to_string(), *offset))
+                            } else {
+                                positions.get(name).cloned()
+                            }
                         };
-                        let right_value = if right == "." {
-                            Some(*offset)
-                        } else {
-                            symbol_offsets.get(&right).copied()
-                        };
-                        if let (Some(left), Some(right)) = (left_value, right_value) {
-                            let value = left as i128 - right as i128;
+                        let left_value = lookup(&left);
+                        let right_value = lookup(&right);
+                        if let (Some((ls, left)), Some((rs, right))) = (&left_value, &right_value)
+                            && ls == rs
+                        {
+                            let value = *left as i128 - *right as i128;
                             code[*offset..*offset + width]
                                 .copy_from_slice(&value.to_le_bytes()[..*width]);
-                        } else if let Some(right) = right_value {
+                        } else if let Some((rs, right)) =
+                            right_value.filter(|(rs, _)| rs == section)
+                        {
+                            let _ = rs;
                             let kind = match (arch, width) {
                                 (TargetArchitecture::X86_64, 4) => 2,
                                 (TargetArchitecture::X86_64, 8) => 24,
@@ -1208,4 +1267,26 @@ fn extract_rip_label(op: &str) -> Option<&str> {
         return None;
     }
     Some(label)
+}
+
+fn absolute_expression(
+    expression: &str,
+    positions: &HashMap<String, (String, usize)>,
+) -> Result<i128, RasError> {
+    match parse_data_expression(expression)? {
+        DataExpression::Constant(value) => Ok(value),
+        DataExpression::Difference(left, right) => {
+            if let (Some((ls, l)), Some((rs, r))) = (positions.get(&left), positions.get(&right))
+                && ls == rs
+            {
+                return Ok(*l as i128 - *r as i128);
+            }
+            Err(RasError::EncodingError(format!(
+                "Unresolved absolute expression: {expression}"
+            )))
+        }
+        _ => Err(RasError::EncodingError(format!(
+            "Unsupported absolute expression: {expression}"
+        ))),
+    }
 }

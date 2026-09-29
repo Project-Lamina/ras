@@ -36,6 +36,10 @@ pub enum Line {
     Label(Symbol),
     Instruction(ParsedInstruction),
     Data(Vec<u8>),
+    Leb128 {
+        expression: String,
+        signed: bool,
+    },
     DataExpression {
         width: usize,
         expression: String,
@@ -184,7 +188,7 @@ impl AssemblyParser {
                         *operand = resolve_numeric_references(operand, index, &definitions)?;
                     }
                 }
-                Line::DataExpression { expression, .. } => {
+                Line::DataExpression { expression, .. } | Line::Leb128 { expression, .. } => {
                     *expression = resolve_numeric_references(expression, index, &definitions)?;
                 }
                 _ => {}
@@ -335,6 +339,15 @@ impl AssemblyParser {
                 let rest = line[parts[0].len()..].trim();
                 if let Some(bytes) = parse_quoted_string_bytes(rest, false) {
                     self.lines.push(Line::Data(bytes));
+                }
+            }
+            ".uleb128" => {
+                for item in line[parts[0].len()..].split(',') {
+                    parse_data_expression(item.trim())?;
+                    self.lines.push(Line::Leb128 {
+                        expression: item.trim().into(),
+                        signed: parts[0] == ".sleb128",
+                    });
                 }
             }
             ".byte" | ".short" | ".hword" | ".int" | ".long" | ".quad" | ".xword" => {
@@ -702,6 +715,23 @@ mod tests {
         match &asm.lines[0] {
             Line::Data(bytes) => assert_eq!(bytes, b"hello\0"),
             _ => panic!("expected Line::Data"),
+        }
+    }
+}
+
+pub(crate) fn leb128(mut value: i128, signed: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = if signed {
+            (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0)
+        } else {
+            value == 0
+        };
+        bytes.push(byte | if done { 0 } else { 0x80 });
+        if done {
+            return bytes;
         }
     }
 }
