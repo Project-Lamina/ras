@@ -302,6 +302,7 @@ impl ObjectWriter for ElfWriter {
         let mut sections = req.sections.to_vec();
         if sections.is_empty() {
             sections.push(Section {
+                group: None,
                 name: ".text".into(),
                 flags: crate::parser::SectionFlags {
                     alloc: true,
@@ -316,6 +317,7 @@ impl ObjectWriter for ElfWriter {
             for name in [".data", ".bss"] {
                 if !sections.iter().any(|s| s.name == name) {
                     sections.push(Section {
+                        group: None,
                         name: name.into(),
                         flags: crate::parser::SectionFlags {
                             alloc: true,
@@ -342,7 +344,8 @@ impl ObjectWriter for ElfWriter {
                 },
                 flags: u64::from(s.flags.write)
                     | (u64::from(s.flags.alloc) << 1)
-                    | (u64::from(s.flags.exec) << 2),
+                    | (u64::from(s.flags.exec) << 2)
+                    | if s.group.is_some() { 0x200 } else { 0 },
                 addralign: s.alignment as u64,
                 ..Default::default()
             })
@@ -350,7 +353,21 @@ impl ObjectWriter for ElfWriter {
         let mut strtab = vec![0];
         let mut symtab = vec![0; ELF64_SYM_SIZE as usize];
         let mut sym_indices = std::collections::HashMap::new();
-        let mut defined: Vec<_> = req.symbols.iter().collect();
+        let mut object_symbols = req.symbols.to_vec();
+        for section in &sections {
+            if let Some(signature) = &section.group
+                && !object_symbols.iter().any(|s| &s.name == signature)
+            {
+                object_symbols.push(ObjectSymbol {
+                    name: signature.clone(),
+                    global: false,
+                    section: section.name.clone(),
+                    value: 0,
+                    attributes: Default::default(),
+                });
+            }
+        }
+        let mut defined: Vec<_> = object_symbols.iter().collect();
         defined.sort_by_key(|s| s.global || s.attributes.weak);
         let first_global = 1 + defined
             .iter()
@@ -399,6 +416,13 @@ impl ObjectWriter for ElfWriter {
                 write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, false, 0, 0)?;
             }
         }
+        let mut groups: std::collections::BTreeMap<&str, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (i, section) in sections.iter().enumerate() {
+            if let Some(signature) = &section.group {
+                groups.entry(signature).or_default().push((i + 1) as u32);
+            }
+        }
         let mut rela_sections = Vec::new();
         for (i, section) in sections.iter().enumerate() {
             let mut bytes = Vec::new();
@@ -409,12 +433,18 @@ impl ObjectWriter for ElfWriter {
                 bytes.extend_from_slice(&r.addend.to_le_bytes());
             }
             if !bytes.is_empty() {
+                if let Some(signature) = &section.group {
+                    groups
+                        .get_mut(signature.as_str())
+                        .unwrap()
+                        .push((headers.len() + 1) as u32);
+                }
                 rela_sections.push(headers.len());
                 names.push(format!(".rela{}", section.name));
                 data.push(bytes);
                 headers.push(Elf64SectionHeader {
                     section_type: SHT_RELA,
-                    flags: SHF_INFO_LINK,
+                    flags: SHF_INFO_LINK | if section.group.is_some() { 0x200 } else { 0 },
                     info: (i + 1) as u32,
                     addralign: 8,
                     entsize: ELF64_RELA_SIZE,
@@ -422,7 +452,32 @@ impl ObjectWriter for ElfWriter {
                 });
             }
         }
+        let mut group_sections = Vec::new();
+        for (signature, members) in groups {
+            if !req.symbols.iter().any(|s| s.name == signature) {
+                let offset = sym_indices[signature] as usize * ELF64_SYM_SIZE as usize + 6;
+                symtab[offset..offset + 2]
+                    .copy_from_slice(&((headers.len() + 1) as u16).to_le_bytes());
+            }
+            group_sections.push(headers.len());
+            names.push(".group".into());
+            let mut bytes = 1u32.to_le_bytes().to_vec();
+            for member in members {
+                bytes.extend_from_slice(&member.to_le_bytes());
+            }
+            data.push(bytes);
+            headers.push(Elf64SectionHeader {
+                section_type: 17,
+                info: sym_indices[signature],
+                addralign: 4,
+                entsize: 4,
+                ..Default::default()
+            });
+        }
         let symtab_index = headers.len() + 1;
+        for i in group_sections {
+            headers[i].link = symtab_index as u32;
+        }
         for i in rela_sections {
             headers[i].link = symtab_index as u32;
         }
@@ -771,6 +826,7 @@ mod tests {
         let mut w = ElfWriter::new();
         let code = [0xc3u8];
         let sections = vec![Section {
+            group: None,
             name: ".text".to_string(),
             data: code.to_vec(),
             alignment: 1,
@@ -804,6 +860,7 @@ mod tests {
         let mut w = ElfWriter::new();
         let code = [0xc0, 0x03, 0x5f, 0xd6];
         let sections = vec![Section {
+            group: None,
             name: ".text".to_string(),
             data: code.to_vec(),
             alignment: 1,

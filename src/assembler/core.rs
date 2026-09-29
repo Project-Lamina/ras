@@ -176,6 +176,7 @@ impl RasAssembler {
             sections.insert(
                 0,
                 crate::parser::Section {
+                    group: None,
                     name: ".text".into(),
                     flags: crate::parser::SectionFlags {
                         alloc: true,
