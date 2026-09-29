@@ -233,11 +233,11 @@ impl RasAssembler {
         for (name, attributes) in &parsed.attributes {
             if let Some(sym) = symbols.iter_mut().find(|s| &s.name == name) {
                 sym.attributes = attributes.clone();
-                sym.global |= attributes.weak;
+                sym.global = !attributes.local && (sym.global || attributes.weak);
             } else {
                 symbols.push(ObjectSymbol {
                     name: name.clone(),
-                    global: true,
+                    global: !attributes.local,
                     section: String::new(),
                     value: 0,
                     attributes: attributes.clone(),

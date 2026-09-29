@@ -52,6 +52,7 @@ pub enum Line {
 pub struct SymbolAttributes {
     pub weak: bool,
     pub hidden: bool,
+    pub local: bool,
 }
 
 pub struct ParsedAssembly {
@@ -246,6 +247,14 @@ impl AssemblyParser {
                         data: Vec::new(),
                         alignment: 1,
                     });
+                }
+            }
+            ".local" => {
+                for name in line[parts[0].len()..].split(',').map(str::trim) {
+                    if name.is_empty() {
+                        return Err(RasError::ParseError(".local requires symbol".into()));
+                    }
+                    self.attributes.entry(name.into()).or_default().local = true;
                 }
             }
             ".hidden" => {
