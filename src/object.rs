@@ -379,7 +379,9 @@ impl ObjectWriter for ElfWriter {
             let name = strtab.len() as u32;
             strtab.extend_from_slice(sym.name.as_bytes());
             strtab.push(0);
-            let section = if sym.section == "*COM*" {
+            let section = if sym.section == "*ABS*" {
+                0xfff1
+            } else if sym.section == "*COM*" {
                 0xfff2
             } else if sym.section.is_empty() {
                 0

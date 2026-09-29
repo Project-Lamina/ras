@@ -230,6 +230,40 @@ impl RasAssembler {
             symbols.append(&mut syms);
             relocs.append(&mut relocations);
         }
+        let mut aliases = parsed.aliases.clone();
+        while !aliases.is_empty() {
+            let count = aliases.len();
+            let mut pending = Vec::new();
+            for (name, expression) in aliases {
+                let resolved = match parse_data_expression(&expression)? {
+                    DataExpression::Constant(value) => Some(("*ABS*".to_string(), value as u64)),
+                    DataExpression::Symbol(target, addend) => symbols
+                        .iter()
+                        .find(|s| s.name == target)
+                        .map(|s| (s.section.clone(), s.value.wrapping_add(addend as u64))),
+                    _ => {
+                        return Err(RasError::EncodingError(
+                            "Unsupported .set expression".into(),
+                        ));
+                    }
+                };
+                if let Some((section, value)) = resolved {
+                    symbols.push(ObjectSymbol {
+                        name: name.clone(),
+                        global: false,
+                        section,
+                        value,
+                        attributes: Default::default(),
+                    });
+                } else {
+                    pending.push((name, expression));
+                }
+            }
+            if pending.len() == count {
+                return Err(RasError::EncodingError("Unresolved .set expression".into()));
+            }
+            aliases = pending;
+        }
         let mut ordered_attributes: Vec<_> = parsed.attributes.iter().collect();
         ordered_attributes.sort_by_key(|(name, _)| {
             parsed
