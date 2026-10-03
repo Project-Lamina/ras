@@ -405,9 +405,13 @@ impl AssemblyParser {
                     max_skip,
                 });
             }
-            ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa" | ".size" | ".type" | ".ident"
-            | ".file" => {}
-            _ => {}
+            ".size" | ".type" | ".ident" | ".file" => {}
+            _ => {
+                return Err(RasError::ParseError(format!(
+                    "Unsupported directive: {}",
+                    parts[0]
+                )));
+            }
         }
 
         Ok(())
