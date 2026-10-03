@@ -341,7 +341,7 @@ impl AssemblyParser {
                     self.lines.push(Line::Data(bytes));
                 }
             }
-            ".uleb128" => {
+            ".uleb128" | ".sleb128" => {
                 for item in line[parts[0].len()..].split(',') {
                     parse_data_expression(item.trim())?;
                     self.lines.push(Line::Leb128 {
