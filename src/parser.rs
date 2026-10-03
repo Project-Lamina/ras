@@ -58,6 +58,7 @@ pub struct SymbolAttributes {
     pub hidden: bool,
     pub local: bool,
     pub common: Option<(u64, u64)>,
+    pub symbol_type: u8,
 }
 
 pub struct ParsedAssembly {
@@ -294,6 +295,7 @@ impl AssemblyParser {
                     self.common_order.push(fields[0].into());
                     attributes.common = Some((size, alignment));
                 }
+                attributes.symbol_type = 1;
             }
             ".local" => {
                 for name in line[parts[0].len()..].split(',').map(str::trim) {
@@ -405,7 +407,23 @@ impl AssemblyParser {
                     max_skip,
                 });
             }
-            ".size" | ".type" | ".ident" | ".file" => {}
+            ".type" => {
+                let (name, kind) = line[parts[0].len()..]
+                    .split_once(',')
+                    .ok_or_else(|| RasError::ParseError("Invalid .type".into()))?;
+                let kind = match kind.trim().trim_start_matches(['@', '%']) {
+                    "notype" => 0,
+                    "object" => 1,
+                    "function" => 2,
+                    "tls_object" => 6,
+                    _ => return Err(RasError::ParseError("Unsupported symbol type".into())),
+                };
+                self.attributes
+                    .entry(name.trim().into())
+                    .or_default()
+                    .symbol_type = kind;
+            }
+            ".size" | ".ident" | ".file" => {}
             _ => {
                 return Err(RasError::ParseError(format!(
                     "Unsupported directive: {}",
