@@ -167,8 +167,9 @@ impl RasAssembler {
         asm_text: &str,
         output_path: &std::path::Path,
     ) -> Result<(), RasError> {
+        let asm_text = crate::cfi::lower(asm_text, self.target_arch)?;
         let parsed = AssemblyParser::new()
-            .parse(asm_text)
+            .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
 
         let mut sections = parsed.sections.clone();
