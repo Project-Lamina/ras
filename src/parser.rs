@@ -524,7 +524,7 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
     )))
 }
 
-fn parse_integer(text: &str) -> Result<i128, RasError> {
+pub(crate) fn parse_integer(text: &str) -> Result<i128, RasError> {
     let (sign, digits) = text.strip_prefix('-').map_or((1, text), |s| (-1, s));
     let result = if let Some(hex) = digits.strip_prefix("0x") {
         i128::from_str_radix(hex, 16)
@@ -579,6 +579,23 @@ fn split_operands(text: &str) -> Vec<String> {
     }
     operands.push(text[start..].trim().to_string());
     operands
+}
+
+pub(crate) fn leb128(mut value: i128, signed: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = if signed {
+            (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0)
+        } else {
+            value == 0
+        };
+        bytes.push(byte | if done { 0 } else { 0x80 });
+        if done {
+            return bytes;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -715,23 +732,6 @@ mod tests {
         match &asm.lines[0] {
             Line::Data(bytes) => assert_eq!(bytes, b"hello\0"),
             _ => panic!("expected Line::Data"),
-        }
-    }
-}
-
-pub(crate) fn leb128(mut value: i128, signed: bool) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        let done = if signed {
-            (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0)
-        } else {
-            value == 0
-        };
-        bytes.push(byte | if done { 0 } else { 0x80 });
-        if done {
-            return bytes;
         }
     }
 }
