@@ -402,7 +402,7 @@ impl ObjectWriter for ElfWriter {
                 } else {
                     u8::from(sym.global)
                 },
-                0,
+                sym.attributes.symbol_type,
                 sym.attributes.hidden,
                 section as u16,
                 sym.value,
