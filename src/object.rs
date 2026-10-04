@@ -407,7 +407,13 @@ impl ObjectWriter for ElfWriter {
                 section as u16,
                 sym.value,
             )?;
-            if let Some((size, _)) = sym.attributes.common {
+            if let Some(size) = sym
+                .attributes
+                .size
+                .as_ref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| sym.attributes.common.map(|c| c.0))
+            {
                 let end = symtab.len();
                 symtab[end - 8..].copy_from_slice(&size.to_le_bytes());
             }
