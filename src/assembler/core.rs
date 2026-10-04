@@ -354,6 +354,33 @@ impl RasAssembler {
                 });
             }
         }
+        for _ in 0..parsed.aliases.len() {
+            for (name, expression) in &parsed.aliases {
+                if let DataExpression::Symbol(target, _) = parse_data_expression(expression)? {
+                    let inherited = symbols
+                        .iter()
+                        .find(|s| s.name == target)
+                        .map(|s| s.attributes.clone());
+                    if let Some(inherited) = inherited {
+                        let symbol = symbols.iter_mut().find(|s| &s.name == name).unwrap();
+                        if symbol.attributes.symbol_type == 0 {
+                            symbol.attributes.symbol_type = inherited.symbol_type;
+                        }
+                        if symbol.attributes.size.is_none() {
+                            symbol.attributes.size = inherited.size;
+                        }
+                    }
+                }
+            }
+        }
+        for symbol in &mut symbols {
+            if let Some(expression) = &symbol.attributes.size {
+                let size = absolute_expression(expression, &positions)?;
+                u64::try_from(size)
+                    .map_err(|_| RasError::EncodingError("Invalid symbol size".into()))?;
+                symbol.attributes.size = Some(size.to_string());
+            }
+        }
         let code = &sections.iter().find(|s| s.name == ".text").unwrap().data;
 
         self.object_writer

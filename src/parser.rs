@@ -59,6 +59,7 @@ pub struct SymbolAttributes {
     pub local: bool,
     pub common: Option<(u64, u64)>,
     pub symbol_type: u8,
+    pub size: Option<String>,
 }
 
 pub struct ParsedAssembly {
@@ -73,6 +74,7 @@ pub struct ParsedAssembly {
 
 pub struct AssemblyParser {
     common_order: Vec<String>,
+    generated_prefix: String,
     aliases: Vec<(String, String)>,
     current_section: String,
     sections: Vec<Section>,
@@ -94,6 +96,7 @@ impl AssemblyParser {
     pub fn new() -> Self {
         Self {
             common_order: Vec::new(),
+            generated_prefix: ".Lras_size".into(),
             aliases: Vec::new(),
             current_section: ".text".to_string(),
             sections: Vec::new(),
@@ -107,6 +110,9 @@ impl AssemblyParser {
     }
 
     pub fn parse(&mut self, text: &str) -> Result<ParsedAssembly, RasError> {
+        while text.contains(&self.generated_prefix) {
+            self.generated_prefix.push('_');
+        }
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
@@ -423,7 +429,29 @@ impl AssemblyParser {
                     .or_default()
                     .symbol_type = kind;
             }
-            ".size" | ".ident" | ".file" => {}
+            ".size" => {
+                let (name, expression) = line[parts[0].len()..]
+                    .split_once(',')
+                    .ok_or_else(|| RasError::ParseError("Invalid .size".into()))?;
+                let expression = match parse_data_expression(expression.trim())? {
+                    DataExpression::Difference(left, right) if left == "." || right == "." => {
+                        let location = format!("{}_{}", self.generated_prefix, self.lines.len());
+                        self.lines.push(Line::Label(Symbol {
+                            name: location.clone(),
+                            global: false,
+                            section: self.current_section.clone(),
+                        }));
+                        format!(
+                            "{}-{}",
+                            if left == "." { &location } else { &left },
+                            if right == "." { &location } else { &right }
+                        )
+                    }
+                    _ => expression.trim().into(),
+                };
+                self.attributes.entry(name.trim().into()).or_default().size = Some(expression);
+            }
+            ".ident" | ".file" => {}
             _ => {
                 return Err(RasError::ParseError(format!(
                     "Unsupported directive: {}",
@@ -607,7 +635,11 @@ pub(crate) fn leb128(mut value: i128, signed: bool) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
         let byte = (value & 0x7f) as u8;
-        value >>= 7;
+        value = if signed {
+            value >> 7
+        } else {
+            ((value as u128) >> 7) as i128
+        };
         let done = if signed {
             (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0)
         } else {
