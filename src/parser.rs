@@ -55,6 +55,7 @@ pub enum Line {
 #[derive(Debug, Clone, Default)]
 pub struct SymbolAttributes {
     pub weak: bool,
+    pub global: bool,
     pub hidden: bool,
     pub local: bool,
     pub common: Option<(u64, u64)>,
@@ -158,6 +159,22 @@ impl AssemblyParser {
         }
 
         self.resolve_numeric_labels()?;
+        for line in &mut self.lines {
+            if let Line::Label(symbol) = line
+                && let Some(attributes) = self.attributes.get(&symbol.name)
+            {
+                symbol.global =
+                    !attributes.local && (symbol.global || attributes.global || attributes.weak);
+            }
+        }
+        self.symbols = self
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Label(symbol) => Some(symbol.clone()),
+                _ => None,
+            })
+            .collect();
 
         Ok(ParsedAssembly {
             common_order: self.common_order.clone(),
@@ -333,8 +350,12 @@ impl AssemblyParser {
                         ".global requires a symbol name".to_string(),
                     ));
                 }
-                for name in &parts[1..] {
-                    self.pending_globals.insert((*name).to_string());
+                for name in line[parts[0].len()..]
+                    .split([',', ' ', '\t'])
+                    .filter(|s| !s.is_empty())
+                {
+                    self.pending_globals.insert(name.to_string());
+                    self.attributes.entry(name.into()).or_default().global = true;
                 }
             }
             ".asciz" | ".string" => {
