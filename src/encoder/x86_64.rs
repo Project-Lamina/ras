@@ -450,7 +450,13 @@ impl X86_64Encoder {
             wide: width == 64,
             byte_rex,
             high,
-            opcode: &[if width == 8 { 0xf6 } else { 0xf7 }],
+            opcode: &[if digit <= 1 {
+                if width == 8 { 0xfe } else { 0xff }
+            } else if width == 8 {
+                0xf6
+            } else {
+                0xf7
+            }],
             reg: digit,
             rm,
             ..Op::default()
@@ -1562,9 +1568,16 @@ fn cmov_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
 }
 
 fn unary_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
-    [("neg", 3), ("mul", 4), ("idiv", 7), ("div", 6)]
-        .into_iter()
-        .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
+    [
+        ("inc", 0),
+        ("dec", 1),
+        ("neg", 3),
+        ("mul", 4),
+        ("idiv", 7),
+        ("div", 6),
+    ]
+    .into_iter()
+    .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
 }
 
 fn parse_xmm(s: &str) -> Option<u8> {
