@@ -343,7 +343,8 @@ impl RasAssembler {
             }
             if let Some(sym) = symbols.iter_mut().find(|s| &s.name == name) {
                 sym.attributes = attributes.clone();
-                sym.global = !attributes.local && (sym.global || attributes.weak);
+                sym.global =
+                    !attributes.local && (sym.global || attributes.global || attributes.weak);
             } else {
                 symbols.push(ObjectSymbol {
                     name: name.clone(),
