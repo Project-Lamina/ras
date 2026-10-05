@@ -379,10 +379,11 @@ impl AssemblyParser {
                     });
                 }
             }
-            ".byte" | ".short" | ".hword" | ".int" | ".long" | ".quad" | ".xword" => {
+            ".byte" | ".short" | ".hword" | ".value" | ".int" | ".long" | ".quad"
+            | ".xword" => {
                 let width = match parts[0] {
                     ".byte" => 1,
-                    ".short" | ".hword" => 2,
+                    ".short" | ".hword" | ".value" => 2,
                     ".quad" | ".xword" => 8,
                     _ => 4,
                 };
