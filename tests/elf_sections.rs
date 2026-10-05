@@ -198,7 +198,7 @@ fn undefined_numeric_labels_and_cross_section_differences_fail() {
         (".long 1f", "Undefined numeric label: 1f"),
         ("jmp 1b\n1: ret", "Undefined numeric label: 1b"),
         (
-            ".data\nx: .long y-x\n.text\ny: ret",
+            ".data\nx: .long x-y\n.text\ny: ret",
             "Undefined or cross-section label in difference: y",
         ),
     ] {

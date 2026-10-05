@@ -763,9 +763,11 @@ mod tests {
     }
 
     #[test]
-    fn known_no_op_directives_are_silently_ignored() {
+    fn symbol_metadata_directives_are_recorded() {
         let asm = parse(".size foo, 4\n.type foo, @function");
         assert!(asm.lines.is_empty());
+        assert_eq!(asm.attributes["foo"].symbol_type, 2);
+        assert_eq!(asm.attributes["foo"].size.as_deref(), Some("4"));
     }
 
     #[test]
