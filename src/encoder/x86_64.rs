@@ -313,7 +313,9 @@ impl X86_64Encoder {
             let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
             let width = operand_width(width, &[dst_gpr])?;
             check_alu_width(width)?;
-            let imm = if width == 32 {
+            let imm = if width == 16 {
+                i64::from(imm as u16 as i16)
+            } else if width == 32 {
                 i64::from(imm as u32 as i32)
             } else {
                 imm
@@ -328,6 +330,9 @@ impl X86_64Encoder {
                     (false, false) => base + 5,
                 };
                 let mut bytes = Vec::new();
+                if width == 16 {
+                    bytes.push(0x66);
+                }
                 if width == 64 {
                     bytes.push(0x48);
                 }
@@ -344,7 +349,8 @@ impl X86_64Encoder {
             };
             let (byte_rex, high) = byte_flags(&[dst_gpr]);
             return encode_op(Op {
-                wide: width == 64,
+                legacy: if width == 16 { &[0x66] } else { &[] },
+            wide: width == 64,
                 byte_rex,
                 high,
                 opcode: &[opcode],
@@ -371,6 +377,7 @@ impl X86_64Encoder {
             }
         };
         encode_op(Op {
+            legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
             high,
@@ -420,6 +427,7 @@ impl X86_64Encoder {
             }
         };
         encode_op(Op {
+            legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
             high,
@@ -447,6 +455,7 @@ impl X86_64Encoder {
         check_alu_width(width)?;
         let (byte_rex, high) = byte_flags(&[gpr]);
         encode_op(Op {
+            legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
             high,
@@ -1474,7 +1483,7 @@ fn operand_width(width: Option<u8>, gprs: &[Option<Gpr>]) -> Result<u8, RasError
 }
 
 fn check_alu_width(width: u8) -> Result<(), RasError> {
-    if matches!(width, 8 | 32 | 64) {
+    if matches!(width, 8 | 16 | 32 | 64) {
         Ok(())
     } else {
         Err(RasError::EncodingError(format!(
@@ -1503,7 +1512,7 @@ fn alu_mnemonic(name: &str) -> Option<(&'static str, Option<u8>)> {
     if let Some(stem) = ALU_STEMS.iter().find(|candidate| **candidate == name) {
         return Some((*stem, None));
     }
-    [('q', 64), ('l', 32), ('b', 8)]
+    [('q', 64), ('l', 32), ('w', 16), ('b', 8)]
         .into_iter()
         .find_map(|(suffix, width)| {
             let stem = name.strip_suffix(suffix)?;
@@ -1520,6 +1529,7 @@ fn sized_stem(opcode: &str, stem: &str) -> Option<Option<u8>> {
     }
     match opcode.strip_prefix(stem)? {
         "b" => Some(Some(8)),
+        "w" => Some(Some(16)),
         "l" => Some(Some(32)),
         "q" => Some(Some(64)),
         _ => None,
