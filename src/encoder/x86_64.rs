@@ -104,10 +104,11 @@ impl X86_64Encoder {
         if !disp_text.is_empty() {
             match parse_imm(disp_text) {
                 Ok(value) => mem.disp = value,
-                Err(_) if is_symbol(disp_text) || is_got_symbol(disp_text) => {
-                    mem.label = Some(disp_text.to_string())
+                Err(_) => {
+                    let (label, addend) = rip_expression(disp_text).ok_or_else(invalid)?;
+                    mem.label = Some(label.to_string());
+                    mem.disp = addend;
                 }
-                Err(_) => return Err(invalid()),
             }
         }
         if let Some(inner) = inner {
@@ -1496,6 +1497,22 @@ fn parse_imm(text: &str) -> Result<i64, RasError> {
     }
     .map_err(|_| RasError::EncodingError(format!("Invalid immediate: {}", text)))?;
     Ok(if negative { -magnitude } else { magnitude })
+}
+
+pub(crate) fn rip_expression(text: &str) -> Option<(&str, i64)> {
+    let symbol = |s: &str| is_symbol(s) || is_got_symbol(s);
+    if symbol(text) { return Some((text, 0)); }
+    for (index, op) in text.char_indices().filter(|(i, c)| *i > 0 && matches!(c, '+' | '-')) {
+        let left = text[..index].trim();
+        let right = text[index + 1..].trim();
+        if symbol(left) && let Ok(value) = parse_imm(right) {
+            return Some((left, if op == '-' { value.checked_neg()? } else { value }));
+        }
+        if op == '+' && symbol(right) && let Ok(value) = parse_imm(left) {
+            return Some((right, value));
+        }
+    }
+    None
 }
 
 fn is_got_symbol(text: &str) -> bool {

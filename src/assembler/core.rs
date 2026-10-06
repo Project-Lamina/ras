@@ -85,6 +85,7 @@ enum PatchPoint {
         offset: usize,
         target: String,
         trailing: usize,
+        addend: i64,
     },
     Arx64Jal {
         offset: usize,
@@ -691,7 +692,7 @@ impl RasAssembler {
                             .encode_instruction(inst)
                             .map_err(|e| RasError::EncodingError(e.to_string()))?;
                         if let Some(fixup) = self.encoder.take_rip_fixup()
-                            && let Some(label) = inst
+                            && let Some((label, addend)) = inst
                                 .operands
                                 .iter()
                                 .find_map(|op| extract_rip_label(op.trim().trim_start_matches('*')))
@@ -700,6 +701,7 @@ impl RasAssembler {
                                 offset: current_offset + fixup.disp_offset,
                                 target: label.to_string(),
                                 trailing: fixup.trailing,
+                                addend,
                             });
                         }
                         code.extend_from_slice(&bytes);
@@ -885,10 +887,10 @@ impl RasAssembler {
                         code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
                     }
                     PatchPoint::X86RipRel32 {
-                        offset, trailing, ..
+                        offset, trailing, addend, ..
                     } => {
                         let rel32 =
-                            (target_offset as i64) - (*offset as i64 + 4 + *trailing as i64);
+                            (target_offset as i64) + *addend - (*offset as i64 + 4 + *trailing as i64);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
                         code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
                     }
@@ -922,14 +924,15 @@ impl RasAssembler {
                         });
                     }
                     PatchPoint::X86RipRel32 {
-                        offset, trailing, ..
+                        offset, trailing, addend, ..
                     } => {
+                        code[*offset..*offset + 4].fill(0);
                         external_relocs.push(ExternalReloc {
                             offset: *offset,
                             symbol: target.to_string(),
                             section: String::new(),
                             kind: if got { R_X86_64_REX_GOTPCRELX } else { 2 },
-                            addend: -(4 + *trailing as i64),
+                            addend: *addend - (4 + *trailing as i64),
                         });
                     }
                     _ => {
@@ -1280,7 +1283,7 @@ fn x86_cond_jmp_byte(opcode: &str) -> Option<u8> {
 }
 
 /// Returns the label name if `op` has the form `label(%rip)` (RIP-relative addressing).
-fn extract_rip_label(op: &str) -> Option<&str> {
+fn extract_rip_label(op: &str) -> Option<(&str, i64)> {
     let paren = op.find('(')?;
     let close = op.find(')')?;
     if close <= paren {
@@ -1290,12 +1293,7 @@ fn extract_rip_label(op: &str) -> Option<&str> {
     if !base.eq_ignore_ascii_case("rip") {
         return None;
     }
-    let label = op[..paren].trim();
-    // Must be a non-empty label name (not a numeric displacement)
-    if label.is_empty() || label.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
-        return None;
-    }
-    Some(label)
+    crate::encoder::x86_64::rip_expression(op[..paren].trim())
 }
 
 fn absolute_expression(
