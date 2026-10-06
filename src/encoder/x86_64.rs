@@ -1065,13 +1065,40 @@ impl InstructionEncoder for X86_64Encoder {
                 })?;
                 code = self.emit(enc);
             }
-            "rep" => {
-                if inst.operands.len() != 1 || inst.operands[0] != "movsb" {
-                    return Err(RasError::EncodingError(
-                        "rep: only `rep movsb` is supported".to_string(),
-                    ));
+            "rep" | "repe" | "repz" | "repne" | "repnz" | "lock" | "notrack" => {
+                let Some(first) = inst.operands.first() else {
+                    return Err(RasError::EncodingError("prefix requires instruction".into()));
+                };
+                let mut parts = first.splitn(2, char::is_whitespace);
+                let nested_opcode = parts.next().unwrap().to_string();
+                let mut operands = Vec::new();
+                if let Some(operand) = parts.next() { operands.push(operand.trim().to_string()); }
+                operands.extend_from_slice(&inst.operands[1..]);
+                if opcode == "notrack" && (!matches!(nested_opcode.as_str(), "call" | "jmp") || operands.len() != 1 || !operands[0].starts_with('*')) {
+                    return Err(RasError::EncodingError("notrack requires indirect branch".into()));
                 }
-                code.extend_from_slice(&[0xf3, 0xa4]);
+                if opcode == "lock" && (!alu_mnemonic(&nested_opcode).is_some_and(|(stem, _)| !matches!(stem, "cmp" | "test")) || !operands.last().is_some_and(|op| self.is_memory(op))) {
+                    return Err(RasError::EncodingError("unsupported lock instruction".into()));
+                }
+                let prefix = match opcode.as_str() { "lock" => 0xf0, "notrack" => 0x3e, "repne" | "repnz" => 0xf2, _ => 0xf3 };
+                code.push(prefix);
+                code.extend(self.encode_instruction(&ParsedInstruction { opcode: nested_opcode, operands })?);
+                if code.get(1) == Some(&0x66) { code.swap(0, 1); }
+                if let Some(fixup) = &mut self.rip_fixup { fixup.disp_offset += 1; }
+                self.position += 1;
+                return Ok(code);
+            }
+            "movsb" | "movsw" | "movsl" | "movsq" | "stosb" | "stosw" | "stosl" | "stosq"
+            | "cmpsb" | "cmpsw" | "cmpsl" | "cmpsq" | "scasb" | "scasw" | "scasl" | "scasq"
+            | "lodsb" | "lodsw" | "lodsl" | "lodsq" => {
+                if !inst.operands.is_empty() {
+                    return Err(RasError::EncodingError("explicit string operands unsupported".into()));
+                }
+                if opcode.ends_with('w') { code.push(0x66); }
+                if opcode.ends_with('q') { code.push(0x48); }
+                let base = if opcode.starts_with("movs") { 0xa4 } else if opcode.starts_with("cmps") { 0xa6 }
+                    else if opcode.starts_with("stos") { 0xaa } else if opcode.starts_with("lods") { 0xac } else { 0xae };
+                code.push(base + u8::from(!opcode.ends_with('b')));
             }
             "nop" => {
                 if !inst.operands.is_empty() {
