@@ -301,6 +301,8 @@ impl X86_64Encoder {
         let is_test = stem == "test";
         let digit: u8 = match stem {
             "or" => 1,
+            "adc" => 2,
+            "sbb" => 3,
             "and" => 4,
             "sub" => 5,
             "xor" => 6,
@@ -837,6 +839,36 @@ impl InstructionEncoder for X86_64Encoder {
                 })?;
                 code = self.emit(enc);
             }
+            "fld1" => code.extend_from_slice(&[0xd9, 0xe8]),
+            "bswap" | "bswapl" | "bswapq" => {
+                let [operand] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError("bswap requires 1 operand".into()));
+                };
+                let reg = gpr(operand).filter(|g| matches!(g.width, 32 | 64))
+                    .ok_or_else(|| RasError::EncodingError("bswap requires 32/64-bit register".into()))?;
+                if (opcode == "bswapl" && reg.width != 32) || (opcode == "bswapq" && reg.width != 64) {
+                    return Err(RasError::EncodingError("bswap width mismatch".into()));
+                }
+                let rex = self.encode_rex(reg.width == 64, 0, 0, reg.num >> 3);
+                if rex != 0x40 { code.push(rex); }
+                code.extend_from_slice(&[0x0f, 0xc8 | (reg.num & 7)]);
+            }
+            "btl" | "btq" | "bsrl" | "bsrq" => {
+                let [src, dst] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError("bit operation requires 2 operands".into()));
+                };
+                let width = if opcode.ends_with('q') { 64 } else { 32 };
+                let scan = opcode.starts_with("bsr");
+                let (rm, rm_gpr) = self.parse_rm(if scan { src } else { dst }, false)?;
+                let reg = gpr(if scan { dst } else { src })
+                    .ok_or_else(|| RasError::EncodingError("bit operation requires register".into()))?;
+                operand_width(Some(width), &[rm_gpr, Some(reg)])?;
+                code = self.emit(encode_op(Op {
+                    wide: width == 64,
+                    opcode: &[0x0f, if scan { 0xbd } else { 0xa3 }],
+                    reg: reg.num, rm, ..Op::default()
+                })?);
+            }
             "ret" => code.push(0xC3),
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
             "leave" => code.push(0xC9),
@@ -1014,7 +1046,7 @@ impl InstructionEncoder for X86_64Encoder {
                 code.push(0x99);
             }
             // REX.W 0x99 for 32-bit sign-extend eax into edx:eax
-            "cdq" => {
+            "cdq" | "cltd" => {
                 code.push(0x99);
             }
             // SETcc instructions (byte result from flags)
@@ -1506,7 +1538,7 @@ fn byte_flags(gprs: &[Option<Gpr>]) -> (bool, bool) {
         })
 }
 
-const ALU_STEMS: [&str; 7] = ["add", "or", "and", "sub", "xor", "cmp", "test"];
+const ALU_STEMS: [&str; 9] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp", "test"];
 
 fn alu_mnemonic(name: &str) -> Option<(&'static str, Option<u8>)> {
     if let Some(stem) = ALU_STEMS.iter().find(|candidate| **candidate == name) {
@@ -1537,7 +1569,7 @@ fn sized_stem(opcode: &str, stem: &str) -> Option<Option<u8>> {
 }
 
 fn shift_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
-    [("sar", 7), ("shl", 4), ("sal", 4), ("shr", 5)]
+    [("rol", 0), ("sar", 7), ("shl", 4), ("sal", 4), ("shr", 5)]
         .into_iter()
         .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
 }
@@ -1581,6 +1613,7 @@ fn unary_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
     [
         ("inc", 0),
         ("dec", 1),
+        ("not", 2),
         ("neg", 3),
         ("mul", 4),
         ("idiv", 7),
