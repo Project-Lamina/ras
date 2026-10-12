@@ -592,6 +592,55 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_x87(&self, opcode: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let memory = match opcode {
+            "flds" => Some((0xd9, 0)), "fldl" => Some((0xdd, 0)), "fldt" => Some((0xdb, 5)),
+            "fstl" => Some((0xdd, 2)), "fstpl" => Some((0xdd, 3)), "fstpt" => Some((0xdb, 7)),
+            "fildl" => Some((0xdb, 0)), "fildq" => Some((0xdf, 5)),
+            "fistpl" => Some((0xdb, 3)), "fistpq" => Some((0xdf, 7)),
+            "fldcw" => Some((0xd9, 5)), "fnstcw" => Some((0xd9, 7)),
+            "fadds" => Some((0xd8, 0)), "faddl" => Some((0xdc, 0)), "fmull" => Some((0xdc, 1)),
+            _ => None,
+        };
+        if let Some((byte, digit)) = memory {
+            let [operand] = operands else {
+                return Err(RasError::EncodingError("x87 memory operation requires 1 operand".into()));
+            };
+            return encode_op(Op { opcode: &[byte], reg: digit, rm: Rm::Mem(self.parse_mem(operand)?), ..Op::default() });
+        }
+        let stack = |operand: &str| -> Result<u8, RasError> {
+            let text = operand.trim().trim_start_matches('%');
+            if text == "st" { return Ok(0); }
+            text.strip_prefix("st(").and_then(|s| s.strip_suffix(')'))
+                .and_then(|s| s.parse::<u8>().ok()).filter(|n| *n < 8)
+                .ok_or_else(|| RasError::EncodingError("expected x87 stack register".into()))
+        };
+        let (byte, field) = match (opcode, operands) {
+            ("fld" | "fxch" | "fstp", [operand]) => {
+                let reg = stack(operand)?;
+                match opcode { "fld" => (0xd9, 0xc0 + reg), "fxch" => (0xd9, 0xc8 + reg), _ => (0xdd, 0xd8 + reg) }
+            }
+            ("fmul" | "fsub" | "fmulp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip", [src, dst]) => {
+                let src = stack(src)?;
+                let dst = stack(dst)?;
+                match opcode {
+                    "fmul" if dst == 0 => (0xd8, 0xc8 + src),
+                    "fmul" if src == 0 => (0xdc, 0xc8 + dst),
+                    "fsub" if dst == 0 => (0xd8, 0xe0 + src),
+                    "fsub" if src == 0 => (0xdc, 0xe0 + dst),
+                    "fmulp" if src == 0 => (0xde, 0xc8 + dst),
+                    "fsubrp" if src == 0 => (0xde, 0xe8 + dst),
+                    "fcomi" if dst == 0 => (0xdb, 0xf0 + src),
+                    "fcomip" if dst == 0 => (0xdf, 0xf0 + src),
+                    "fucomip" if dst == 0 => (0xdf, 0xe8 + src),
+                    _ => return Err(RasError::EncodingError("unsupported x87 stack operands".into())),
+                }
+            }
+            _ => return Err(RasError::EncodingError("unsupported x87 operands".into())),
+        };
+        Ok(Encoded { bytes: vec![byte, field], rip: None })
+    }
+
     fn encode_cvttsd2si(&self, wide: bool, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError(
@@ -839,6 +888,15 @@ impl InstructionEncoder for X86_64Encoder {
                     ..Op::default()
                 })?;
                 code = self.emit(enc);
+            }
+            "flds" | "fldl" | "fldt" | "fstl" | "fstpl" | "fstpt" | "fildl" | "fildq"
+            | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl" | "fmull"
+            | "fld" | "fxch" | "fstp" | "fmul" | "fsub" | "fmulp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip" => {
+                code = self.emit(self.encode_x87(&opcode, &inst.operands)?);
+            }
+            "fldz" | "fchs" => {
+                if !inst.operands.is_empty() { return Err(RasError::EncodingError("x87 constant/sign operation takes no operands".into())); }
+                code.extend_from_slice(&[0xd9, if opcode == "fldz" { 0xee } else { 0xe0 }]);
             }
             "fld1" => code.extend_from_slice(&[0xd9, 0xe8]),
             "bswap" | "bswapl" | "bswapq" => {
