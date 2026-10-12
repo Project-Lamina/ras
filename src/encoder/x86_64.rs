@@ -935,15 +935,15 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_cvttsd2si(opcode == "cvttsd2siq", &inst.operands)?;
                 code = self.emit(enc);
             }
-            "cvtsi2sdl" | "cvtsi2sdq" => {
+            "cvtsi2sdl" | "cvtsi2sdq" | "cvtsi2ssq" => {
                 let [src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError("cvtsi2sd requires 2 operands".into()));
                 };
                 let (rm, src_reg) = self.parse_rm(src, false)?;
-                let wide = opcode == "cvtsi2sdq";
+                let wide = opcode.ends_with('q');
                 operand_width(Some(if wide { 64 } else { 32 }), &[src_reg])?;
                 let reg = parse_xmm(dst).ok_or_else(|| RasError::EncodingError("cvtsi2sd requires xmm destination".into()))?;
-                code = self.emit(encode_op(Op { legacy: &[0xf2], wide, opcode: &[0x0f, 0x2a], reg, rm, ..Op::default() })?);
+                code = self.emit(encode_op(Op { legacy: &[if opcode == "cvtsi2ssq" { 0xf3 } else { 0xf2 }], wide, opcode: &[0x0f, 0x2a], reg, rm, ..Op::default() })?);
             }
             "movdqu" => {
                 code = self.emit(self.encode_sse_move(&[0xf3], &[0x0f, 0x6f], &[0x0f, 0x7f], &inst.operands)?);
@@ -954,14 +954,15 @@ impl InstructionEncoder for X86_64Encoder {
                 }
                 code = self.emit(self.encode_sse_move(&[], &[0x0f, 0x16], &[0x0f, 0x17], &inst.operands)?);
             }
-            "punpcklqdq" | "punpckldq" | "pcmpeqd" | "comisd" | "ucomisd" => {
+            "punpcklqdq" | "punpckldq" | "pcmpeqd" | "comisd" | "ucomisd" | "paddb" | "paddw" | "psubd" | "pand" => {
                 let op = match opcode.as_str() {
                     "punpcklqdq" => 0x6c, "punpckldq" => 0x62, "pcmpeqd" => 0x76,
+                    "paddb" => 0xfc, "paddw" => 0xfd, "psubd" => 0xfa, "pand" => 0xdb,
                     "comisd" => 0x2f, _ => 0x2e,
                 };
                 code = self.emit(self.encode_sse_rm(&[0x66], &[0x0f, op], &inst.operands)?);
             }
-            "pshufd" | "pshuflw" => {
+            "pshufd" | "pshuflw" | "shufpd" => {
                 let [imm, src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError("shuffle requires 3 operands".into()));
                 };
@@ -970,9 +971,45 @@ impl InstructionEncoder for X86_64Encoder {
                 let (rm, _) = self.parse_rm(src, true)?;
                 let reg = parse_xmm(dst).ok_or_else(|| RasError::EncodingError("shuffle requires xmm destination".into()))?;
                 code = self.emit(encode_op(Op {
-                    legacy: &[if opcode == "pshufd" { 0x66 } else { 0xf2 }],
-                    opcode: &[0x0f, 0x70], reg, rm, imm: &[imm], ..Op::default()
+                    legacy: &[if opcode == "pshuflw" { 0xf2 } else { 0x66 }],
+                    opcode: &[0x0f, if opcode == "shufpd" { 0xc6 } else { 0x70 }], reg, rm, imm: &[imm], ..Op::default()
                 })?);
+            }
+            "movss" => {
+                code = self.emit(self.encode_sse_move(&[0xf3], &[0x0f, 0x10], &[0x0f, 0x11], &inst.operands)?);
+            }
+            "movlpd" => {
+                if inst.operands.len() != 2 || inst.operands.iter().filter(|op| self.is_memory(op)).count() != 1 {
+                    return Err(RasError::EncodingError("movlpd requires memory and xmm operands".into()));
+                }
+                code = self.emit(self.encode_sse_move(&[0x66], &[0x0f, 0x12], &[0x0f, 0x13], &inst.operands)?);
+            }
+            "movhlps" => {
+                if inst.operands.iter().any(|op| parse_xmm(op).is_none()) {
+                    return Err(RasError::EncodingError("movhlps requires xmm registers".into()));
+                }
+                code = self.emit(self.encode_sse_rm(&[], &[0x0f, 0x12], &inst.operands)?);
+            }
+            "cvtss2sd" | "minsd" => {
+                code = self.emit(self.encode_sse_rm(&[if opcode == "minsd" { 0xf2 } else { 0xf3 }], &[0x0f, if opcode == "minsd" { 0x5d } else { 0x5a }], &inst.operands)?);
+            }
+            "pextrw" | "pinsrw" => {
+                let [imm, src, dst] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError("word transfer requires 3 operands".into()));
+                };
+                let imm = imm.strip_prefix('$').ok_or_else(|| RasError::EncodingError("word transfer requires immediate".into()))?;
+                let imm = u8::try_from(parse_imm(imm)?).map_err(|_| RasError::EncodingError("word transfer immediate out of range".into()))?;
+                let (reg, rm) = if opcode == "pextrw" {
+                    let reg = gpr(dst).filter(|g| g.width == 32).ok_or_else(|| RasError::EncodingError("pextrw requires 32-bit destination".into()))?;
+                    let src = parse_xmm(src).ok_or_else(|| RasError::EncodingError("pextrw requires xmm source".into()))?;
+                    (reg.num, Rm::Reg(src))
+                } else {
+                    let reg = parse_xmm(dst).ok_or_else(|| RasError::EncodingError("pinsrw requires xmm destination".into()))?;
+                    let (rm, gpr) = self.parse_rm(src, false)?;
+                    operand_width(Some(32), &[gpr])?;
+                    (reg, rm)
+                };
+                code = self.emit(encode_op(Op { legacy: &[0x66], opcode: &[0x0f, if opcode == "pextrw" { 0xc5 } else { 0xc4 }], reg, rm, imm: &[imm], ..Op::default() })?);
             }
             "movsd" => {
                 let enc =
@@ -1316,36 +1353,8 @@ impl InstructionEncoder for X86_64Encoder {
                 operand_width(Some(32), &[gpr])?;
                 code = self.emit(encode_op(Op { legacy: &[0x66], opcode: &[0x0f, op], reg, rm, ..Op::default() })?);
             }
-            // xorps: 0F 57 /r
-            "xorps" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("xorps requires 2 operands".into()));
-                }
-                let src = parse_xmm(inst.operands[0].trim().trim_start_matches('%'))
-                    .ok_or_else(|| RasError::EncodingError("xorps: expected xmm src".into()))?;
-                let dst = parse_xmm(inst.operands[1].trim().trim_start_matches('%'))
-                    .ok_or_else(|| RasError::EncodingError("xorps: expected xmm dst".into()))?;
-                if src >= 8 || dst >= 8 {
-                    code.push(0x40 | ((dst >> 3) << 2) | (src >> 3));
-                }
-                code.extend_from_slice(&[0x0F, 0x57]);
-                code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
-            }
-            // xorpd: 66 0F 57 /r
-            "xorpd" => {
-                if inst.operands.len() != 2 {
-                    return Err(RasError::EncodingError("xorpd requires 2 operands".into()));
-                }
-                let src = parse_xmm(inst.operands[0].trim().trim_start_matches('%'))
-                    .ok_or_else(|| RasError::EncodingError("xorpd: expected xmm src".into()))?;
-                let dst = parse_xmm(inst.operands[1].trim().trim_start_matches('%'))
-                    .ok_or_else(|| RasError::EncodingError("xorpd: expected xmm dst".into()))?;
-                code.push(0x66);
-                if src >= 8 || dst >= 8 {
-                    code.push(0x40 | ((dst >> 3) << 2) | (src >> 3));
-                }
-                code.extend_from_slice(&[0x0F, 0x57]);
-                code.push(0xC0 | ((dst & 7) << 3) | (src & 7));
+            "xorps" | "xorpd" => {
+                code = self.emit(self.encode_sse_rm(if opcode == "xorpd" { &[0x66] } else { &[] }, &[0x0f, 0x57], &inst.operands)?);
             }
             "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" | "movsbl" | "movsbq"
             | "movswl" | "movswq" => {
