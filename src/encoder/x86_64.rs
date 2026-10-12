@@ -1560,11 +1560,12 @@ fn parse_imm(text: &str) -> Result<i64, RasError> {
         .strip_prefix("0x")
         .or_else(|| digits.strip_prefix("0X"))
     {
-        Some(hex) => i64::from_str_radix(hex, 16),
-        None => digits.parse::<i64>(),
+        Some(hex) => i128::from_str_radix(hex, 16),
+        None => digits.parse::<i128>(),
     }
     .map_err(|_| RasError::EncodingError(format!("Invalid immediate: {}", text)))?;
-    Ok(if negative { -magnitude } else { magnitude })
+    i64::try_from(if negative { -magnitude } else { magnitude })
+        .map_err(|_| RasError::EncodingError(format!("Immediate out of range: {}", text)))
 }
 
 pub(crate) fn rip_expression(text: &str) -> Option<(&str, i64)> {
