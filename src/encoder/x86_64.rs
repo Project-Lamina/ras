@@ -620,7 +620,7 @@ impl X86_64Encoder {
                 let reg = stack(operand)?;
                 match opcode { "fld" => (0xd9, 0xc0 + reg), "fxch" => (0xd9, 0xc8 + reg), _ => (0xdd, 0xd8 + reg) }
             }
-            ("fmul" | "fsub" | "fmulp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip", [src, dst]) => {
+            ("fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip", [src, dst]) => {
                 let src = stack(src)?;
                 let dst = stack(dst)?;
                 match opcode {
@@ -629,6 +629,7 @@ impl X86_64Encoder {
                     "fsub" if dst == 0 => (0xd8, 0xe0 + src),
                     "fsub" if src == 0 => (0xdc, 0xe0 + dst),
                     "fmulp" if src == 0 => (0xde, 0xc8 + dst),
+                    "fdivp" if src == 0 => (0xde, 0xf0 + dst),
                     "fsubrp" if src == 0 => (0xde, 0xe8 + dst),
                     "fcomi" if dst == 0 => (0xdb, 0xf0 + src),
                     "fcomip" if dst == 0 => (0xdf, 0xf0 + src),
@@ -891,7 +892,7 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "flds" | "fldl" | "fldt" | "fstl" | "fstpl" | "fstpt" | "fildl" | "fildq"
             | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl" | "fmull"
-            | "fld" | "fxch" | "fstp" | "fmul" | "fsub" | "fmulp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip" => {
+            | "fld" | "fxch" | "fstp" | "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip" => {
                 code = self.emit(self.encode_x87(&opcode, &inst.operands)?);
             }
             "fldz" | "fchs" => {
