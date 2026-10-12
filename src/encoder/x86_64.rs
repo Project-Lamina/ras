@@ -842,28 +842,22 @@ impl InstructionEncoder for X86_64Encoder {
                         &inst.operands,
                     )?);
                 } else {
-                    let a_xmm = parse_xmm(a.trim().trim_start_matches('%'));
-                    let b_xmm = parse_xmm(b.trim().trim_start_matches('%'));
-                    if let (Ok(gpr), Some(xmm)) = (self.parse_register(a), b_xmm) {
-                        // movq %gpr, %xmm  →  66 REX.W 0F 6E /r
-                        code.push(0x66);
-                        code.push(0x48 | ((xmm >> 3) << 2) | (gpr >> 3));
-                        code.extend_from_slice(&[0x0F, 0x6E]);
-                        code.push(0xC0 | ((xmm & 7) << 3) | (gpr & 7));
-                    } else if let (Some(xmm), Ok(gpr)) = (a_xmm, self.parse_register(b)) {
-                        // movq %xmm, %gpr  →  66 REX.W 0F 7E /r
-                        code.push(0x66);
-                        code.push(0x48 | ((xmm >> 3) << 2) | (gpr >> 3));
-                        code.extend_from_slice(&[0x0F, 0x7E]);
-                        code.push(0xC0 | ((xmm & 7) << 3) | (gpr & 7));
+                    let a_xmm = parse_xmm(a);
+                    let b_xmm = parse_xmm(b);
+                    let transfer = match (gpr(a), b_xmm, a_xmm, gpr(b)) {
+                        (Some(reg), Some(xmm), _, _) => Some((reg, xmm, 0x6e)),
+                        (_, _, Some(xmm), Some(reg)) => Some((reg, xmm, 0x7e)),
+                        _ => None,
+                    };
+                    if let Some((reg, xmm, op)) = transfer {
+                        operand_width(Some(64), &[Some(reg)])?;
+                        code = self.emit(encode_op(Op { legacy: &[0x66], wide: true, opcode: &[0x0f, op], reg: xmm, rm: Rm::Reg(reg.num), ..Op::default() })?);
+                    } else if b_xmm.is_some() {
+                        code = self.emit(self.encode_sse_rm(&[0xf3], &[0x0f, 0x7e], &inst.operands)?);
+                    } else if let Some(reg) = a_xmm {
+                        code = self.emit(encode_op(Op { legacy: &[0x66], opcode: &[0x0f, 0xd6], reg, rm: Rm::Mem(self.parse_mem(b)?), ..Op::default() })?);
                     } else {
-                        // AT&T order: `mov src, dst`. 0x89 is MOV r/m64, r64 where
-                        // the reg field is the source and r/m is the destination.
-                        let src_reg = self.parse_register(a)?;
-                        let dst_reg = self.parse_register(b)?;
-                        code.push(self.encode_rex(true, src_reg >> 3, 0, dst_reg >> 3));
-                        code.push(0x89);
-                        code.push(0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7));
+                        return Err(RasError::EncodingError("unsupported movq operands".into()));
                     }
                 }
             }
