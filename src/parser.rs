@@ -612,14 +612,28 @@ fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
     let s = s.trim();
     let s = s.strip_prefix('"')?.strip_suffix('"')?;
     let mut out = Vec::new();
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next()? {
+                'b' => out.push(8),
+                'f' => out.push(12),
+                'v' => out.push(11),
                 'n' => out.push(b'\n'),
                 'r' => out.push(b'\r'),
                 't' => out.push(b'\t'),
-                '0' => out.push(0),
+                digit @ '0'..='7' => {
+                    let mut value = digit as u8 - b'0';
+                    for _ in 0..2 {
+                        if let Some(next @ '0'..='7') = chars.peek().copied() {
+                            chars.next();
+                            value = value.wrapping_mul(8).wrapping_add(next as u8 - b'0');
+                        } else {
+                            break;
+                        }
+                    }
+                    out.push(value);
+                }
                 '"' => out.push(b'"'),
                 '\\' => out.push(b'\\'),
                 c => out.push(c as u8),
