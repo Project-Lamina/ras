@@ -32,6 +32,7 @@ struct ShortJump {
 }
 
 struct Layout {
+    line_offsets: Vec<usize>,
     code: Vec<u8>,
     symbol_offsets: HashMap<String, usize>,
     patch_points: Vec<PatchPoint>,
@@ -422,26 +423,92 @@ impl RasAssembler {
         executable: bool,
         positions: &HashMap<String, (String, usize)>,
     ) -> Result<Layout, RasError> {
+        let mut labels = HashMap::new();
+        let mut regions = Vec::with_capacity(lines.len());
+        let mut region = 0;
+        for (index, line) in lines.iter().enumerate() {
+            regions.push(region);
+            if let Line::Label(symbol) = line {
+                labels.insert(symbol.name.as_str(), index);
+            }
+            if matches!(line, Line::Align { .. }) {
+                region += 1;
+            }
+        }
         let mut long_jumps = HashSet::new();
+        for (index, line) in lines.iter().enumerate() {
+            if let Line::Instruction(inst) = line
+                && (inst.opcode == "jmp" || x86_cond_jmp_byte(&inst.opcode).is_some())
+                && inst.operands.len() == 1
+                && !inst.operands[0].starts_with('*')
+                && !labels.contains_key(inst.operands[0].as_str())
+            {
+                long_jumps.insert(index);
+            }
+        }
         let layout = loop {
             let layout = self.layout_lines(lines, executable, &long_jumps, positions)?;
-            let grown: Vec<usize> = layout
-                .short_jumps
-                .iter()
-                .filter(|site| {
-                    !layout
-                        .symbol_offsets
-                        .get(&site.target)
-                        .is_some_and(|&target| {
-                            i8::try_from(target as i64 - (site.offset as i64 + 2)).is_ok()
-                        })
-                })
-                .map(|site| site.index)
-                .collect();
-            if grown.is_empty() {
+            let mut stretch = 0i64;
+            let mut adjusted = HashMap::new();
+            let mut sites = layout.short_jumps.iter().peekable();
+            let mut grown = false;
+            for (index, line) in lines.iter().enumerate() {
+                let old = layout.line_offsets[index] as i64;
+                let address = old + stretch;
+                if let Line::Label(symbol) = line {
+                    adjusted.insert(symbol.name.as_str(), address);
+                }
+                if let Line::Align {
+                    value,
+                    directive,
+                    max_skip,
+                    ..
+                } = line
+                {
+                    let alignment = self.alignment(*value, directive)? as i64;
+                    let padding = |at: i64| {
+                        let bytes = (alignment - at % alignment) % alignment;
+                        if max_skip.is_some_and(|maximum| bytes > maximum as i64) {
+                            0
+                        } else {
+                            bytes
+                        }
+                    };
+                    stretch += padding(address) - padding(old);
+                }
+                if let Some(site) = sites.peek().filter(|site| site.index == index) {
+                    let target = if let Some(&target) = adjusted.get(site.target.as_str()) {
+                        target
+                    } else if let Some(&target) = layout.symbol_offsets.get(&site.target) {
+                        let target = target as i64;
+                        if stretch < 0
+                            || labels
+                                .get(site.target.as_str())
+                                .is_some_and(|&label| regions[label] == regions[index])
+                        {
+                            target + stretch
+                        } else {
+                            target.max(address)
+                        }
+                    } else {
+                        i64::MAX
+                    };
+                    if i8::try_from(target - (address + 2)).is_err() {
+                        long_jumps.insert(index);
+                        stretch += if matches!(line, Line::Instruction(inst) if inst.opcode == "jmp")
+                        {
+                            3
+                        } else {
+                            4
+                        };
+                        grown = true;
+                    }
+                    sites.next();
+                }
+            }
+            if !grown {
                 break layout;
             }
-            long_jumps.extend(grown);
         };
         Ok(layout)
     }
@@ -467,8 +534,10 @@ impl RasAssembler {
         let mut mapping_mode = "";
         let mut current_offset = 0usize;
         let mut short_jumps = Vec::new();
+        let mut line_offsets = Vec::with_capacity(lines.len());
 
         for (index, line) in lines.iter().enumerate() {
+            line_offsets.push(current_offset);
             if self.target_arch == TargetArchitecture::Aarch64 {
                 let mode = match line {
                     Line::Instruction(_) => "$x",
@@ -712,6 +781,7 @@ impl RasAssembler {
         }
 
         Ok(Layout {
+            line_offsets,
             code,
             symbol_offsets,
             patch_points,
@@ -732,6 +802,7 @@ impl RasAssembler {
             patch_points,
             mapping_symbols,
             short_jumps,
+            ..
         } = layout;
         for site in &short_jumps {
             let target = symbol_offsets.get(&site.target).ok_or_else(|| {
