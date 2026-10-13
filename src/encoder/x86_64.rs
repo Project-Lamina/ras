@@ -41,40 +41,6 @@ impl X86_64Encoder {
         rex
     }
 
-    fn parse_register(&self, reg: &str) -> Result<u8, RasError> {
-        let reg = reg.trim_start_matches('%');
-        if let Some(number) = reg.strip_prefix('r') {
-            let number = number.trim_end_matches(['b', 'w', 'd']);
-            if let Ok(n) = number.parse::<u8>()
-                && (8..=15).contains(&n)
-            {
-                return Ok(n);
-            }
-        }
-        match reg {
-            "rax" | "eax" | "ax" | "al" => Ok(0),
-            "rcx" | "ecx" | "cx" | "cl" => Ok(1),
-            "rdx" | "edx" | "dx" | "dl" => Ok(2),
-            "rbx" | "ebx" | "bx" | "bl" => Ok(3),
-            "rsp" | "esp" | "sp" | "spl" | "ah" => Ok(4),
-            "rbp" | "ebp" | "bp" | "bpl" | "ch" => Ok(5),
-            "rsi" | "esi" | "si" | "sil" | "dh" => Ok(6),
-            "rdi" | "edi" | "di" | "dil" | "bh" => Ok(7),
-            "r8" => Ok(8),
-            "r9" => Ok(9),
-            "r10" => Ok(10),
-            "r11" => Ok(11),
-            "r12" => Ok(12),
-            "r13" => Ok(13),
-            "r14" => Ok(14),
-            "r15" => Ok(15),
-            _ => Err(RasError::EncodingError(format!(
-                "Unknown register: {}",
-                reg
-            ))),
-        }
-    }
-
     fn parse_mem(&self, op: &str) -> Result<Mem, RasError> {
         let invalid = || RasError::EncodingError(format!("Invalid memory operand: {}", op));
         let mut text = op.trim();
@@ -159,7 +125,7 @@ impl X86_64Encoder {
 
     fn is_memory(&self, op: &str) -> bool {
         let op = op.trim();
-        (op.contains('(') && op.contains(')')) || op.starts_with("%fs:")
+        (op.contains('(') && op.contains(')')) || op.starts_with("%fs:") || parse_imm(op).is_ok()
     }
 
     fn parse_rm(&self, op: &str, xmm: bool) -> Result<(Rm, Option<Gpr>), RasError> {
@@ -492,13 +458,14 @@ impl X86_64Encoder {
             ));
         };
         let width = operand_width(width, &[src_gpr, dst_gpr])?;
-        if width != 32 && width != 64 {
+        if !matches!(width, 16 | 32 | 64) {
             return Err(RasError::EncodingError(format!(
                 "cmov: unsupported operand width: {}",
                 width
             )));
         }
         encode_op(Op {
+            legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             opcode: &[0x0f, 0x40 | cc],
             reg,
@@ -739,6 +706,7 @@ impl X86_64Encoder {
             ));
         }
         let (src_bits, dst_width): (Option<u8>, Option<u8>) = match opcode {
+            "movsbw" => (Some(8), Some(16)),
             "movzbq" | "movsbq" => (Some(8), Some(64)),
             "movzbl" | "movsbl" => (Some(8), Some(32)),
             "movzwq" | "movswq" => (Some(16), Some(64)),
@@ -821,6 +789,18 @@ impl InstructionEncoder for X86_64Encoder {
         if let Some((cc, width)) = cmov_mnemonic(&opcode) {
             let encoded = self.encode_cmov(cc, width, &inst.operands)?;
             let bytes = self.emit(encoded);
+            self.position += bytes.len();
+            return Ok(bytes);
+        }
+        if let Some(cc) = opcode.strip_prefix("set").and_then(condition_code) {
+            let [operand] = inst.operands.as_slice() else {
+                return Err(RasError::EncodingError("setcc requires 1 operand".into()));
+            };
+            let (rm, gpr) = self.parse_rm(operand, false)?;
+            operand_width(Some(8), &[gpr])?;
+            let (byte_rex, high) = byte_flags(&[gpr]);
+            let enc = encode_op(Op { byte_rex, high, opcode: &[0x0f, 0x90 | cc], rm, ..Op::default() })?;
+            let bytes = self.emit(enc);
             self.position += bytes.len();
             return Ok(bytes);
         }
@@ -907,21 +887,25 @@ impl InstructionEncoder for X86_64Encoder {
                 if rex != 0x40 { code.push(rex); }
                 code.extend_from_slice(&[0x0f, 0xc8 | (reg.num & 7)]);
             }
-            "btl" | "btq" | "bsrl" | "bsrq" => {
+            "btl" | "btq" | "btsl" | "btsq" | "btrl" | "btrq" | "btcl" | "btcq" | "bsrl" | "bsrq" => {
                 let [src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError("bit operation requires 2 operands".into()));
                 };
                 let width = if opcode.ends_with('q') { 64 } else { 32 };
                 let scan = opcode.starts_with("bsr");
                 let (rm, rm_gpr) = self.parse_rm(if scan { src } else { dst }, false)?;
-                let reg = gpr(if scan { dst } else { src })
-                    .ok_or_else(|| RasError::EncodingError("bit operation requires register".into()))?;
-                operand_width(Some(width), &[rm_gpr, Some(reg)])?;
-                code = self.emit(encode_op(Op {
-                    wide: width == 64,
-                    opcode: &[0x0f, if scan { 0xbd } else { 0xa3 }],
-                    reg: reg.num, rm, ..Op::default()
-                })?);
+                let digit = if opcode.starts_with("bts") { 5 } else if opcode.starts_with("btr") { 6 } else if opcode.starts_with("btc") { 7 } else { 4 };
+                let mut imm = Vec::new();
+                let (op, reg) = if !scan && let Some(value) = src.strip_prefix('$') {
+                    imm.push(u8::try_from(parse_imm(value)?).map_err(|_| RasError::EncodingError("bit index out of range".into()))?);
+                    operand_width(Some(width), &[rm_gpr])?;
+                    (0xba, digit)
+                } else {
+                    let reg = gpr(if scan { dst } else { src }).ok_or_else(|| RasError::EncodingError("bit operation requires register".into()))?;
+                    operand_width(Some(width), &[rm_gpr, Some(reg)])?;
+                    (if scan { 0xbd } else { 0xa3 + (digit - 4) * 8 }, reg.num)
+                };
+                code = self.emit(encode_op(Op { wide: width == 64, opcode: &[0x0f, op], reg, rm, imm: &imm, ..Op::default() })?);
             }
             "ret" => code.push(0xC3),
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
@@ -1056,34 +1040,33 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_sse_shift(3, &inst.operands)?;
                 code = self.emit(enc);
             }
+            "cwtl" => code.push(0x98),
+            "ud2" => code.extend_from_slice(&[0x0f, 0x0b]),
             "cltq" => code.extend_from_slice(&[0x48, 0x98]),
             "movslq" => {
                 let enc = self.encode_movsxd(&inst.operands)?;
                 code = self.emit(enc);
             }
-            "pushq" | "push" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "push requires 1 operand".to_string(),
-                    ));
+            "pushq" | "push" | "popq" | "pop" => {
+                let [operand] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError("push/pop requires 1 operand".into()));
+                };
+                let push = opcode.starts_with("push");
+                if let Some(imm) = operand.strip_prefix('$').filter(|_| push) {
+                    let imm = parse_imm(imm)?;
+                    let small = i8::try_from(imm).is_ok();
+                    code.push(if small { 0x6a } else { 0x68 });
+                    code.extend(imm_bytes(imm, if small { 8 } else { 64 })?);
+                } else {
+                    let (rm, reg) = self.parse_rm(operand, false)?;
+                    operand_width(Some(64), &[reg])?;
+                    if let Rm::Reg(reg) = rm {
+                        if reg >= 8 { code.push(0x41); }
+                        code.push((if push { 0x50 } else { 0x58 }) | (reg & 7));
+                    } else {
+                        code = self.emit(encode_op(Op { opcode: &[if push { 0xff } else { 0x8f }], reg: if push { 6 } else { 0 }, rm, ..Op::default() })?);
+                    }
                 }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 8 {
-                    code.push(0x41);
-                }
-                code.push(0x50 | (reg & 7));
-            }
-            "popq" | "pop" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "pop requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 8 {
-                    code.push(0x41);
-                }
-                code.push(0x58 | (reg & 7));
             }
             "leaq" | "lea" | "leal" => {
                 let width = match opcode.as_str() {
@@ -1099,30 +1082,24 @@ impl InstructionEncoder for X86_64Encoder {
                     "imulq" => Some(64),
                     _ => None,
                 };
+                if inst.operands.len() == 1 {
+                    code = self.emit(self.encode_unary(5, suffix_width, &inst.operands)?);
+                    self.position += code.len();
+                    return Ok(code);
+                }
                 // Three-operand form: imul $imm, src, dst
                 if inst.operands.len() == 3 {
                     let imm = parse_imm(inst.operands[0].trim_start_matches('$'))?;
-                    let src_reg = self.parse_register(&inst.operands[1])?;
-                    let dst_reg = self.parse_register(&inst.operands[2])?;
-                    let width = operand_width(
-                        suffix_width,
-                        &[gpr(&inst.operands[1]), gpr(&inst.operands[2])],
-                    )?;
-                    let wide = width == 64;
-                    let rex = self.encode_rex(wide, dst_reg >> 3, 0, src_reg >> 3);
-                    if wide || rex != 0x40 {
-                        code.push(rex);
-                    }
-                    let modrm = 0xC0 | ((dst_reg & 7) << 3) | (src_reg & 7);
-                    if (-128..=127).contains(&imm) {
-                        code.push(0x6B);
-                        code.push(modrm);
-                        code.push(imm as u8);
-                    } else {
-                        code.push(0x69);
-                        code.push(modrm);
-                        code.extend_from_slice(&(imm as i32).to_le_bytes());
-                    }
+                    let (rm, src_gpr) = self.parse_rm(&inst.operands[1], false)?;
+                    let dst = gpr(&inst.operands[2]).ok_or_else(|| RasError::EncodingError("imul requires register destination".into()))?;
+                    let width = operand_width(suffix_width, &[src_gpr, Some(dst)])?;
+                    if !matches!(width, 32 | 64) { return Err(RasError::EncodingError("unsupported imul width".into())); }
+                    let small = (-128..=127).contains(&imm);
+                    let immediate = imm_bytes(imm, if small { 8 } else { width })?;
+                    code = self.emit(encode_op(Op {
+                        wide: width == 64, opcode: &[if small { 0x6b } else { 0x69 }],
+                        reg: dst.num, rm, imm: &immediate, ..Op::default()
+                    })?);
                     self.position += code.len();
                     return Ok(code);
                 }
@@ -1206,91 +1183,6 @@ impl InstructionEncoder for X86_64Encoder {
             "cdq" | "cltd" => {
                 code.push(0x99);
             }
-            // SETcc instructions (byte result from flags)
-            "sete" | "setz" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "sete requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                } // REX prefix for spl/bpl/sil/dil and r8b-r15b
-                code.push(0x0F);
-                code.push(0x94);
-                code.push(0xC0 | (reg & 7));
-            }
-            "setne" | "setnz" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "setne requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.push(0x0F);
-                code.push(0x95);
-                code.push(0xC0 | (reg & 7));
-            }
-            "setl" | "setnge" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "setl requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.push(0x0F);
-                code.push(0x9C);
-                code.push(0xC0 | (reg & 7));
-            }
-            "setle" | "setng" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "setle requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.push(0x0F);
-                code.push(0x9E);
-                code.push(0xC0 | (reg & 7));
-            }
-            "setg" | "setnle" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "setg requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.push(0x0F);
-                code.push(0x9F);
-                code.push(0xC0 | (reg & 7));
-            }
-            "setge" | "setnl" => {
-                if inst.operands.len() != 1 {
-                    return Err(RasError::EncodingError(
-                        "setge requires 1 operand".to_string(),
-                    ));
-                }
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.push(0x0F);
-                code.push(0x9D);
-                code.push(0xC0 | (reg & 7));
-            }
             "movb" | "movw" | "movl" => {
                 let width = match opcode.as_str() {
                     "movb" => 8,
@@ -1302,35 +1194,6 @@ impl InstructionEncoder for X86_64Encoder {
             // syscall: 0F 05
             "syscall" => {
                 code.extend_from_slice(&[0x0F, 0x05]);
-            }
-            // SETcc for unsigned comparisons
-            "seta" | "setnbe" => {
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.extend_from_slice(&[0x0F, 0x97, 0xC0 | (reg & 7)]);
-            }
-            "setae" | "setnb" | "setnc" => {
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.extend_from_slice(&[0x0F, 0x93, 0xC0 | (reg & 7)]);
-            }
-            "setb" | "setnae" | "setc" => {
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.extend_from_slice(&[0x0F, 0x92, 0xC0 | (reg & 7)]);
-            }
-            "setbe" | "setna" => {
-                let reg = self.parse_register(&inst.operands[0])?;
-                if reg >= 4 {
-                    code.push(0x40 | (reg >> 3));
-                }
-                code.extend_from_slice(&[0x0F, 0x96, 0xC0 | (reg & 7)]);
             }
             "movd" => {
                 let [src, dst] = inst.operands.as_slice() else {
@@ -1352,7 +1215,7 @@ impl InstructionEncoder for X86_64Encoder {
                 code = self.emit(self.encode_sse_rm(if opcode == "xorpd" { &[0x66] } else { &[] }, &[0x0f, 0x57], &inst.operands)?);
             }
             "movzbq" | "movzbl" | "movzx" | "movzwq" | "movzwl" | "movsbl" | "movsbq"
-            | "movswl" | "movswq" => {
+            | "movswl" | "movswq" | "movsbw" => {
                 code = self.emit(self.encode_movzx(&opcode, &inst.operands)?);
             }
             _ => {
@@ -1680,7 +1543,7 @@ fn sized_stem(opcode: &str, stem: &str) -> Option<Option<u8>> {
 }
 
 fn shift_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
-    [("rol", 0), ("sar", 7), ("shl", 4), ("sal", 4), ("shr", 5)]
+    [("rol", 0), ("ror", 1), ("sar", 7), ("shl", 4), ("sal", 4), ("shr", 5)]
         .into_iter()
         .find_map(|(stem, digit)| sized_stem(opcode, stem).map(|width| (digit, width)))
 }
@@ -1714,6 +1577,8 @@ fn cmov_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
     }
     let (name, width) = if let Some(name) = rest.strip_suffix('q') {
         (name, 64)
+    } else if let Some(name) = rest.strip_suffix('w') {
+        (name, 16)
     } else {
         (rest.strip_suffix('l')?, 32)
     };
