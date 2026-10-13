@@ -87,6 +87,7 @@ enum PatchPoint {
         target: String,
         trailing: usize,
         addend: i64,
+        relocate: bool,
     },
     Arx64Jal {
         offset: usize,
@@ -231,6 +232,19 @@ impl RasAssembler {
             }
             positions = next;
         }
+        let global_symbols: HashSet<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.global)
+            .map(|s| s.name.as_str())
+            .chain(
+                parsed
+                    .attributes
+                    .iter()
+                    .filter(|(_, a)| !a.local && (a.global || a.weak))
+                    .map(|(name, _)| name.as_str()),
+            )
+            .collect();
         let mut symbols = Vec::new();
         let mut relocs = Vec::new();
         for ((section, lines), layout) in sections.iter_mut().zip(&section_lines).zip(layouts) {
@@ -243,7 +257,7 @@ impl RasAssembler {
                 }
             }
             let (data, mut syms, mut relocations) =
-                Self::finish_layout(layout, lines, &positions, &section.name)?;
+                Self::finish_layout(layout, lines, &positions, &section.name, &global_symbols)?;
             section.alignment =
                 if self.target_arch == TargetArchitecture::Aarch64 && section.flags.exec {
                     4
@@ -771,6 +785,7 @@ impl RasAssembler {
                                 target: label.to_string(),
                                 trailing: fixup.trailing,
                                 addend,
+                                relocate: global_labels.contains(label),
                             });
                         }
                         code.extend_from_slice(&bytes);
@@ -795,6 +810,7 @@ impl RasAssembler {
         lines: &[Line],
         positions: &HashMap<String, (String, usize)>,
         section: &str,
+        global_symbols: &HashSet<&str>,
     ) -> EncodeResult {
         let Layout {
             mut code,
@@ -946,10 +962,13 @@ impl RasAssembler {
             }
             let got = target.ends_with("@GOTPCREL");
             let target = reloc_symbol(target);
-            if let Some(&target_offset) = symbol_offsets
-                .get(target)
-                .filter(|_| !got && !matches!(patch, PatchPoint::X86Rel32 { relocate: true, .. }))
-            {
+            if let Some(&target_offset) = symbol_offsets.get(target).filter(|_| {
+                !got && !matches!(
+                    patch,
+                    PatchPoint::X86Rel32 { relocate: true, .. }
+                        | PatchPoint::X86RipRel32 { relocate: true, .. }
+                )
+            }) {
                 match patch {
                     PatchPoint::Data { .. } | PatchPoint::AArch64 { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
@@ -958,10 +977,13 @@ impl RasAssembler {
                         code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
                     }
                     PatchPoint::X86RipRel32 {
-                        offset, trailing, addend, ..
+                        offset,
+                        trailing,
+                        addend,
+                        ..
                     } => {
-                        let rel32 =
-                            (target_offset as i64) + *addend - (*offset as i64 + 4 + *trailing as i64);
+                        let rel32 = (target_offset as i64) + *addend
+                            - (*offset as i64 + 4 + *trailing as i64);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
                         code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
                     }
@@ -990,12 +1012,21 @@ impl RasAssembler {
                             offset: *offset,
                             symbol: target.to_string(),
                             section: String::new(),
-                            kind: 4,
+                            kind: if positions.contains_key(target)
+                                && !global_symbols.contains(target)
+                            {
+                                2
+                            } else {
+                                4
+                            },
                             addend: -4,
                         });
                     }
                     PatchPoint::X86RipRel32 {
-                        offset, trailing, addend, ..
+                        offset,
+                        trailing,
+                        addend,
+                        ..
                     } => {
                         code[*offset..*offset + 4].fill(0);
                         external_relocs.push(ExternalReloc {
@@ -1355,6 +1386,10 @@ fn x86_cond_jmp_byte(opcode: &str) -> Option<u8> {
 
 /// Returns the label name if `op` has the form `label(%rip)` (RIP-relative addressing).
 fn extract_rip_label(op: &str) -> Option<(&str, i64)> {
+    let op = op
+        .strip_prefix("jmp ")
+        .or_else(|| op.strip_prefix("call "))
+        .map_or(op, |operand| operand.trim().trim_start_matches('*'));
     let paren = op.find('(')?;
     let close = op.find(')')?;
     if close <= paren {
