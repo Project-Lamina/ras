@@ -1443,9 +1443,15 @@ impl InstructionEncoder for X86_64Encoder {
                 } else {
                     return Err(RasError::EncodingError("movd requires xmm operand".into()));
                 };
-                operand_width(Some(32), &[gpr])?;
+                let width = gpr.map_or(32, |reg| reg.width);
+                if !matches!(width, 32 | 64) {
+                    return Err(RasError::EncodingError(
+                        "movd requires 32/64-bit GPR".into(),
+                    ));
+                }
                 code = self.emit(encode_op(Op {
                     legacy: &[0x66],
+                    wide: width == 64,
                     opcode: &[0x0f, op],
                     reg,
                     rm,
