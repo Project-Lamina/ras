@@ -76,3 +76,163 @@ fn memory_move_rejects_an_unrepresentable_immediate() {
             .is_err()
     );
 }
+
+fn oracle(asm: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("ras_x86_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("input.s");
+    let reference = dir.join("reference.o");
+    let output = dir.join("ras.o");
+    std::fs::write(&source, asm).unwrap();
+    let result = Command::new("as")
+        .args(["--64", "-o"])
+        .arg(&reference)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(asm, &output)
+        .unwrap();
+    let bytes = (
+        std::fs::read(output).unwrap(),
+        std::fs::read(reference).unwrap(),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    bytes
+}
+
+fn section<'a>(bytes: &'a [u8], name: &str) -> &'a [u8] {
+    let at = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+    let headers = at(40);
+    let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+    let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+    let names = &bytes[at(headers + strings * 64 + 24)..];
+    for i in 1..count {
+        let h = headers + i * 64;
+        let n = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+        if names[n..].split(|b| *b == 0).next().unwrap() == name.as_bytes() {
+            return &bytes[at(h + 24)..at(h + 24) + at(h + 32)];
+        }
+    }
+    panic!("Missing section {name}")
+}
+
+fn relocations(bytes: &[u8], name: &str) -> Vec<(u64, u32, String, i64)> {
+    let at =
+        |bytes: &[u8], offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let symbols = section(bytes, ".symtab");
+    let strings = section(bytes, ".strtab");
+    section(bytes, name)
+        .chunks_exact(24)
+        .map(|entry| {
+            let info = at(entry, 8);
+            let symbol = &symbols[(info >> 32) as usize * 24..];
+            let offset = u32::from_le_bytes(symbol[..4].try_into().unwrap()) as usize;
+            let name = strings[offset..].split(|b| *b == 0).next().unwrap();
+            (
+                at(entry, 0),
+                info as u32,
+                String::from_utf8(name.to_vec()).unwrap(),
+                at(entry, 16) as i64,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn gcc_instruction_forms_match_gas() {
+    let (output, reference) = oracle(include_str!("fixtures/x86_gcc.s"), "gcc_forms");
+    assert_eq!(text(&output), text(&reference));
+    assert_eq!(
+        relocations(&output, ".rela.text"),
+        relocations(&reference, ".rela.text")
+    );
+}
+
+#[test]
+fn rip_addends_and_prefixed_fixups_match_gas() {
+    let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
+    let (output, reference) = oracle(asm, "rip_addends");
+    assert_eq!(text(&output), text(&reference));
+    assert_eq!(
+        relocations(&output, ".rela.text"),
+        relocations(&reference, ".rela.text")
+    );
+    let entries = relocations(&output, ".rela.text");
+    assert_eq!(entries[0].3, 116);
+    assert_eq!(entries[2].3, -13);
+}
+
+#[test]
+fn alignment_sensitive_branches_match_gas() {
+    let mut asm = String::from(".text\n");
+    for i in 100..160 {
+        asm.push_str(&format!(".p2align 4\n.Lstart{i}: je .Lend{i}\n.space {i}, 0x90\njne .Lstart{i}\n.p2align 4,,10\n.p2align 3\njmp .Lend{i}\n.space 8, 0x90\n.Lend{i}: ret\n"));
+    }
+    let (output, reference) = oracle(&asm, "branch_alignment");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
+fn compiler_string_escapes_match_gas() {
+    let asm = r#".text
+.ascii "\001\012\123\377\0x\b\f\v\a\n\t\r\\\""
+.asciz "\0007\01a\1234"
+"#;
+    let (output, reference) = oracle(asm, "string_escapes");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
+fn invalid_compiler_operands_fail() {
+    let path = std::env::temp_dir().join(format!("ras_invalid_compiler_{}.o", std::process::id()));
+    for asm in [
+        "cmpw %eax, %ax",
+        "movd %ax, %xmm0",
+        "movhps %xmm0, %xmm1",
+        "pshufd $256, %xmm0, %xmm1",
+        "cvtsi2sdq %eax, %xmm0",
+        "notrack jmp %rax",
+        "lock cmpq $1, (%rax)",
+        "rep addq %rax, %rbx",
+        "movq external+other(%rip), %rax",
+        "movq 2147483648+external(%rip), %rax",
+    ] {
+        assert!(
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(asm, &path)
+                .is_err(),
+            "{asm}"
+        );
+    }
+}
+
+#[test]
+fn cross_section_branch_relocation_kinds_match_gas() {
+    let asm = ".text\ncall .Lcold\njmp .Lcold\ncall cold_global\n.section .text.unlikely,\"ax\",@progbits\n.Lcold: ret\n.globl cold_global\ncold_global: ret\n";
+    let (output, reference) = oracle(asm, "cold_branches");
+    assert_eq!(text(&output), text(&reference));
+    let fields = |bytes: &[u8]| {
+        let mut entries = relocations(bytes, ".rela.text")
+            .into_iter()
+            .map(|(offset, kind, _, addend)| (offset, kind, addend))
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    };
+    assert_eq!(fields(&output), fields(&reference));
+    assert_eq!(
+        fields(&output)
+            .iter()
+            .map(|entry| entry.1)
+            .collect::<Vec<_>>(),
+        [2, 2, 4]
+    );
+}
