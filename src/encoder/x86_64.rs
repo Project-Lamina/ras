@@ -1348,12 +1348,22 @@ impl InstructionEncoder for X86_64Encoder {
                     ));
                 }
                 if opcode == "lock"
-                    && (!alu_mnemonic(&nested_opcode)
-                        .is_some_and(|(stem, _)| !matches!(stem, "cmp" | "test"))
+                    && (alu_mnemonic(&nested_opcode)
+                        .is_none_or(|(stem, _)| matches!(stem, "cmp" | "test"))
                         || !operands.last().is_some_and(|op| self.is_memory(op)))
                 {
                     return Err(RasError::EncodingError(
                         "unsupported lock instruction".into(),
+                    ));
+                }
+                if !matches!(opcode.as_str(), "lock" | "notrack")
+                    && !matches!(nested_opcode.as_str(), "ret" | "nop")
+                    && !["movs", "stos", "cmps", "scas", "lods"]
+                        .iter()
+                        .any(|stem| sized_stem(&nested_opcode, stem).is_some())
+                {
+                    return Err(RasError::EncodingError(
+                        "unsupported repeat instruction".into(),
                     ));
                 }
                 let prefix = match opcode.as_str() {
@@ -1367,8 +1377,10 @@ impl InstructionEncoder for X86_64Encoder {
                     opcode: nested_opcode,
                     operands,
                 })?);
-                if code.get(1) == Some(&0x66) {
-                    code.swap(0, 1);
+                let mut at = 1;
+                while code.get(at).is_some_and(|byte| matches!(byte, 0x64 | 0x66)) {
+                    code.swap(at - 1, at);
+                    at += 1;
                 }
                 if let Some(fixup) = &mut self.rip_fixup {
                     fixup.disp_offset += 1;
