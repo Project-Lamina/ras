@@ -326,7 +326,6 @@ impl X86_64Encoder {
                 reg: digit,
                 rm: dst_rm,
                 imm: &imm_field,
-                ..Op::default()
             });
         }
         let (src_rm, src_gpr) = self.parse_rm(src, false)?;
@@ -404,7 +403,6 @@ impl X86_64Encoder {
             reg: digit,
             rm,
             imm: &imm,
-            ..Op::default()
         })
     }
 
