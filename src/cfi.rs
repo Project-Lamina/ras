@@ -52,9 +52,12 @@ fn pointer(encoding: u8, symbol: &str) -> Result<String, RasError> {
     }
 }
 
-pub(crate) fn lower(source: &str, arch: TargetArchitecture) -> Result<String, RasError> {
+pub(crate) fn lower(
+    source: &str,
+    arch: TargetArchitecture,
+) -> Result<(String, Option<String>), RasError> {
     if !source.contains(".cfi_") {
-        return Ok(source.into());
+        return Ok((source.into(), None));
     }
     if !matches!(
         arch,
@@ -278,5 +281,5 @@ pub(crate) fn lower(source: &str, arch: TargetArchitecture) -> Result<String, Ra
     if !frames.is_empty() {
         writeln!(output, ".section .eh_frame,\"a\",@progbits\n{frames}").unwrap();
     }
-    Ok(output)
+    Ok((output, Some(prefix)))
 }

@@ -23,6 +23,7 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  -o <file>, --output <file>   Output object file (default: a.out)");
     eprintln!("  --target <arch_os>          Target (e.g. x86_64_linux, aarch64_macos)");
+    eprintln!("  -L, --keep-locals           Retain temporary local symbols");
     eprintln!("  -v, --verbose               Verbose output");
     eprintln!("  --version                   Print version");
     eprintln!("  -h, --help                  This help");
@@ -42,6 +43,7 @@ fn program_name_is_gnu_as(arg0: &str) -> bool {
 
 /// When the binary is invoked as `as` (e.g. symlink `as` -> `ras`), accept argv from the GCC driver.
 fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
+    let mut keep_locals = false;
     let mut output_file = None;
     let mut input_path: Option<PathBuf> = None;
     let mut i = 0;
@@ -61,8 +63,12 @@ fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
                     .ok_or_else(|| format!("Missing argument for {}", a))?;
                 i += 2;
             }
+            "-L" | "--keep-locals" => {
+                keep_locals = true;
+                i += 1;
+            }
             "--64" | "--32" | "-n" | "-q" | "-s" | "-g" | "-Z" | "-K" | "-Q" | "-k" | "-v"
-            | "-V" | "-w" | "-d" | "-L" => {
+            | "-V" | "-w" | "-d" => {
                 i += 1;
             }
             a if a.starts_with("-march=")
@@ -108,6 +114,7 @@ fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
         output_file,
         target: None,
         verbose: false,
+        keep_locals,
     })
 }
 
@@ -154,8 +161,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[ras] Target: {}", target);
     }
 
-    let mut ras = ras::Ras::new(target.architecture, target.operating_system)
-        .map_err(|e| format!("Failed to create assembler: {}", e))?;
+    let mut ras = ras::Ras::with_object_write_options(
+        target.architecture,
+        target.operating_system,
+        ras::ObjectWriteOptions {
+            keep_locals: options.keep_locals,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("Failed to create assembler: {}", e))?;
 
     let asm_text = read_assembly_input(&options.input_file)?;
     ras.assemble(&asm_text, &output_path)
@@ -173,6 +187,7 @@ struct Options {
     output_file: Option<PathBuf>,
     target: Option<String>,
     verbose: bool,
+    keep_locals: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -187,6 +202,7 @@ fn parse_args() -> Result<Options, String> {
         output_file: None,
         target: None,
         verbose: false,
+        keep_locals: false,
     };
 
     let mut i = 1;
@@ -208,6 +224,10 @@ fn parse_args() -> Result<Options, String> {
             }
             "-v" | "--verbose" => {
                 options.verbose = true;
+                i += 1;
+            }
+            "-L" | "--keep-locals" => {
+                options.keep_locals = true;
                 i += 1;
             }
             "--64" | "--32" | "--x32" => i += 1,
