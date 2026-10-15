@@ -171,17 +171,9 @@ impl RasAssembler {
         output_path: &std::path::Path,
     ) -> Result<(), RasError> {
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
-        let mut parsed = AssemblyParser::new()
+        let parsed = AssemblyParser::new()
             .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
-
-        if let Some(prefix) = internal_prefix {
-            for symbol in &parsed.symbols {
-                if symbol.name.starts_with(&prefix) {
-                    parsed.attributes.entry(symbol.name.clone()).or_default().internal = true;
-                }
-            }
-        }
 
         let mut sections = parsed.sections.clone();
         if !sections.iter().any(|s| s.name == ".text") {
@@ -402,6 +394,12 @@ impl RasAssembler {
             }
         }
         for symbol in &mut symbols {
+            if internal_prefix
+                .as_ref()
+                .is_some_and(|prefix| symbol.name.starts_with(prefix))
+            {
+                symbol.attributes.internal = true;
+            }
             if let Some(expression) = &symbol.attributes.size {
                 let size = absolute_expression(expression, &positions)?;
                 u64::try_from(size)
