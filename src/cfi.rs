@@ -1,6 +1,6 @@
 use crate::error::RasError;
 use lamina_platform::TargetArchitecture;
-use std::fmt::Write;
+use std::{collections::HashMap, fmt::Write};
 
 struct Frame {
     start: String,
@@ -14,6 +14,56 @@ struct Frame {
     simple: bool,
     signal: bool,
     return_column: i128,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct CieKey {
+    simple: bool,
+    signal: bool,
+    return_column: i128,
+    personality: Option<(u8, String)>,
+    lsda_encoding: Option<u8>,
+}
+
+pub(crate) fn advance(value: i128) -> Result<Vec<u8>, RasError> {
+    let value = u32::try_from(value)
+        .map_err(|_| RasError::EncodingError("CFI location advance out of range".into()))?;
+    Ok(match value {
+        0 => Vec::new(),
+        1..=63 => vec![0x40 | value as u8],
+        64..=255 => vec![2, value as u8],
+        256..=65535 => {
+            let mut bytes = vec![3];
+            bytes.extend(value.to_le_bytes()[..2].iter());
+            bytes
+        }
+        _ => {
+            let mut bytes = vec![4];
+            bytes.extend(value.to_le_bytes());
+            bytes
+        }
+    })
+}
+
+fn cfa(opcode: u8, register: Option<i128>, offset: i128) -> Result<Vec<u8>, RasError> {
+    let mut bytes = vec![opcode];
+    if let Some(register) = register {
+        if register < 0 {
+            return Err(RasError::ParseError("Invalid CFA register".into()));
+        }
+        bytes.extend(crate::parser::leb128(register, false));
+    }
+    let unsigned = crate::parser::leb128(offset.max(0), false);
+    let signed = crate::parser::leb128(offset / -8, true);
+    if offset % 8 == 0 && (offset < 0 || signed.len() < unsigned.len()) {
+        bytes[0] = if opcode == 12 { 0x12 } else { 0x13 };
+        bytes.extend(signed);
+    } else if offset >= 0 {
+        bytes.extend(unsigned);
+    } else {
+        return Err(RasError::ParseError("Invalid CFA offset".into()));
+    }
+    Ok(bytes)
 }
 
 fn number(value: &str) -> Result<i128, RasError> {
@@ -71,6 +121,7 @@ pub(crate) fn lower(
     }
     let mut output = String::new();
     let mut frames = String::new();
+    let mut cies: HashMap<CieKey, String> = HashMap::new();
     let mut frame: Option<Frame> = None;
     let mut serial = 0;
     for line in source.lines() {
@@ -141,29 +192,44 @@ pub(crate) fn lower(
                 if f.lsda.is_some() { "L" } else { "" },
                 if f.signal { "S" } else { "" }
             );
-            writeln!(frames, ".balign 8\n{base}_cie:\n.long {base}_cie_end-{base}_cie_body\n{base}_cie_body:\n.long 0\n.byte 1\n.asciz \"{augmentation}\"\n.uleb128 1\n.sleb128 -8\n.uleb128 {}\n.uleb128 {base}_aug_end-{base}_aug\n{base}_aug:", f.return_column).unwrap();
-            if let Some((encoding, symbol)) = &f.personality {
-                writeln!(frames, ".byte {encoding}").unwrap();
-                frames.push_str(&pointer(*encoding, symbol)?);
-            }
-            if let Some((encoding, _)) = &f.lsda {
-                writeln!(frames, ".byte {encoding}").unwrap();
-            }
-            writeln!(frames, ".byte 0x1b\n{base}_aug_end:").unwrap();
-            if !f.simple {
-                if arch == TargetArchitecture::X86_64 {
-                    frames.push_str(".byte 12,7,8,0x90,1\n");
-                } else {
-                    frames.push_str(".byte 12,31,0\n");
+            let key = CieKey {
+                simple: f.simple,
+                signal: f.signal,
+                return_column: f.return_column,
+                personality: f.personality.clone(),
+                lsda_encoding: f.lsda.as_ref().map(|(encoding, _)| *encoding),
+            };
+            let cie = if let Some(cie) = cies.get(&key) {
+                cie.clone()
+            } else {
+                writeln!(frames, ".balign 4\n{base}_cie:\n.long {base}_cie_end-{base}_cie_body\n{base}_cie_body:\n.long 0\n.byte 1\n.asciz \"{augmentation}\"\n.uleb128 1\n.sleb128 -8\n.uleb128 {}\n.uleb128 {base}_aug_end-{base}_aug\n{base}_aug:", f.return_column).unwrap();
+                if let Some((encoding, symbol)) = &f.personality {
+                    writeln!(frames, ".byte {encoding}").unwrap();
+                    frames.push_str(&pointer(*encoding, symbol)?);
                 }
-            }
-            writeln!(frames, ".balign 8\n{base}_cie_end:\n.long {base}_fde_end-{base}_fde_body\n{base}_fde_body:\n.long .-{base}_cie\n.long {base}-.\n.long {base}_end-{base}\n.uleb128 {base}_fde_aug_end-{base}_fde_aug\n{base}_fde_aug:").unwrap();
+                if let Some((encoding, _)) = &f.lsda {
+                    writeln!(frames, ".byte {encoding}").unwrap();
+                }
+                writeln!(frames, ".byte 0x1b\n{base}_aug_end:").unwrap();
+                if !f.simple {
+                    if arch == TargetArchitecture::X86_64 {
+                        frames.push_str(".byte 12,7,8,0x90,1\n");
+                    } else {
+                        frames.push_str(".byte 12,31,0\n");
+                    }
+                }
+                writeln!(frames, ".balign 4\n{base}_cie_end:").unwrap();
+                let cie = format!("{base}_cie");
+                cies.insert(key, cie.clone());
+                cie
+            };
+            writeln!(frames, ".long {base}_fde_end-{base}_fde_body\n{base}_fde_body:\n.long .-{cie}\n.long {base}-.\n.long {base}_end-{base}\n.uleb128 {base}_fde_aug_end-{base}_fde_aug\n{base}_fde_aug:").unwrap();
             if let Some((encoding, symbol)) = &f.lsda {
                 frames.push_str(&pointer(*encoding, symbol)?);
             }
             writeln!(
                 frames,
-                "{base}_fde_aug_end:\n{}.balign 8\n{base}_fde_end:",
+                "{base}_fde_aug_end:\n{}.balign 4\n{base}_fde_end:",
                 f.instructions
             )
             .unwrap();
@@ -195,7 +261,7 @@ pub(crate) fn lower(
         let label = format!("{prefix}_{serial}");
         serial += 1;
         writeln!(output, "{label}:").unwrap();
-        writeln!(f.instructions, ".byte 4\n.long {label}-{}", f.last).unwrap();
+        writeln!(f.instructions, ".ras_cfi_advance {label}-{}", f.last).unwrap();
         f.last = label;
         let mut bytes = Vec::new();
         let mut unsigned = |opcode: u8, values: &[i128]| -> Result<(), RasError> {
@@ -212,7 +278,7 @@ pub(crate) fn lower(
             ".cfi_def_cfa" => {
                 f.cfa_register = register(arg(0)?, arch)?;
                 f.cfa_offset = number(arg(1)?)?;
-                unsigned(12, &[f.cfa_register, f.cfa_offset])?;
+                bytes = cfa(12, Some(f.cfa_register), f.cfa_offset)?;
             }
             ".cfi_def_cfa_register" => {
                 f.cfa_register = register(arg(0)?, arch)?;
@@ -225,7 +291,7 @@ pub(crate) fn lower(
                 } else {
                     value
                 };
-                unsigned(14, &[f.cfa_offset])?;
+                bytes = cfa(14, None, f.cfa_offset)?;
             }
             ".cfi_offset" | ".cfi_rel_offset" | ".cfi_val_offset" => {
                 let reg = register(arg(0)?, arch)?;
@@ -239,15 +305,28 @@ pub(crate) fn lower(
                     return Err(invalid());
                 }
                 let factor = offset / -8;
-                bytes.push(if directive == ".cfi_val_offset" {
-                    0x15
+                if reg < 0 {
+                    return Err(invalid());
+                }
+                if directive == ".cfi_val_offset" {
+                    bytes.push(if factor < 0 { 0x15 } else { 0x14 });
+                    bytes.extend(crate::parser::leb128(reg, false));
+                } else if factor >= 0 && reg < 64 {
+                    bytes.push(0x80 | reg as u8);
                 } else {
-                    0x11
-                });
-                bytes.extend(crate::parser::leb128(reg, false));
-                bytes.extend(crate::parser::leb128(factor, true));
+                    bytes.push(if factor < 0 { 0x11 } else { 5 });
+                    bytes.extend(crate::parser::leb128(reg, false));
+                }
+                bytes.extend(crate::parser::leb128(factor, factor < 0));
             }
-            ".cfi_restore" => unsigned(6, &[register(arg(0)?, arch)?])?,
+            ".cfi_restore" => {
+                let reg = register(arg(0)?, arch)?;
+                if (0..64).contains(&reg) {
+                    bytes.push(0xc0 | reg as u8);
+                } else {
+                    unsigned(6, &[reg])?;
+                }
+            }
             ".cfi_undefined" => unsigned(7, &[register(arg(0)?, arch)?])?,
             ".cfi_same_value" => unsigned(8, &[register(arg(0)?, arch)?])?,
             ".cfi_register" => unsigned(9, &[register(arg(0)?, arch)?, register(arg(1)?, arch)?])?,
@@ -279,7 +358,7 @@ pub(crate) fn lower(
         return Err(RasError::ParseError("Unterminated CFI procedure".into()));
     }
     if !frames.is_empty() {
-        writeln!(output, ".section .eh_frame,\"a\",@progbits\n{frames}").unwrap();
+        writeln!(output, ".section .eh_frame,\"a\",@progbits\n.balign 8\n{frames}").unwrap();
     }
     Ok((output, Some(prefix)))
 }

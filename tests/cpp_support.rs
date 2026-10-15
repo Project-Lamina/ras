@@ -390,3 +390,104 @@ fn relocations_retain_merge_and_got_local_symbols() {
     assert!(ras.symbols().iter().all(|(name, _)| *name != ".Lunused"));
     assert_eq!(ras.relocations(".rela.text"), gas.relocations(".rela.text"));
 }
+
+#[test]
+fn compact_cfi_preserves_decoded_unwind_rows() {
+    let dir = WorkDir::new("compact_cfi");
+    let mut source = String::from(".text\n.cfi_startproc\n");
+    for (index, advance) in [1, 63, 64, 255, 256, 65535, 65536].iter().enumerate() {
+        source.push_str(&format!(
+            ".space {advance}\n.cfi_def_cfa_offset {}\n",
+            (index + 2) * 128
+        ));
+    }
+    source.push_str(".cfi_offset 3,-16\n.cfi_offset 64,-24\n.cfi_offset 4,8\n.cfi_val_offset 5,-16\n.cfi_val_offset 6,8\n.cfi_restore 3\n.cfi_restore 64\n.cfi_def_cfa 7,-8\nnop\n.cfi_endproc\n");
+    let (ras, gas) = assemble_pair(&dir.0, &source);
+    assert!(
+        ras.contents(ras.section(".eh_frame")).len()
+            <= gas.contents(gas.section(".eh_frame")).len()
+    );
+    let rows = |path: &Path| {
+        let output = run(Command::new("readelf")
+            .arg("--debug-dump=frames-interp")
+            .arg(path));
+        let output = String::from_utf8(output).unwrap();
+        let mut in_fde = false;
+        output
+            .lines()
+            .filter_map(|line| {
+                if line.contains(" FDE ") {
+                    in_fde = true;
+                    return Some(line.split_once("pc=").unwrap().1.to_string());
+                }
+                if line.contains(" CIE ") {
+                    in_fde = false;
+                }
+                (in_fde && !line.trim().is_empty())
+                    .then(|| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&dir.0.join("ras.o")), rows(&dir.0.join("gas.o")));
+}
+
+#[test]
+fn cies_share_only_compatible_unwind_metadata() {
+    let dir = WorkDir::new("shared_cies");
+    let mut source = String::from(".text\n");
+    for (simple, directives) in [
+        ("", ""),
+        ("", ""),
+        ("simple", ""),
+        ("", ".cfi_signal_frame\n"),
+        ("", ".cfi_return_column 15\n"),
+        ("", ".cfi_personality 0x1b,personality\n"),
+        ("", ".cfi_personality 0x1b,other\n"),
+        (
+            "",
+            ".cfi_personality 0x1b,personality\n.cfi_lsda 0x1b,lsda1\n",
+        ),
+        (
+            "",
+            ".cfi_personality 0x1b,personality\n.cfi_lsda 0x1b,lsda2\n",
+        ),
+        ("", ".cfi_personality 0x1b,personality\n.cfi_lsda 0,lsda1\n"),
+    ] {
+        source.push_str(&format!(
+            ".cfi_startproc {simple}\n{directives}.space 4\n.cfi_endproc\n"
+        ));
+    }
+    for architecture in [TargetArchitecture::X86_64, TargetArchitecture::Aarch64] {
+        let output = dir.0.join("frames.o");
+        Ras::new(architecture, TargetOperatingSystem::Linux)
+            .unwrap()
+            .assemble(&source, &output)
+            .unwrap();
+        let object = Object(std::fs::read(&output).unwrap());
+        let frames = object.contents(object.section(".eh_frame"));
+        let mut cies = std::collections::HashSet::new();
+        let mut fdes = 0;
+        let mut offset = 0;
+        while offset < frames.len() {
+            let length = u32_at(frames, offset) as usize;
+            assert!(length > 0);
+            let pointer = u32_at(frames, offset + 4) as usize;
+            if pointer == 0 {
+                cies.insert(offset);
+            } else {
+                assert!(cies.contains(&(offset + 4 - pointer)));
+                fdes += 1;
+            }
+            offset += 4 + length;
+        }
+        assert_eq!(cies.len(), 8);
+        assert_eq!(fdes, 10);
+        let relocations = object.relocations(".rela.eh_frame");
+        assert_eq!(
+            relocations.iter().filter(|r| r.2 == "personality").count(),
+            3
+        );
+        assert_eq!(relocations.iter().filter(|r| r.2 == "lsda1").count(), 2);
+        assert_eq!(relocations.iter().filter(|r| r.2 == "lsda2").count(), 1);
+    }
+}
