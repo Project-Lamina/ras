@@ -205,6 +205,21 @@ fn symbolic_leb128_and_aliases_match_gas() {
 }
 
 #[test]
+fn relaxed_branches_with_symbolic_leb128_match_gas() {
+    let dir = WorkDir::new("relaxed_leb128");
+    let (ras, gas) = assemble_pair(
+        &dir.0,
+        ".text\nstart: jmp end\n.space 128,0x90\nend: ret\n.data\n.uleb128 end-start\n.sleb128 start-end\n.balign 16\n.byte 7\n",
+    );
+    for section in [".text", ".data"] {
+        assert_eq!(
+            ras.contents(ras.section(section)),
+            gas.contents(gas.section(section))
+        );
+    }
+}
+
+#[test]
 fn local_and_common_storage_match_gas() {
     let dir = WorkDir::new("common");
     let (ras, gas) = assemble_pair(
