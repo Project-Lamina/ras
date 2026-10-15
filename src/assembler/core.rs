@@ -257,6 +257,9 @@ impl RasAssembler {
         let mut relocs = Vec::new();
         for ((section, lines), layout) in sections.iter_mut().zip(&section_lines).zip(layouts) {
             for line in lines {
+                if let Line::CfiAdvance(expression) = line {
+                    crate::cfi::advance(absolute_expression(expression, &positions)?)?;
+                }
                 if let Line::Leb128 { expression, signed } = line {
                     let value = absolute_expression(expression, &positions)?;
                     if !signed && value < 0 {
@@ -608,6 +611,12 @@ impl RasAssembler {
                 }
                 Line::Label(sym) => {
                     symbol_offsets.insert(sym.name.clone(), current_offset);
+                }
+                Line::CfiAdvance(expression) => {
+                    let value = absolute_expression(expression, positions).unwrap_or(0);
+                    let bytes = crate::cfi::advance(value)?;
+                    current_offset += bytes.len();
+                    code.extend(bytes);
                 }
                 Line::Leb128 { expression, signed } => {
                     let value = absolute_expression(expression, positions).unwrap_or(0);

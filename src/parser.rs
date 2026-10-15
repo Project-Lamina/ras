@@ -36,6 +36,7 @@ pub enum Line {
     Label(Symbol),
     Instruction(ParsedInstruction),
     Data(Vec<u8>),
+    CfiAdvance(String),
     Leb128 {
         expression: String,
         signed: bool,
@@ -222,7 +223,8 @@ impl AssemblyParser {
                         *operand = resolve_numeric_references(operand, index, &definitions)?;
                     }
                 }
-                Line::DataExpression { expression, .. } | Line::Leb128 { expression, .. } => {
+                Line::DataExpression { expression, .. } | Line::Leb128 { expression, .. }
+                | Line::CfiAdvance(expression) => {
                     *expression = resolve_numeric_references(expression, index, &definitions)?;
                 }
                 _ => {}
@@ -382,6 +384,11 @@ impl AssemblyParser {
                 if let Some(bytes) = parse_quoted_string_bytes(rest, false) {
                     self.lines.push(Line::Data(bytes));
                 }
+            }
+            ".ras_cfi_advance" => {
+                let expression = line[parts[0].len()..].trim();
+                parse_data_expression(expression)?;
+                self.lines.push(Line::CfiAdvance(expression.into()));
             }
             ".uleb128" | ".sleb128" => {
                 for item in line[parts[0].len()..].split(',') {
