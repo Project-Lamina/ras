@@ -11,6 +11,31 @@ use std::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging() {
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(log::LevelFilter::Warn);
+    log::set_max_level(level);
+    let _ = log::set_logger(&StderrLogger);
+}
+
 fn print_usage() {
     eprintln!("ras - drop-in replacement for as/gas (assembly to object file)");
     eprintln!();
@@ -119,6 +144,8 @@ fn parse_gnu_as_invocation(program_args: &[String]) -> Result<Options, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
     let options = match parse_args() {
         Ok(opts) => opts,
         Err(e) => {
@@ -136,6 +163,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if options.verbose {
+        log::set_max_level(log::max_level().max(log::LevelFilter::Info));
+    }
+
     let output_path = options
         .output_file
         .unwrap_or_else(|| PathBuf::from("a.out"));
@@ -147,19 +178,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Target::detect_host()
     };
 
-    if options.verbose {
-        let input_desc = options
-            .input_file
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "<stdin>".to_string());
-        println!(
-            "[ras] Assembling {} -> {}",
-            input_desc,
-            output_path.display()
-        );
-        println!("[ras] Target: {}", target);
-    }
+    let input_desc = options
+        .input_file
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<stdin>".to_string());
+    log::info!("Assembling {} -> {}", input_desc, output_path.display());
+    log::info!("Target: {}", target);
 
     let mut ras = ras::Ras::with_object_write_options(
         target.architecture,
@@ -175,9 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ras.assemble(&asm_text, &output_path)
         .map_err(|e| format!("Assembly failed: {}", e))?;
 
-    if options.verbose {
-        println!("[ras] Assembly completed successfully");
-    }
+    log::info!("Assembly completed successfully");
 
     Ok(())
 }
