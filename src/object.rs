@@ -11,6 +11,8 @@ use std::io::Write;
 pub struct ObjectWriteOptions {
     /// When true, [`ElfWriter`] also emits minimal `.debug_line`, `.debug_abbrev`, and `.debug_info`.
     pub emit_minimal_dwarf_sections: bool,
+    /// Retain temporary local symbols in ELF output.
+    pub keep_locals: bool,
     /// File name stored in DWARF line/info (used when `emit_minimal_dwarf_sections` is set).
     pub dwarf_decl_file_name: String,
 }
@@ -19,6 +21,7 @@ impl Default for ObjectWriteOptions {
     fn default() -> Self {
         Self {
             emit_minimal_dwarf_sections: false,
+            keep_locals: false,
             dwarf_decl_file_name: "lamina.s".to_string(),
         }
     }
@@ -367,12 +370,81 @@ impl ObjectWriter for ElfWriter {
                 });
             }
         }
-        let mut defined: Vec<_> = object_symbols.iter().collect();
-        defined.sort_by_key(|s| s.global || s.attributes.weak);
-        let first_global = 1 + defined
+        let merge_relocs: std::collections::HashSet<_> = req
+            .relocations
             .iter()
-            .filter(|s| !s.global && !s.attributes.weak)
-            .count() as u32;
+            .filter(|r| {
+                !matches!(
+                    (req.target_arch, r.kind),
+                    (TargetArchitecture::X86_64, 1 | 10 | 11 | 12 | 14)
+                        | (TargetArchitecture::Aarch64, 257..=259)
+                )
+            })
+            .map(|r| r.symbol.as_str())
+            .collect();
+        let identity_relocs: std::collections::HashSet<_> = req
+            .relocations
+            .iter()
+            .filter(|r| {
+                matches!(
+                    (req.target_arch, r.kind),
+                    (TargetArchitecture::X86_64, 9 | 41 | 42)
+                        | (TargetArchitecture::Aarch64, 311 | 312)
+                )
+            })
+            .map(|r| r.symbol.as_str())
+            .collect();
+        let omitted: std::collections::HashMap<_, _> = object_symbols
+            .iter()
+            .filter(|s| {
+                s.attributes.internal
+                    || (!req.opts.keep_locals
+                        && s.name.starts_with(".L")
+                        && !s.global
+                        && !s.attributes.weak
+                        && !s.section.is_empty()
+                        && s.section != "*COM*"
+                        && !sections
+                            .iter()
+                            .any(|section| section.group.as_ref() == Some(&s.name))
+                        && !(s.attributes.retain && merge_relocs.contains(s.name.as_str()))
+                        && !identity_relocs.contains(s.name.as_str()))
+            })
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+        let mut section_symbols = std::collections::HashMap::new();
+        for reloc in req.relocations {
+            let Some(symbol) = omitted.get(reloc.symbol.as_str()) else {
+                continue;
+            };
+            if symbol.section == "*ABS*" {
+                section_symbols.insert(symbol.section.as_str(), 0);
+                continue;
+            }
+            if section_symbols.contains_key(symbol.section.as_str()) {
+                continue;
+            }
+            let section = names
+                .iter()
+                .position(|n| n == &symbol.section)
+                .ok_or_else(|| {
+                    RasError::ObjectError(format!("Unknown symbol section: {}", symbol.section))
+                })?
+                + 1;
+            let index = symtab.len() / ELF64_SYM_SIZE as usize;
+            section_symbols.insert(symbol.section.as_str(), index as u32);
+            write_elf64_symbol(&mut symtab, 0, 0, 3, false, section as u16, 0)?;
+        }
+        let mut defined: Vec<_> = object_symbols
+            .iter()
+            .filter(|s| !omitted.contains_key(s.name.as_str()))
+            .collect();
+        defined.sort_by_key(|s| s.global || s.attributes.weak);
+        let first_global = (symtab.len() / ELF64_SYM_SIZE as usize) as u32
+            + defined
+                .iter()
+                .filter(|s| !s.global && !s.attributes.weak)
+                .count() as u32;
         for sym in defined {
             let index = symtab.len() / ELF64_SYM_SIZE as usize;
             sym_indices.insert(sym.name.as_str(), index as u32);
@@ -419,7 +491,9 @@ impl ObjectWriter for ElfWriter {
             }
         }
         for reloc in req.relocations {
-            if !sym_indices.contains_key(reloc.symbol.as_str()) {
+            if !sym_indices.contains_key(reloc.symbol.as_str())
+                && !omitted.contains_key(reloc.symbol.as_str())
+            {
                 sym_indices.insert(
                     reloc.symbol.as_str(),
                     (symtab.len() / ELF64_SYM_SIZE as usize) as u32,
@@ -442,9 +516,17 @@ impl ObjectWriter for ElfWriter {
             let mut bytes = Vec::new();
             for r in req.relocations.iter().filter(|r| r.section == section.name) {
                 bytes.extend_from_slice(&(r.offset as u64).to_le_bytes());
-                let info = (u64::from(sym_indices[r.symbol.as_str()]) << 32) | u64::from(r.kind);
+                let (index, addend) = if let Some(symbol) = omitted.get(r.symbol.as_str()) {
+                    (
+                        section_symbols[symbol.section.as_str()],
+                        r.addend.wrapping_add(symbol.value as i64),
+                    )
+                } else {
+                    (sym_indices[r.symbol.as_str()], r.addend)
+                };
+                let info = (u64::from(index) << 32) | u64::from(r.kind);
                 bytes.extend_from_slice(&info.to_le_bytes());
-                bytes.extend_from_slice(&r.addend.to_le_bytes());
+                bytes.extend_from_slice(&addend.to_le_bytes());
             }
             if !bytes.is_empty() {
                 if let Some(signature) = &section.group {
@@ -943,6 +1025,7 @@ mod tests {
         let opts = ObjectWriteOptions {
             emit_minimal_dwarf_sections: true,
             dwarf_decl_file_name: "t.s".to_string(),
+            ..Default::default()
         };
         w.write_object_file(
             &path,

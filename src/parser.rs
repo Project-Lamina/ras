@@ -54,6 +54,8 @@ pub enum Line {
 
 #[derive(Debug, Clone, Default)]
 pub struct SymbolAttributes {
+    pub internal: bool,
+    pub retain: bool,
     pub weak: bool,
     pub global: bool,
     pub hidden: bool,
@@ -76,6 +78,7 @@ pub struct ParsedAssembly {
 pub struct AssemblyParser {
     common_order: Vec<String>,
     generated_prefix: String,
+    merge_sections: HashSet<String>,
     aliases: Vec<(String, String)>,
     current_section: String,
     sections: Vec<Section>,
@@ -98,6 +101,7 @@ impl AssemblyParser {
         Self {
             common_order: Vec::new(),
             generated_prefix: ".Lras_size".into(),
+            merge_sections: HashSet::new(),
             aliases: Vec::new(),
             current_section: ".text".to_string(),
             sections: Vec::new(),
@@ -159,6 +163,11 @@ impl AssemblyParser {
         }
 
         self.resolve_numeric_labels()?;
+        for symbol in &self.symbols {
+            if self.merge_sections.contains(&symbol.section) {
+                self.attributes.entry(symbol.name.clone()).or_default().retain = true;
+            }
+        }
         for line in &mut self.lines {
             if let Line::Label(symbol) = line
                 && let Some(attributes) = self.attributes.get(&symbol.name)
@@ -204,6 +213,7 @@ impl AssemblyParser {
             match line {
                 Line::Label(symbol) => {
                     if let Some((_, _, name)) = definitions.iter().find(|d| d.0 == index) {
+                        self.attributes.entry(name.clone()).or_default().internal = true;
                         symbol.name = name.clone();
                     }
                 }
@@ -255,6 +265,9 @@ impl AssemblyParser {
                 } else {
                     parts[0]
                 };
+                if line.split('"').nth(1).is_some_and(|flags| flags.contains('M')) {
+                    self.merge_sections.insert(name.to_string());
+                }
                 self.current_section = name.to_string();
                 self.lines.push(Line::Section(name.to_string()));
                 if !self.sections.iter().any(|s| s.name == name) {
@@ -458,6 +471,7 @@ impl AssemblyParser {
                 let expression = match parse_data_expression(expression.trim())? {
                     DataExpression::Difference(left, right) if left == "." || right == "." => {
                         let location = format!("{}_{}", self.generated_prefix, self.lines.len());
+                        self.attributes.entry(location.clone()).or_default().internal = true;
                         self.lines.push(Line::Label(Symbol {
                             name: location.clone(),
                             global: false,

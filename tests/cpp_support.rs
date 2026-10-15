@@ -316,3 +316,77 @@ fn increment_and_decrement_encodings_match_gas() {
         gas.contents(gas.section(".text"))
     );
 }
+
+#[test]
+fn temporary_symbols_resolve_without_leaking_internal_labels() {
+    let dir = WorkDir::new("temporary_symbols");
+    let source = ".text\n.Lras_cfi: nop\n.Lras_size: nop\n.globl entry\n.type entry,@function\nentry:\n.cfi_startproc\n1: nop\n.Ltarget: ret\n.cfi_endproc\n.size entry,.-entry\n.type .Ltyped,@function\n.Ltyped: ret\n.globl .Lglobal\n.Lglobal: ret\n.set .Lalias,.Ltarget+1\n.data\n.quad .Ltarget+3\n.quad 1b\n.quad .Lalias\n";
+    let input = dir.0.join("input.s");
+    std::fs::write(&input, source).unwrap();
+    let (default, gas) = assemble_pair(&dir.0, source);
+    let targets = |object: &Object| {
+        let symbols = object.symbols();
+        object
+            .contents(object.section(".rela.data"))
+            .chunks_exact(24)
+            .map(|r| {
+                let info = u64_at(r, 8);
+                let symbol = symbols[(info >> 32) as usize].1;
+                let section = u16::from_le_bytes(symbol[6..8].try_into().unwrap()) as usize;
+                (
+                    object.section_name(section).to_string(),
+                    info as u32,
+                    (u64_at(symbol, 8) as i64).wrapping_add(u64_at(r, 16) as i64),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(targets(&default), targets(&gas));
+    assert!(
+        default
+            .symbols()
+            .iter()
+            .all(|(name, _)| !name.starts_with(".L") || *name == ".Lglobal")
+    );
+    let driver = dir.0.join("as");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ras"), &driver).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(env!("CARGO_BIN_EXE_ras"), &driver).unwrap();
+    for program in [std::path::Path::new(env!("CARGO_BIN_EXE_ras")), &driver] {
+        for flag in ["-L", "--keep-locals"] {
+            let output = dir.0.join("kept.o");
+            run(Command::new(program)
+                .arg(flag)
+                .arg(&input)
+                .arg("-o")
+                .arg(&output));
+            let kept = Object(std::fs::read(&output).unwrap());
+            for name in [".Ltarget", ".Ltyped", ".Lalias", ".Lras_cfi", ".Lras_size"] {
+                kept.symbol(name);
+            }
+            assert!(kept.symbols().iter().all(|(name, _)| {
+                !name.starts_with(".Lras_") || [".Lras_cfi", ".Lras_size"].contains(name)
+            }));
+            assert_eq!(targets(&kept), targets(&gas));
+            assert_eq!(
+                kept.contents(kept.section(".eh_frame")),
+                default.contents(default.section(".eh_frame"))
+            );
+        }
+    }
+}
+
+#[test]
+fn relocations_retain_merge_and_got_local_symbols() {
+    let dir = WorkDir::new("retained_locals");
+    let (ras, gas) = assemble_pair(
+        &dir.0,
+        ".text\nmovq .Lgot@GOTPCREL(%rip),%rax\n.Lgot: ret\nleaq .Lmerged(%rip),%rax\n.section .rodata.str1.1,\"aMS\",@progbits,1\n.Lmerged: .asciz \"kept\"\n.Lunused: .asciz \"discarded\"\n",
+    );
+    for name in [".Lgot", ".Lmerged"] {
+        assert_eq!(u64_at(ras.symbol(name), 8), u64_at(gas.symbol(name), 8));
+    }
+    assert!(ras.symbols().iter().all(|(name, _)| *name != ".Lunused"));
+    assert_eq!(ras.relocations(".rela.text"), gas.relocations(".rela.text"));
+}
