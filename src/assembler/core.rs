@@ -31,6 +31,11 @@ struct ShortJump {
     target: String,
 }
 
+struct LayoutCache {
+    sizes: Vec<usize>,
+    short_jumps: Vec<ShortJump>,
+}
+
 struct Layout {
     line_offsets: Vec<usize>,
     code: Vec<u8>,
@@ -212,11 +217,14 @@ impl RasAssembler {
             .collect();
         let mut positions = HashMap::new();
         let mut layouts = Vec::new();
+        let mut layout_caches: Vec<_> = sections.iter().map(|_| None).collect();
         for iteration in 0..64 {
             layouts.clear();
             let mut next = HashMap::new();
-            for (section, lines) in sections.iter().zip(&section_lines) {
-                let layout = self.layout_two_pass(lines, section.flags.exec, &positions)?;
+            for ((section, lines), cache) in
+                sections.iter().zip(&section_lines).zip(&mut layout_caches)
+            {
+                let layout = self.layout_two_pass(lines, section.flags.exec, &positions, cache)?;
                 for (name, offset) in &layout.symbol_offsets {
                     next.insert(name.clone(), (section.name.clone(), *offset));
                 }
@@ -445,6 +453,7 @@ impl RasAssembler {
         lines: &[Line],
         executable: bool,
         positions: &HashMap<String, (String, usize)>,
+        cache: &mut Option<LayoutCache>,
     ) -> Result<Layout, RasError> {
         let mut labels = HashMap::new();
         let mut regions = Vec::with_capacity(lines.len());
@@ -469,14 +478,74 @@ impl RasAssembler {
                 long_jumps.insert(index);
             }
         }
-        let layout = loop {
+        if cache.is_none() {
             let layout = self.layout_lines(lines, executable, &long_jumps, positions)?;
+            let sizes = layout
+                .line_offsets
+                .iter()
+                .zip(
+                    layout
+                        .line_offsets
+                        .iter()
+                        .skip(1)
+                        .chain(std::iter::once(&layout.code.len())),
+                )
+                .map(|(start, end)| end - start)
+                .collect();
+            *cache = Some(LayoutCache {
+                sizes,
+                short_jumps: layout.short_jumps,
+            });
+        }
+        let cache = cache.as_mut().unwrap();
+        for site in &cache.short_jumps {
+            cache.sizes[site.index] = 2;
+        }
+        loop {
+            let mut line_offsets = Vec::with_capacity(lines.len());
+            let mut symbol_offsets = HashMap::with_capacity(labels.len());
+            let mut offset = 0;
+            for (index, line) in lines.iter().enumerate() {
+                line_offsets.push(offset);
+                match line {
+                    Line::Label(symbol) => {
+                        symbol_offsets.insert(symbol.name.as_str(), offset);
+                    }
+                    Line::Align {
+                        value,
+                        directive,
+                        max_skip,
+                        ..
+                    } => {
+                        let alignment = self.alignment(*value, directive)?;
+                        let padding = (alignment - offset % alignment) % alignment;
+                        cache.sizes[index] = if max_skip.is_some_and(|maximum| padding > maximum) {
+                            0
+                        } else {
+                            padding
+                        };
+                    }
+                    Line::CfiAdvance(expression) => {
+                        let value = absolute_expression(expression, positions).unwrap_or(0);
+                        cache.sizes[index] = crate::cfi::advance(value)?.len();
+                    }
+                    Line::Leb128 { expression, signed } => {
+                        let value = absolute_expression(expression, positions).unwrap_or(0);
+                        if !signed && value < 0 {
+                            return Err(RasError::EncodingError("Negative unsigned LEB128".into()));
+                        }
+                        cache.sizes[index] = crate::parser::leb128(value, *signed).len();
+                    }
+                    _ => {}
+                }
+                offset += cache.sizes[index];
+            }
             let mut stretch = 0i64;
             let mut adjusted = HashMap::new();
-            let mut sites = layout.short_jumps.iter().peekable();
+            let mut sites = cache.short_jumps.iter().peekable();
             let mut grown = false;
             for (index, line) in lines.iter().enumerate() {
-                let old = layout.line_offsets[index] as i64;
+                let old = line_offsets[index] as i64;
                 let address = old + stretch;
                 if let Line::Label(symbol) = line {
                     adjusted.insert(symbol.name.as_str(), address);
@@ -500,9 +569,13 @@ impl RasAssembler {
                     stretch += padding(address) - padding(old);
                 }
                 if let Some(site) = sites.peek().filter(|site| site.index == index) {
+                    if cache.sizes[index] != 2 {
+                        sites.next();
+                        continue;
+                    }
                     let target = if let Some(&target) = adjusted.get(site.target.as_str()) {
                         target
-                    } else if let Some(&target) = layout.symbol_offsets.get(&site.target) {
+                    } else if let Some(&target) = symbol_offsets.get(site.target.as_str()) {
                         let target = target as i64;
                         if stretch < 0
                             || labels
@@ -518,6 +591,12 @@ impl RasAssembler {
                     };
                     if i8::try_from(target - (address + 2)).is_err() {
                         long_jumps.insert(index);
+                        cache.sizes[index] = if matches!(line, Line::Instruction(inst) if x86_cond_jmp_byte(&inst.opcode).is_some())
+                        {
+                            6
+                        } else {
+                            5
+                        };
                         stretch += if matches!(line, Line::Instruction(inst) if inst.opcode == "jmp")
                         {
                             3
@@ -530,10 +609,10 @@ impl RasAssembler {
                 }
             }
             if !grown {
-                break layout;
+                break;
             }
-        };
-        Ok(layout)
+        }
+        self.layout_lines(lines, executable, &long_jumps, positions)
     }
 
     fn layout_lines(
