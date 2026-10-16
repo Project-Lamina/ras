@@ -36,6 +36,45 @@ struct LayoutCache {
     short_jumps: Vec<ShortJump>,
 }
 
+struct RelaxationEvent {
+    index: usize,
+    gap: usize,
+    size: usize,
+    kind: RelaxationKind,
+}
+
+enum RelaxationKind {
+    Label,
+    Align {
+        alignment: usize,
+        max_skip: Option<usize>,
+    },
+    Branch {
+        target: Option<usize>,
+        same_region: bool,
+        near_size: usize,
+        growth: usize,
+    },
+}
+
+impl RelaxationKind {
+    fn padding(&self, offset: usize) -> usize {
+        let Self::Align {
+            alignment,
+            max_skip,
+        } = self
+        else {
+            return 0;
+        };
+        let padding = (alignment - offset % alignment) % alignment;
+        if max_skip.is_some_and(|maximum| padding > maximum) {
+            0
+        } else {
+            padding
+        }
+    }
+}
+
 struct Layout {
     line_offsets: Vec<usize>,
     code: Vec<u8>,
@@ -497,117 +536,137 @@ impl RasAssembler {
         for site in &cache.short_jumps {
             cache.sizes[site.index] = 2;
         }
-        loop {
-            let mut line_offsets = Vec::with_capacity(lines.len());
-            let mut symbol_offsets = HashMap::with_capacity(labels.len());
-            let mut offset = 0;
-            for (index, line) in lines.iter().enumerate() {
-                line_offsets.push(offset);
-                match line {
-                    Line::Label(symbol) => {
-                        symbol_offsets.insert(symbol.name.as_str(), offset);
-                    }
-                    Line::Align {
-                        value,
-                        directive,
-                        max_skip,
-                        ..
-                    } => {
-                        let alignment = self.alignment(*value, directive)?;
-                        let padding = (alignment - offset % alignment) % alignment;
-                        cache.sizes[index] = if max_skip.is_some_and(|maximum| padding > maximum) {
-                            0
-                        } else {
-                            padding
-                        };
-                    }
-                    Line::CfiAdvance(expression) => {
-                        let value = absolute_expression(expression, positions).unwrap_or(0);
-                        cache.sizes[index] = crate::cfi::advance(value)?.len();
-                    }
-                    Line::Leb128 { expression, signed } => {
-                        let value = absolute_expression(expression, positions).unwrap_or(0);
-                        if !signed && value < 0 {
-                            return Err(RasError::EncodingError("Negative unsigned LEB128".into()));
-                        }
-                        cache.sizes[index] = crate::parser::leb128(value, *signed).len();
-                    }
-                    _ => {}
+        let targets: HashSet<_> = cache
+            .short_jumps
+            .iter()
+            .map(|site| site.target.as_str())
+            .collect();
+        let mut events = Vec::new();
+        let mut label_events = HashMap::with_capacity(targets.len());
+        let mut sites = cache.short_jumps.iter().peekable();
+        let mut gap = 0;
+        for (index, line) in lines.iter().enumerate() {
+            let kind = match line {
+                Line::Label(symbol) if targets.contains(symbol.name.as_str()) => {
+                    label_events.insert(symbol.name.as_str(), events.len());
+                    Some(RelaxationKind::Label)
                 }
-                offset += cache.sizes[index];
-            }
-            let mut stretch = 0i64;
-            let mut adjusted = HashMap::new();
-            let mut sites = cache.short_jumps.iter().peekable();
-            let mut grown = false;
-            for (index, line) in lines.iter().enumerate() {
-                let old = line_offsets[index] as i64;
-                let address = old + stretch;
-                if let Line::Label(symbol) = line {
-                    adjusted.insert(symbol.name.as_str(), address);
-                }
-                if let Line::Align {
+                Line::Align {
                     value,
                     directive,
                     max_skip,
                     ..
-                } = line
-                {
-                    let alignment = self.alignment(*value, directive)? as i64;
-                    let padding = |at: i64| {
-                        let bytes = (alignment - at % alignment) % alignment;
-                        if max_skip.is_some_and(|maximum| bytes > maximum as i64) {
-                            0
-                        } else {
-                            bytes
-                        }
-                    };
-                    stretch += padding(address) - padding(old);
+                } => Some(RelaxationKind::Align {
+                    alignment: self.alignment(*value, directive)?,
+                    max_skip: *max_skip,
+                }),
+                Line::CfiAdvance(expression) => {
+                    let value = absolute_expression(expression, positions).unwrap_or(0);
+                    cache.sizes[index] = crate::cfi::advance(value)?.len();
+                    None
                 }
-                if let Some(site) = sites.peek().filter(|site| site.index == index) {
-                    if cache.sizes[index] != 2 {
-                        sites.next();
-                        continue;
+                Line::Leb128 { expression, signed } => {
+                    let value = absolute_expression(expression, positions).unwrap_or(0);
+                    if !signed && value < 0 {
+                        return Err(RasError::EncodingError("Negative unsigned LEB128".into()));
                     }
-                    let target = if let Some(&target) = adjusted.get(site.target.as_str()) {
-                        target
-                    } else if let Some(&target) = symbol_offsets.get(site.target.as_str()) {
-                        let target = target as i64;
-                        if stretch < 0
-                            || labels
-                                .get(site.target.as_str())
-                                .is_some_and(|&label| regions[label] == regions[index])
-                        {
-                            target + stretch
-                        } else {
-                            target.max(address)
-                        }
-                    } else {
-                        i64::MAX
-                    };
-                    if i8::try_from(target - (address + 2)).is_err() {
-                        long_jumps.insert(index);
-                        cache.sizes[index] = if matches!(line, Line::Instruction(inst) if x86_cond_jmp_byte(&inst.opcode).is_some())
-                        {
+                    cache.sizes[index] = crate::parser::leb128(value, *signed).len();
+                    None
+                }
+                Line::Instruction(inst) if sites.peek().is_some_and(|site| site.index == index) => {
+                    let site = sites.next().unwrap();
+                    Some(RelaxationKind::Branch {
+                        target: None,
+                        same_region: labels
+                            .get(site.target.as_str())
+                            .is_some_and(|&label| regions[label] == regions[index]),
+                        near_size: if x86_cond_jmp_byte(&inst.opcode).is_some() {
                             6
                         } else {
                             5
-                        };
-                        stretch += if matches!(line, Line::Instruction(inst) if inst.opcode == "jmp")
-                        {
-                            3
-                        } else {
-                            4
-                        };
-                        grown = true;
+                        },
+                        growth: if inst.opcode == "jmp" { 3 } else { 4 },
+                    })
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                events.push(RelaxationEvent {
+                    index,
+                    gap,
+                    size: cache.sizes[index],
+                    kind,
+                });
+                gap = 0;
+            } else {
+                gap += cache.sizes[index];
+            }
+        }
+        let mut sites = cache.short_jumps.iter();
+        for event in &mut events {
+            if let RelaxationKind::Branch { target, .. } = &mut event.kind {
+                *target = label_events
+                    .get(sites.next().unwrap().target.as_str())
+                    .copied();
+            }
+        }
+        let mut offsets = vec![0; events.len()];
+        let mut adjusted = vec![0; events.len()];
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            let mut offset = 0;
+            for (event, address) in events.iter_mut().zip(&mut offsets) {
+                offset += event.gap;
+                *address = offset;
+                if matches!(event.kind, RelaxationKind::Align { .. }) {
+                    event.size = event.kind.padding(offset);
+                }
+                offset += event.size;
+            }
+            let mut stretch = 0i64;
+            let mut grown = false;
+            for (index, event) in events.iter_mut().enumerate() {
+                let old = offsets[index] as i64;
+                let address = old + stretch;
+                adjusted[index] = address;
+                match event.kind {
+                    RelaxationKind::Align { .. } => {
+                        stretch += event.kind.padding(address as usize) as i64 - event.size as i64;
                     }
-                    sites.next();
+                    RelaxationKind::Branch {
+                        target,
+                        same_region,
+                        near_size,
+                        growth,
+                    } if event.size == 2 => {
+                        let target = match target {
+                            Some(target) if target < index => adjusted[target],
+                            Some(target) if stretch < 0 || same_region => {
+                                offsets[target] as i64 + stretch
+                            }
+                            Some(target) => (offsets[target] as i64).max(address),
+                            None => i64::MAX,
+                        };
+                        if i8::try_from(target - (address + 2)).is_err() {
+                            long_jumps.insert(event.index);
+                            event.size = near_size;
+                            stretch += growth as i64;
+                            grown = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
             if !grown {
                 break;
             }
         }
+        log::debug!(
+            "branch relaxation: lines={}, events={}, rounds={rounds}",
+            lines.len(),
+            events.len()
+        );
         self.layout_lines(lines, executable, &long_jumps, positions)
     }
 

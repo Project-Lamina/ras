@@ -220,6 +220,28 @@ fn relaxed_branches_with_symbolic_leb128_match_gas() {
 }
 
 #[test]
+fn cascading_forward_branches_match_gas() {
+    let dir = WorkDir::new("branch_cascade");
+    let mut source = String::from(".text\n.globl cascade\ncascade:\n");
+    let count = 16;
+    for index in 0..count {
+        source.push_str(&format!("jmp target{index}\n"));
+        if index > 0 {
+            source.push_str(&format!("target{}:\n", index - 1));
+        }
+        let padding = if index + 1 == count { 128 } else { 123 };
+        source.push_str(&format!(".space {padding},0x90\n"));
+    }
+    source.push_str(&format!("target{}: ret\n", count - 1));
+    let (ras, gas) = assemble_pair(&dir.0, &source);
+    let text = ras.contents(ras.section(".text"));
+    assert_eq!(text, gas.contents(gas.section(".text")));
+    for index in 0..count {
+        assert_eq!(&text[index * 128..index * 128 + 5], &[0xe9, 128, 0, 0, 0]);
+    }
+}
+
+#[test]
 fn local_and_common_storage_match_gas() {
     let dir = WorkDir::new("common");
     let (ras, gas) = assemble_pair(
