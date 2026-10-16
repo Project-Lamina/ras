@@ -197,24 +197,20 @@ impl RasAssembler {
                 },
             );
         }
-        let section_lines: Vec<Vec<Line>> = sections
+        let section_indices: HashMap<_, _> = sections
             .iter()
-            .map(|section| {
-                let mut current = ".text";
-                parsed
-                    .lines
-                    .iter()
-                    .filter(|line| {
-                        if let Line::Section(name) = line {
-                            current = name;
-                            return false;
-                        }
-                        current == section.name
-                    })
-                    .cloned()
-                    .collect()
-            })
+            .enumerate()
+            .map(|(index, section)| (section.name.as_str(), index))
             .collect();
+        let mut section_lines: Vec<Vec<Line>> = sections.iter().map(|_| Vec::new()).collect();
+        let mut current = section_indices.get(".text").copied();
+        for line in parsed.lines {
+            if let Line::Section(name) = &line {
+                current = section_indices.get(name.as_str()).copied();
+            } else if let Some(index) = current {
+                section_lines[index].push(line);
+            }
+        }
         let mut positions = HashMap::new();
         let mut layouts = Vec::new();
         let mut layout_caches: Vec<_> = sections.iter().map(|_| None).collect();
