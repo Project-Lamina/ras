@@ -5,6 +5,7 @@
 //! for two-pass assembly (jmp/call with label resolution).
 
 use crate::{encoder::traits::ParsedInstruction, error::RasError};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -210,42 +211,54 @@ impl AssemblyParser {
                 definitions.push((index, symbol.name.clone(), name));
             }
         }
+        let mut symbols_changed = false;
+        let mut instructions_changed = false;
         for (index, line) in self.lines.iter_mut().enumerate() {
             match line {
                 Line::Label(symbol) => {
                     if let Some((_, _, name)) = definitions.iter().find(|d| d.0 == index) {
                         self.attributes.entry(name.clone()).or_default().internal = true;
                         symbol.name = name.clone();
+                        symbols_changed = true;
                     }
                 }
                 Line::Instruction(inst) => {
                     for operand in &mut inst.operands {
-                        *operand = resolve_numeric_references(operand, index, &definitions)?;
+                        if let Cow::Owned(text) = resolve_numeric_references(operand, index, &definitions)? {
+                            *operand = text;
+                            instructions_changed = true;
+                        }
                     }
                 }
                 Line::DataExpression { expression, .. } | Line::Leb128 { expression, .. }
                 | Line::CfiAdvance(expression) => {
-                    *expression = resolve_numeric_references(expression, index, &definitions)?;
+                    if let Cow::Owned(text) = resolve_numeric_references(expression, index, &definitions)? {
+                        *expression = text;
+                    }
                 }
                 _ => {}
             }
         }
-        self.symbols = self
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                Line::Label(symbol) => Some(symbol.clone()),
-                _ => None,
-            })
-            .collect();
-        self.instructions = self
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                Line::Instruction(inst) => Some(inst.clone()),
-                _ => None,
-            })
-            .collect();
+        if symbols_changed {
+            self.symbols = self
+                .lines
+                .iter()
+                .filter_map(|line| match line {
+                    Line::Label(symbol) => Some(symbol.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+        if instructions_changed {
+            self.instructions = self
+                .lines
+                .iter()
+                .filter_map(|line| match line {
+                    Line::Instruction(inst) => Some(inst.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
         Ok(())
     }
 
@@ -530,12 +543,13 @@ fn is_numeric_label(name: &str) -> bool {
     name.len() == 1 && name.as_bytes()[0].is_ascii_digit()
 }
 
-fn resolve_numeric_references(
-    text: &str,
+fn resolve_numeric_references<'a>(
+    text: &'a str,
     position: usize,
     definitions: &[(usize, String, String)],
-) -> Result<String, RasError> {
-    let mut result = String::new();
+) -> Result<Cow<'a, str>, RasError> {
+    let mut result: Option<String> = None;
+    let mut copied = 0;
     let mut start = 0;
     for (end, ch) in text
         .char_indices()
@@ -560,17 +574,21 @@ fn resolve_numeric_references(
                         .find(|d| d.1 == digit && d.0 < position)
                 }
                 .ok_or_else(|| RasError::ParseError(format!("Undefined numeric label: {token}")))?;
-                result.push_str(&definition.2);
-            } else {
-                result.push_str(token);
+                let out = result.get_or_insert_with(|| String::with_capacity(text.len()));
+                out.push_str(&text[copied..start]);
+                out.push_str(&definition.2);
+                copied = end;
             }
-        }
-        if end < text.len() {
-            result.push(ch);
         }
         start = end + ch.len_utf8();
     }
-    Ok(result)
+    Ok(match result {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(text),
+    })
 }
 
 pub(crate) enum DataExpression {
