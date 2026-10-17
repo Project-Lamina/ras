@@ -407,6 +407,10 @@ impl RasAssembler {
                 .position(|n| n == *name)
                 .unwrap_or(usize::MAX)
         });
+        let mut symbol_index: HashMap<String, usize> = HashMap::with_capacity(symbols.len());
+        for (i, symbol) in symbols.iter().enumerate() {
+            symbol_index.entry(symbol.name.clone()).or_insert(i);
+        }
         for (name, attributes) in ordered_attributes {
             if let Some((size, alignment)) = attributes.common {
                 let (section, value) = if attributes.local {
@@ -431,6 +435,7 @@ impl RasAssembler {
                 } else {
                     ("*COM*", alignment)
                 };
+                symbol_index.entry(name.clone()).or_insert(symbols.len());
                 symbols.push(ObjectSymbol {
                     name: name.clone(),
                     global: !attributes.local,
@@ -440,11 +445,12 @@ impl RasAssembler {
                 });
                 continue;
             }
-            if let Some(sym) = symbols.iter_mut().find(|s| &s.name == name) {
+            if let Some(sym) = symbol_index.get(name).map(|&i| &mut symbols[i]) {
                 sym.attributes = attributes.clone();
                 sym.global =
                     !attributes.local && (sym.global || attributes.global || attributes.weak);
             } else {
+                symbol_index.entry(name.clone()).or_insert(symbols.len());
                 symbols.push(ObjectSymbol {
                     name: name.clone(),
                     global: !attributes.local,
