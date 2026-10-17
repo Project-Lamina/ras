@@ -220,6 +220,22 @@ fn relaxed_branches_with_symbolic_leb128_match_gas() {
 }
 
 #[test]
+fn chained_layout_dependencies_match_gas() {
+    let dir = WorkDir::new("layout_dependencies");
+    let (ras, gas) = assemble_pair(
+        &dir.0,
+        ".text\nstart: .space 16384\nend: ret\n.data\n.uleb128 tail-head\nhead: .uleb128 end-start\ntail:\n.section .dependent,\"a\"\n.sleb128 tail-head\n",
+    );
+    for section in [".text", ".data", ".dependent"] {
+        assert_eq!(
+            ras.contents(ras.section(section)),
+            gas.contents(gas.section(section))
+        );
+    }
+    assert_eq!(ras.contents(ras.section(".data")), &[3, 0x80, 0x80, 1]);
+}
+
+#[test]
 fn cascading_forward_branches_match_gas() {
     let dir = WorkDir::new("branch_cascade");
     let mut source = String::from(".text\n.globl cascade\ncascade:\n");

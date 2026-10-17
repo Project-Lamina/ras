@@ -250,22 +250,55 @@ impl RasAssembler {
                 section_lines[index].push(line);
             }
         }
+        let dependencies: Vec<Vec<_>> = section_lines
+            .iter()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| match line {
+                        Line::CfiAdvance(expression) | Line::Leb128 { expression, .. } => {
+                            Some(expression.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
         let mut positions = HashMap::new();
-        let mut layouts = Vec::new();
+        let mut layouts: Vec<Option<Layout>> = sections.iter().map(|_| None).collect();
+        let mut layout_inputs: Vec<Vec<i128>> = sections.iter().map(|_| Vec::new()).collect();
         let mut layout_caches: Vec<_> = sections.iter().map(|_| None).collect();
         for iteration in 0..64 {
-            layouts.clear();
             let mut next = HashMap::new();
-            for ((section, lines), cache) in
-                sections.iter().zip(&section_lines).zip(&mut layout_caches)
-            {
-                let layout = self.layout_two_pass(lines, section.flags.exec, &positions, cache)?;
-                for (name, offset) in &layout.symbol_offsets {
+            for (index, section) in sections.iter().enumerate() {
+                let inputs: Vec<_> = dependencies[index]
+                    .iter()
+                    .map(|expression| absolute_expression(expression, &positions).unwrap_or(0))
+                    .collect();
+                if layouts[index].is_none() || inputs != layout_inputs[index] {
+                    layouts[index] = Some(self.layout_two_pass(
+                        &section_lines[index],
+                        section.flags.exec,
+                        &positions,
+                        &mut layout_caches[index],
+                    )?);
+                    layout_inputs[index] = inputs;
+                }
+                for (name, offset) in &layouts[index].as_ref().unwrap().symbol_offsets {
                     next.insert(name.clone(), (section.name.clone(), *offset));
                 }
-                layouts.push(layout);
             }
-            if next == positions {
+            let converged = dependencies
+                .iter()
+                .zip(&layout_inputs)
+                .all(|(expressions, inputs)| {
+                    expressions.iter().zip(inputs).all(|(expression, &input)| {
+                        absolute_expression(expression, &next).unwrap_or(0) == input
+                    })
+                });
+            positions = next;
+            if converged {
+                log::debug!("section layout: iterations={}", iteration + 1);
                 break;
             }
             if iteration == 63 {
@@ -273,7 +306,6 @@ impl RasAssembler {
                     "Section layout did not converge".into(),
                 ));
             }
-            positions = next;
         }
         let global_symbols: HashSet<_> = parsed
             .symbols
@@ -302,8 +334,13 @@ impl RasAssembler {
                     }
                 }
             }
-            let (data, mut syms, mut relocations) =
-                Self::finish_layout(layout, lines, &positions, &section.name, &global_symbols)?;
+            let (data, mut syms, mut relocations) = Self::finish_layout(
+                layout.unwrap(),
+                lines,
+                &positions,
+                &section.name,
+                &global_symbols,
+            )?;
             section.alignment =
                 if self.target_arch == TargetArchitecture::Aarch64 && section.flags.exec {
                     4
