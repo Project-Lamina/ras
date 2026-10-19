@@ -116,7 +116,7 @@ impl AssemblyParser {
         }
     }
 
-    pub fn parse(&mut self, text: &str) -> Result<ParsedAssembly, RasError> {
+    pub fn parse(mut self, text: &str) -> Result<ParsedAssembly, RasError> {
         while text.contains(&self.generated_prefix) {
             self.generated_prefix.push('_');
         }
@@ -188,13 +188,13 @@ impl AssemblyParser {
             .collect();
 
         Ok(ParsedAssembly {
-            common_order: self.common_order.clone(),
-            aliases: self.aliases.clone(),
-            attributes: self.attributes.clone(),
-            sections: self.sections.clone(),
-            symbols: self.symbols.clone(),
-            instructions: self.instructions.clone(),
-            lines: self.lines.clone(),
+            common_order: self.common_order,
+            aliases: self.aliases,
+            attributes: self.attributes,
+            sections: self.sections,
+            symbols: self.symbols,
+            instructions: self.instructions,
+            lines: self.lines,
         })
     }
 
