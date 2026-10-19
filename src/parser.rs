@@ -85,7 +85,6 @@ pub struct AssemblyParser {
     current_section: String,
     sections: Vec<Section>,
     symbols: Vec<Symbol>,
-    instructions: Vec<ParsedInstruction>,
     lines: Vec<Line>,
     attributes: HashMap<String, SymbolAttributes>,
     pending_globals: HashSet<String>,
@@ -108,7 +107,6 @@ impl AssemblyParser {
             current_section: ".text".to_string(),
             sections: Vec::new(),
             symbols: Vec::new(),
-            instructions: Vec::new(),
             lines: Vec::new(),
             attributes: HashMap::new(),
             pending_globals: HashSet::new(),
@@ -187,13 +185,22 @@ impl AssemblyParser {
             })
             .collect();
 
+        let instructions = self
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Instruction(inst) => Some(inst.clone()),
+                _ => None,
+            })
+            .collect();
+
         Ok(ParsedAssembly {
             common_order: self.common_order,
             aliases: self.aliases,
             attributes: self.attributes,
             sections: self.sections,
             symbols: self.symbols,
-            instructions: self.instructions,
+            instructions,
             lines: self.lines,
         })
     }
@@ -212,7 +219,6 @@ impl AssemblyParser {
             }
         }
         let mut symbols_changed = false;
-        let mut instructions_changed = false;
         for (index, line) in self.lines.iter_mut().enumerate() {
             match line {
                 Line::Label(symbol) => {
@@ -226,7 +232,6 @@ impl AssemblyParser {
                     for operand in &mut inst.operands {
                         if let Cow::Owned(text) = resolve_numeric_references(operand, index, &definitions)? {
                             *operand = text;
-                            instructions_changed = true;
                         }
                     }
                 }
@@ -245,16 +250,6 @@ impl AssemblyParser {
                 .iter()
                 .filter_map(|line| match line {
                     Line::Label(symbol) => Some(symbol.clone()),
-                    _ => None,
-                })
-                .collect();
-        }
-        if instructions_changed {
-            self.instructions = self
-                .lines
-                .iter()
-                .filter_map(|line| match line {
-                    Line::Instruction(inst) => Some(inst.clone()),
                     _ => None,
                 })
                 .collect();
@@ -520,21 +515,23 @@ impl AssemblyParser {
     }
 
     fn parse_instruction(&mut self, line: &str) -> Result<(), RasError> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
+        let line = line.trim();
+        if line.is_empty() {
             return Ok(());
         }
 
-        let opcode = parts[0].to_string();
-        let operands: Vec<String> = if parts.len() > 1 {
-            split_operands(&parts[1..].join(" "))
-        } else {
+        let (opcode, operand_text) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let operand_text = operand_text.trim();
+        let operands = if operand_text.is_empty() {
             Vec::new()
+        } else {
+            split_operands(operand_text)
         };
 
-        let inst = ParsedInstruction { opcode, operands };
-        self.instructions.push(inst.clone());
-        self.lines.push(Line::Instruction(inst));
+        self.lines.push(Line::Instruction(ParsedInstruction {
+            opcode: opcode.to_string(),
+            operands,
+        }));
         Ok(())
     }
 }
