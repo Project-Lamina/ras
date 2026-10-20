@@ -11,10 +11,6 @@ use lamina_mir::{
 };
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// RISC-V instruction format encoders
-// ---------------------------------------------------------------------------
-
 #[inline]
 fn r_type(funct7: u8, rs2: u8, rs1: u8, funct3: u8, rd: u8, opcode: u8) -> [u8; 4] {
     let w = ((funct7 as u32) << 25)
@@ -88,9 +84,6 @@ fn j_type(offset: i32, rd: u8) -> [u8; 4] {
     w.to_le_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// Common instructions
-// ---------------------------------------------------------------------------
 // Register numbers used in generated code:
 //  0  = x0/zero  (always 0)
 //  1  = x1/ra    (return address)
@@ -106,16 +99,13 @@ fn j_type(offset: i32, rd: u8) -> [u8; 4] {
 const REG_ZERO: u8 = 0;
 const REG_RA: u8 = 1;
 const REG_SP: u8 = 2;
-const REG_FP: u8 = 8; // s0/fp
-const REG_T0: u8 = 5; // scratch
-const REG_T1: u8 = 6; // scratch
+const REG_FP: u8 = 8;
+const REG_T0: u8 = 5;
+const REG_T1: u8 = 6;
 const REG_T2: u8 = 7; // scratch / result staging
 
-// Argument registers (a0–a7)
 const ARG_REGS: [u8; 8] = [10, 11, 12, 13, 14, 15, 16, 17];
 
-// Callee-saved virtual register pool: s2–s11
-// s2–s11: available for future vreg pinning optimisation
 #[allow(dead_code)]
 const VREG_POOL: [u8; 10] = [18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
 
@@ -153,7 +143,7 @@ fn emit_mulw(rd: u8, rs1: u8, rs2: u8) -> [u8; 4] {
 
 #[inline]
 fn emit_div(rd: u8, rs1: u8, rs2: u8) -> [u8; 4] {
-    r_type(0x01, rs2, rs1, 0x4, rd, 0x33) // sdiv
+    r_type(0x01, rs2, rs1, 0x4, rd, 0x33)
 }
 #[inline]
 fn emit_divu(rd: u8, rs1: u8, rs2: u8) -> [u8; 4] {
@@ -228,7 +218,6 @@ fn emit_xori_1(rd: u8, rs: u8) -> [u8; 4] {
     i_type(1, rs, 0x4, rd, 0x13)
 }
 
-// Loads
 #[inline]
 fn emit_ld(rd: u8, rs1: u8, offset: i32) -> [u8; 4] {
     i_type(offset, rs1, 0x3, rd, 0x03) // LD (64-bit sign-extend)
@@ -238,14 +227,13 @@ fn emit_lw(rd: u8, rs1: u8, offset: i32) -> [u8; 4] {
     i_type(offset, rs1, 0x2, rd, 0x03) // LW (32-bit sign-extend)
 }
 
-// Stores
 #[inline]
 fn emit_sd(rs2: u8, rs1: u8, offset: i32) -> [u8; 4] {
-    s_type(offset, rs2, rs1, 0x3, 0x23) // SD (64-bit)
+    s_type(offset, rs2, rs1, 0x3, 0x23)
 }
 #[inline]
 fn emit_sw(rs2: u8, rs1: u8, offset: i32) -> [u8; 4] {
-    s_type(offset, rs2, rs1, 0x2, 0x23) // SW (32-bit)
+    s_type(offset, rs2, rs1, 0x2, 0x23)
 }
 
 // LUI: rd = imm20 << 12
@@ -254,7 +242,6 @@ fn emit_lui(rd: u8, imm20: i32) -> [u8; 4] {
     u_type(imm20, rd, 0x37)
 }
 
-// JALR rd, rs1, offset — available for external/indirect calls
 #[allow(dead_code)]
 #[inline]
 fn emit_jalr(rd: u8, rs1: u8, offset: i32) -> [u8; 4] {
@@ -279,8 +266,6 @@ fn emit_jal_zero(offset: i32) -> [u8; 4] {
     j_type(offset, REG_ZERO)
 }
 
-// BEQ / BNE / BLT / BGE / BLTU / BGEU
-// BEQ — used for future equality-branch optimisations
 #[allow(dead_code)]
 #[inline]
 fn emit_beq(rs1: u8, rs2: u8, offset: i32) -> [u8; 4] {
@@ -291,9 +276,6 @@ fn emit_bne(rs1: u8, rs2: u8, offset: i32) -> [u8; 4] {
     b_type(offset, rs2, rs1, 0x1)
 }
 
-// ---------------------------------------------------------------------------
-// Load an arbitrary i64 immediate into a register (≤4 instructions)
-// ---------------------------------------------------------------------------
 fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
     if (-2048..=2047).contains(&imm) {
         // addi rd, x0, imm
@@ -313,7 +295,6 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
         let lo32 = imm as i32;
         let hi32 = (imm >> 32) as i32;
 
-        // Lower 32 into rd
         let lo_lower = lo32 & 0xFFF;
         let lo_lower_sext = if lo_lower >= 2048 {
             lo_lower - 4096
@@ -330,7 +311,6 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
             code.extend_from_slice(&emit_addi(rd, REG_ZERO, lo_lower_sext));
         }
 
-        // Upper 32 into t2 (x7)
         let hi_lower = hi32 & 0xFFF;
         let hi_lower_sext = if hi_lower >= 2048 {
             hi_lower - 4096
@@ -347,8 +327,6 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
             code.extend_from_slice(&emit_addi(REG_T2, REG_ZERO, hi_lower_sext));
         }
 
-        // rd = (t2 << 32) | rd
-        // slli t2, t2, 32
         let slli_w: u32 =
             ((32u32) << 20) | ((REG_T2 as u32) << 15) | (0x1 << 12) | ((REG_T2 as u32) << 7) | 0x13;
         code.extend_from_slice(&slli_w.to_le_bytes());
@@ -356,9 +334,7 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stack helpers — all offsets are relative to FP (s0/x8)
-// ---------------------------------------------------------------------------
+// Offsets are relative to FP (s0/x8)
 fn emit_store_to_fp(code: &mut Vec<u8>, src: u8, offset: i32, rv64: bool) {
     if rv64 {
         code.extend_from_slice(&emit_sd(src, REG_FP, offset));
@@ -375,9 +351,6 @@ fn emit_load_from_fp(code: &mut Vec<u8>, dst: u8, offset: i32, rv64: bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Prologue / Epilogue
-// ---------------------------------------------------------------------------
 fn encode_prologue(frame_size: usize, rv64: bool) -> Result<Vec<u8>, RasError> {
     // Minimum frame: 16 bytes for ra + fp (8+8). Round up to 16-byte alignment.
     let min_frame = 16usize;
@@ -391,7 +364,6 @@ fn encode_prologue(frame_size: usize, rv64: bool) -> Result<Vec<u8>, RasError> {
     }
 
     let mut code = Vec::with_capacity(16);
-    // addi sp, sp, -total
     code.extend_from_slice(&emit_addi(REG_SP, REG_SP, -(total as i32)));
     // sd/sw ra, (total-8)(sp)
     if rv64 {
@@ -402,7 +374,6 @@ fn encode_prologue(frame_size: usize, rv64: bool) -> Result<Vec<u8>, RasError> {
         code.extend_from_slice(&emit_sw(REG_RA, REG_SP, (total - 8) as i32));
         code.extend_from_slice(&emit_sw(REG_FP, REG_SP, (total - 16) as i32));
     }
-    // addi fp, sp, total  (set frame pointer to top of frame)
     code.extend_from_slice(&emit_addi(REG_FP, REG_SP, total as i32));
     Ok(code)
 }
@@ -419,15 +390,11 @@ fn encode_epilogue(frame_size: usize, rv64: bool) -> Result<Vec<u8>, RasError> {
         code.extend_from_slice(&emit_lw(REG_RA, REG_SP, (total - 8) as i32));
         code.extend_from_slice(&emit_lw(REG_FP, REG_SP, (total - 16) as i32));
     }
-    // addi sp, sp, total
     code.extend_from_slice(&emit_addi(REG_SP, REG_SP, total as i32));
     code.extend_from_slice(&emit_ret());
     Ok(code)
 }
 
-// ---------------------------------------------------------------------------
-// Operand materialisation — loads into `dst_reg`
-// ---------------------------------------------------------------------------
 fn materialize_operand(
     code: &mut Vec<u8>,
     operand: &lamina_mir::Operand,
@@ -490,9 +457,6 @@ fn store_result(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ABI name → register number
-// ---------------------------------------------------------------------------
 fn riscv_reg_num(name: &str) -> Result<u8, RasError> {
     match name {
         "x0" | "zero" => Ok(0),
@@ -534,9 +498,6 @@ fn riscv_reg_num(name: &str) -> Result<u8, RasError> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MIR instruction encoder
-// ---------------------------------------------------------------------------
 #[allow(clippy::too_many_arguments)]
 fn encode_instruction(
     code: &mut Vec<u8>,
@@ -545,13 +506,11 @@ fn encode_instruction(
     frame_size: usize,
     ret_ty: Option<&lamina_mir::MirType>,
     rv64: bool,
-    // branch fixup tracking
     block_offsets: &HashMap<String, usize>,
     branch_fixups: &mut Vec<(usize, String, BranchFixupOp)>,
     base_offset: usize, // offset of `code[0]` in the final buffer
 ) -> Result<(), RasError> {
     match inst {
-        // ---- IntBinary ----
         Instruction::IntBinary {
             op,
             ty,
@@ -619,7 +578,6 @@ fn encode_instruction(
             store_result(code, result, dst, stack_slots, rv64)?;
         }
 
-        // ---- IntCmp ----
         Instruction::IntCmp {
             op,
             ty: _,
@@ -630,16 +588,13 @@ fn encode_instruction(
             materialize_operand(code, lhs, REG_T0, stack_slots, rv64)?;
             materialize_operand(code, rhs, REG_T1, stack_slots, rv64)?;
 
-            // Produce 0/1 in REG_T2
             let r = REG_T2;
             match op {
                 IntCmpOp::Eq => {
-                    // sub t2, t0, t1; seqz t2, t2
                     code.extend_from_slice(&emit_sub(r, REG_T0, REG_T1));
                     code.extend_from_slice(&emit_sltiu_1(r, r));
                 }
                 IntCmpOp::Ne => {
-                    // sub t2, t0, t1; snez t2, t2  (sltu t2, x0, t2)
                     code.extend_from_slice(&emit_sub(r, REG_T0, REG_T1));
                     code.extend_from_slice(&emit_sltu(r, REG_ZERO, r));
                 }
@@ -678,22 +633,18 @@ fn encode_instruction(
             store_result(code, r, dst, stack_slots, rv64)?;
         }
 
-        // ---- Ret ----
         Instruction::Ret { value } => {
             if let Some(v) = value
                 && ret_ty.is_some()
             {
-                // Move return value into a0 (x10)
                 materialize_operand(code, v, ARG_REGS[0], stack_slots, rv64)?;
             }
             let epilogue = encode_epilogue(frame_size, rv64)?;
             code.extend_from_slice(&epilogue);
         }
 
-        // ---- Jmp ----
         Instruction::Jmp { target } => {
             if let Some(&target_off) = block_offsets.get(target.as_str()) {
-                // Target already known: direct encode
                 let from_abs = base_offset + code.len();
                 let delta = target_off as i64 - from_abs as i64;
                 if !(-0x10_0000..0x10_0000).contains(&delta) {
@@ -704,37 +655,30 @@ fn encode_instruction(
                 }
                 code.extend_from_slice(&emit_jal_zero(delta as i32));
             } else {
-                // Forward reference: emit placeholder, record fixup
                 let fixup_abs = base_offset + code.len();
                 branch_fixups.push((fixup_abs, target.clone(), BranchFixupOp::Jal));
-                code.extend_from_slice(&emit_jal_zero(0)); // placeholder
+                code.extend_from_slice(&emit_jal_zero(0));
             }
         }
 
-        // ---- Br ----
         Instruction::Br {
             cond,
             true_target,
             false_target,
         } => {
-            // Load condition register into t0
             let cond_operand = Op::Register(cond.clone());
             materialize_operand(code, &cond_operand, REG_T0, stack_slots, rv64)?;
 
-            // BNE t0, x0, true_target  (if t0 != 0, branch to true)
-            // JAL x0, false_target
             let bne_abs = base_offset + code.len();
-            code.extend_from_slice(&emit_bne(REG_T0, REG_ZERO, 0)); // placeholder
+            code.extend_from_slice(&emit_bne(REG_T0, REG_ZERO, 0));
             branch_fixups.push((bne_abs, true_target.clone(), BranchFixupOp::Bne));
 
             let jal_abs = base_offset + code.len();
-            code.extend_from_slice(&emit_jal_zero(0)); // placeholder
+            code.extend_from_slice(&emit_jal_zero(0));
             branch_fixups.push((jal_abs, false_target.clone(), BranchFixupOp::Jal));
         }
 
-        // ---- Call ----
         Instruction::Call { name, args, ret } => {
-            // Move args into a0-a7
             for (i, arg) in args.iter().enumerate() {
                 if i >= ARG_REGS.len() {
                     return Err(RasError::EncodingError(
@@ -748,15 +692,13 @@ fn encode_instruction(
             let target_name = name.trim_start_matches('@');
             let jal_abs = base_offset + code.len();
             branch_fixups.push((jal_abs, target_name.to_string(), BranchFixupOp::JalRa));
-            code.extend_from_slice(&j_type(0, REG_RA)); // placeholder
+            code.extend_from_slice(&j_type(0, REG_RA));
 
-            // Capture return value from a0
             if let Some(dst_reg) = ret {
                 store_result(code, ARG_REGS[0], dst_reg, stack_slots, rv64)?;
             }
         }
 
-        // ---- TailCall ----
         Instruction::TailCall { name, args } => {
             for (i, arg) in args.iter().enumerate() {
                 if i >= ARG_REGS.len() {
@@ -775,16 +717,13 @@ fn encode_instruction(
             let target_name = name.trim_start_matches('@');
             let jal_abs = base_offset + code.len();
             branch_fixups.push((jal_abs, target_name.to_string(), BranchFixupOp::Jal));
-            code.extend_from_slice(&emit_jal_zero(0)); // placeholder
+            code.extend_from_slice(&emit_jal_zero(0));
         }
 
-        // ---- Unreachable ----
         Instruction::Unreachable => {
-            // EBREAK — trap
             code.extend_from_slice(&i_type(1, 0, 0, 0, 0x73));
         }
 
-        // ---- Unimplemented ----
         other => {
             return Err(RasError::EncodingError(format!(
                 "RISC-V JIT: instruction not yet implemented: {:?}",
@@ -795,9 +734,6 @@ fn encode_instruction(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Branch fixup type
-// ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BranchFixupOp {
     Jal,   // JAL x0, offset  (unconditional, offset in J-type)
@@ -805,9 +741,6 @@ pub(crate) enum BranchFixupOp {
     Bne,   // BNE rs1, x0, offset  (rs1 already baked in the placeholder)
 }
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
 #[cfg(feature = "encoder")]
 pub fn compile_mir_riscv_function(
     assembler: &mut RasAssembler,
@@ -864,7 +797,6 @@ pub fn compile_mir_riscv_function(
     for (func_name, func) in &functions_to_compile {
         function_offsets.insert(func_name.clone(), code.len());
 
-        // --- Build stack slot map ---
         let mut stack_slots: HashMap<lamina_mir::VirtualReg, i32> = HashMap::new();
         let mut def_regs: std::collections::HashSet<lamina_mir::VirtualReg> =
             std::collections::HashSet::new();
@@ -901,11 +833,9 @@ pub fn compile_mir_riscv_function(
 
         let frame_size = stack_slots.len() * 8;
 
-        // --- Prologue ---
         let prologue = encode_prologue(frame_size, rv64)?;
         code.extend_from_slice(&prologue);
 
-        // --- Spill function parameters (a0–a7 → stack slots) ---
         for (i, param) in func.sig.params.iter().enumerate() {
             if let Register::Virtual(vreg) = &param.reg
                 && let Some(slot) = stack_slots.get(vreg)
@@ -916,16 +846,12 @@ pub fn compile_mir_riscv_function(
             // Stack args beyond 8 not yet supported
         }
 
-        // --- Compile blocks ---
         let func_base = function_offsets[func_name.as_str()];
 
-        // First pass: record block offsets (relative to start of `code`)
-        // We'll do a single-pass encoding with forward-branch fixups tracked locally.
         let mut block_offsets: HashMap<String, usize> = HashMap::new();
         let mut local_fixups: Vec<(usize, String, BranchFixupOp)> = Vec::new();
 
         // We need a per-function local code buffer so absolute offsets work.
-        // We'll emit into `code` directly and track via code.len().
         for block in &func.blocks {
             block_offsets.insert(block.label.clone(), code.len());
 
@@ -958,7 +884,6 @@ pub fn compile_mir_riscv_function(
             }
         }
 
-        // Patch intra-function branch fixups
         for (abs_off, target, op) in local_fixups {
             if let Some(&target_off) = block_offsets.get(&target) {
                 patch_branch(&mut code, abs_off, target_off, op)?;
@@ -975,7 +900,6 @@ pub fn compile_mir_riscv_function(
         let _ = func_base;
     }
 
-    // Patch cross-function call fixups
     for fixup in cross_fn_fixups {
         let target_off = *function_offsets.get(&fixup.target_name).ok_or_else(|| {
             RasError::EncodingError(format!(
@@ -989,9 +913,6 @@ pub fn compile_mir_riscv_function(
     Ok((code, function_offsets))
 }
 
-// ---------------------------------------------------------------------------
-// Branch patch helper
-// ---------------------------------------------------------------------------
 fn patch_branch(
     code: &mut [u8],
     patch_abs: usize,
@@ -1036,9 +957,6 @@ fn patch_branch(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,9 +974,9 @@ mod tests {
     fn emit_li64_small() {
         let mut code = Vec::new();
         emit_li64(&mut code, 10, 42);
-        assert_eq!(code.len(), 4); // single ADDI
+        assert_eq!(code.len(), 4);
         let word = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
-        assert_eq!(word & 0x7F, 0x13); // OP-IMM opcode
+        assert_eq!(word & 0x7F, 0x13);
         assert_eq!((word >> 20) as i32, 42);
     }
 
