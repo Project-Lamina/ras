@@ -10,11 +10,9 @@ use crate::encoder::aarch64::ldst_imm64::{
 use crate::error::RasError;
 use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
 
-/// Encode AArch64 prologue
 pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
 
-    // stp x29, x30, [sp, #-16]!
     let stp = enc_stp_pre_64(29, 30, 31, -16)?;
     code.extend_from_slice(&stp.to_le_bytes());
 
@@ -22,11 +20,8 @@ pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
     let mov_fp = 0x9100_03FDu32;
     code.extend_from_slice(&mov_fp.to_le_bytes());
 
-    // SUB sp, sp, #<stack_size> (allocate stack frame)
-    // Ensure stack is 16-byte aligned (AAPCS64 requirement)
     // The prologue already saved x29, x30 (16 bytes), maintaining alignment
     if stack_size > 0 {
-        // Ensure stack_size is 16-byte aligned (AAPCS64 requirement)
         let aligned_size = (stack_size + 15) & !15;
 
         if aligned_size > 0xFFF {
@@ -35,7 +30,6 @@ pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
                 stack_size, aligned_size
             )));
         }
-        // sub sp, sp, #aligned
         // Encoding matches clang/llvm-mc:
         //   sub sp, sp, #imm12  => 0xD10003FF | (imm12 << 10)
         let sub_sp = 0xD100_03FFu32 | ((aligned_size as u32) << 10);
@@ -45,7 +39,6 @@ pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
     Ok(code)
 }
 
-/// Encode AArch64 epilogue
 /// Must restore SP before LDP (undo the SUB sp, sp, #aligned_size from prologue)
 pub(super) fn encode_epilogue(aligned_stack_size: usize) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
@@ -57,14 +50,12 @@ pub(super) fn encode_epilogue(aligned_stack_size: usize) -> Result<Vec<u8>, RasE
                 aligned_stack_size
             )));
         }
-        // add sp, sp, #aligned_stack_size
         // Encoding matches clang/llvm-mc:
         //   add sp, sp, #imm12  => 0x910003FF | (imm12 << 10)
         let add_sp = 0x9100_03FFu32 | ((aligned_stack_size as u32) << 10);
         code.extend_from_slice(&add_sp.to_le_bytes());
     }
 
-    // ldp x29, x30, [sp], #16
     let ldp = enc_ldp_post_64(29, 30, 31, 16)?;
     code.extend_from_slice(&ldp.to_le_bytes());
 
@@ -136,14 +127,12 @@ pub(super) fn encode_str_typed(
     encode_str_scalar(src, base_reg, offset, kind)
 }
 
-/// Encode RET instruction (AArch64)
 /// RET Xn = 0xD65F0000 | (n << 5)
 pub(super) fn encode_ret(reg: u8) -> Result<Vec<u8>, RasError> {
     let instr: u32 = 0xD65F_0000 | ((reg as u32) << 5);
     Ok(instr.to_le_bytes().to_vec())
 }
 
-/// Encode BR instruction (AArch64)
 /// BR Xn = 0xD61F0000 | (n << 5)
 #[allow(dead_code)]
 pub(super) fn encode_br(reg: u8) -> Result<Vec<u8>, RasError> {
@@ -151,7 +140,6 @@ pub(super) fn encode_br(reg: u8) -> Result<Vec<u8>, RasError> {
     Ok(instr.to_le_bytes().to_vec())
 }
 
-/// Encode BLR instruction (AArch64)
 /// BLR Xn = 0xD63F0000 | (n << 5)
 pub(super) fn encode_blr(reg: u8) -> Result<Vec<u8>, RasError> {
     let instr: u32 = 0xD63F_0000 | ((reg as u32) << 5);
@@ -344,7 +332,6 @@ pub(super) fn emit_indexed_address(
     Ok(())
 }
 
-/// Parse register name to encoding (AArch64)
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {

@@ -30,9 +30,6 @@ struct BlFixup {
 static PRINT_I64_FORMAT: [u8; 6] = *b"%lld\n\0";
 
 /// Compile MIR to binary for AArch64
-///
-/// This reuses the instruction emission logic from mir_codegen/aarch64
-/// but generates binary instead of assembly text.
 #[cfg(feature = "encoder")]
 pub fn compile_mir_aarch64_function(
     assembler: &mut RasAssembler,
@@ -45,23 +42,20 @@ pub fn compile_mir_aarch64_function(
         std::collections::HashMap::new();
 
     // Always compile all functions (needed for internal function calls)
-    // Collect all function names first to ensure deterministic order
     let mut all_function_names: Vec<String> = module.functions.keys().cloned().collect();
-    all_function_names.sort(); // Sort for deterministic order
+    all_function_names.sort();
 
     // Pre-calculate function offsets (estimate) to handle recursive calls
-    // We'll use estimated offsets initially, then update with actual offsets as we compile
     let mut estimated_sizes: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for func_name in &all_function_names {
         if let Some(func) = module.functions.get(func_name) {
-            // Rough estimate: prologue + epilogue + RET + instructions
             let inst_count = func
                 .blocks
                 .iter()
                 .map(|b| b.instructions.len())
                 .sum::<usize>();
-            let estimated_size = 16 + (inst_count * 4) + 12 + 4; // prologue + instructions + epilogue + ret
+            let estimated_size = 16 + (inst_count * 4) + 12 + 4;
             estimated_sizes.insert(func_name.clone(), estimated_size);
         }
     }
@@ -69,7 +63,6 @@ pub fn compile_mir_aarch64_function(
     let total_est: usize = estimated_sizes.values().copied().sum();
     code.reserve(total_est.saturating_add(256));
 
-    // Pre-populate function_offsets with estimated offsets
     let mut current_estimate = 0;
     for func_name in &all_function_names {
         function_offsets.insert(func_name.clone(), current_estimate);
@@ -81,20 +74,17 @@ pub fn compile_mir_aarch64_function(
     // Tail calls use unconditional B (same patch shape as BL: 26-bit PC-relative).
     let mut tail_b_fixups: Vec<BlFixup> = Vec::new();
 
-    // Now compile all functions, updating offsets with actual values
     for func_name in &all_function_names {
         let func = module.functions.get(func_name).ok_or_else(|| {
             RasError::EncodingError(format!("Function '{}' not found in module", func_name))
         })?;
 
-        // Update function offset with actual value
         function_offsets.insert(func_name.clone(), code.len());
         let mut reg_alloc = A64RegAlloc::new();
         let frame = FrameMap::from_function(func);
         let mut stack_slots: std::collections::HashMap<lamina_mir::VirtualReg, i32> =
             std::collections::HashMap::new();
 
-        // Convert FrameMap slots to HashMap for easier lookup
         for (reg, offset) in &frame.slots {
             if let Register::Virtual(vreg) = reg {
                 stack_slots.insert(*vreg, *offset);
@@ -108,7 +98,6 @@ pub fn compile_mir_aarch64_function(
         // the total stack frame is 16-byte aligned
         let aligned_stack_size = (stack_size + 15) & !15;
 
-        // Generate function prologue (binary encoded)
         let prologue = encode_prologue(aligned_stack_size)?;
         code.extend_from_slice(&prologue);
 
@@ -124,7 +113,6 @@ pub fn compile_mir_aarch64_function(
                     && let Some(slot_off) = stack_slots.get(vreg)
                 {
                     if index < arg_regs.len() {
-                        // Store x0-x7 directly to the virtual register stack slot.
                         let str_bytes =
                             encode_str(arg_regs[index], 29 /* x29 (FP) */, *slot_off)?;
                         code.extend_from_slice(&str_bytes);
@@ -290,7 +278,6 @@ pub fn compile_mir_aarch64_function(
                     true_target,
                     false_target,
                 } => {
-                    // Load condition value and branch on non-zero.
                     let cond_reg_str = reg_alloc.alloc_scratch().unwrap_or("x9");
                     let cond_reg = parse_register(cond_reg_str)?;
                     materialize_operand(
@@ -304,7 +291,6 @@ pub fn compile_mir_aarch64_function(
                     )?;
                     reg_alloc.free_scratch(cond_reg_str);
 
-                    // CBNZ <cond>, <true>
                     let patch_location = code.len();
                     let placeholder = 0xB500_0000u32 | (cond_reg as u32);
                     code.extend_from_slice(&placeholder.to_le_bytes());
@@ -316,7 +302,6 @@ pub fn compile_mir_aarch64_function(
                         },
                     });
 
-                    // B <false>
                     let patch_location = code.len();
                     code.extend_from_slice(&0x1400_0000u32.to_le_bytes());
                     branch_fixups.push(BranchFixup {
@@ -398,7 +383,6 @@ pub fn compile_mir_aarch64_function(
             }
         }
 
-        // Patch branches that target blocks or the epilogue.
         let epilogue_offset = code.len();
         for fix in &branch_fixups {
             let from_pc = fix.patch_location;
@@ -422,7 +406,6 @@ pub fn compile_mir_aarch64_function(
             write_u32_le(&mut code, fix.patch_location, patched)?;
         }
 
-        // Generate function epilogue (must pass aligned_stack_size to restore SP)
         let epilogue = encode_epilogue(aligned_stack_size)?;
         code.extend_from_slice(&epilogue);
 
@@ -430,7 +413,6 @@ pub fn compile_mir_aarch64_function(
         code.extend_from_slice(&encode_ret(30)?);
     }
 
-    // Patch BL fixups now that all functions have their final offsets.
     fn lookup_function_offset(
         function_offsets: &std::collections::HashMap<String, usize>,
         name: &str,
@@ -519,12 +501,7 @@ pub fn compile_mir_aarch64_function(
     Ok((code, function_offsets))
 }
 
-// Encoding functions extracted from backup file
-
 /// Encode MIR instruction to binary (AArch64)
-///
-/// This reuses the instruction emission logic from mir_codegen/aarch64
-/// but generates binary instead of assembly text.
 #[cfg(feature = "encoder")]
 #[allow(dead_code)]
 fn encode_mir_instruction(
@@ -919,7 +896,6 @@ fn encode_mir_instruction_with_context(
             reg_alloc.free_scratch(tmp_reg_str);
         }
         lamina_mir::Instruction::Store { src, addr, ty, .. } => {
-            // Store from source to memory address
             let src_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");
             let src_reg = parse_register(src_reg_str)?;
 
@@ -1227,7 +1203,6 @@ fn encode_mir_instruction_with_context(
         lamina_mir::Instruction::Call { name, args, ret } => {
             let _abi = AArch64ABI::new(assembler.target_os);
 
-            // Materialize arguments into argument registers (x0-x7).
             let arg_regs = AArch64ABI::ARG_REGISTERS;
             for (i, arg) in args.iter().enumerate().take(8) {
                 let arg_reg_str = arg_regs[i];
@@ -1243,7 +1218,6 @@ fn encode_mir_instruction_with_context(
                 )?;
             }
 
-            // Handle stack arguments (args beyond 8).
             let stack_args = if args.len() > 8 { &args[8..] } else { &[] };
             let stack_space = (stack_args.len() * 8 + 15) & !15;
             if stack_space > 0 {
@@ -1275,14 +1249,13 @@ fn encode_mir_instruction_with_context(
 
                     code.extend_from_slice(&encode_str(
                         scratch_str,
-                        31, // sp
+                        31,
                         offset as i32,
                     )?);
                     reg_alloc.free_scratch(scratch_str);
                 }
             }
 
-            // External function calls need special handling for JIT.
             // Keep `print(x)` as a special-case intrinsic.
             if name == "print" && args.len() == 1 {
                 if stack_space != 0 {
@@ -1290,7 +1263,6 @@ fn encode_mir_instruction_with_context(
                         "print() intrinsic does not support stack-passed args".to_string(),
                     ));
                 }
-                // (Existing printf-based implementation below.)
                 // Resolve printf - try both "printf" and "_printf" on macOS
                 // The actual symbol name may vary, but dlsym usually finds "printf"
                 let printf_name = "printf";
@@ -1301,7 +1273,6 @@ fn encode_mir_instruction_with_context(
                 } else if let Some(addr) = assembler.function_pointers.get(printf_name_alt) {
                     *addr
                 } else {
-                    // Try to resolve "printf" first
                     if assembler.register_function(printf_name).is_err() {
                         // Fallback to "_printf" on macOS
                         if assembler.target_os == lamina_platform::TargetOperatingSystem::MacOS {
@@ -1349,11 +1320,10 @@ fn encode_mir_instruction_with_context(
                 let sub_sp = 0xD100_03FFu32 | ((home_area_size & 0xFFF) << 10);
                 code.extend_from_slice(&sub_sp.to_le_bytes());
 
-                // Spill the variadic integer argument to the home area at [sp].
                 materialize_operand(
                     assembler,
                     &args[0],
-                    8, // x8
+                    8,
                     stack_slots,
                     reg_alloc,
                     &mut code,
@@ -1361,23 +1331,21 @@ fn encode_mir_instruction_with_context(
                 )?;
                 code.extend_from_slice(&encode_str("x8", 31, 0)?);
 
-                // Load format string pointer into x0.
                 let fmt_ptr = PRINT_I64_FORMAT.as_ptr() as u64;
                 materialize_operand(
                     assembler,
                     &lamina_mir::Operand::Immediate(lamina_mir::Immediate::I64(fmt_ptr as i64)),
-                    0, // x0
+                    0,
                     stack_slots,
                     reg_alloc,
                     &mut code,
                     stack_size,
                 )?;
 
-                // Load printf address into x16 and call via BLR.
                 materialize_operand(
                     assembler,
                     &lamina_mir::Operand::Immediate(lamina_mir::Immediate::I64(printf_addr as i64)),
-                    16, // x16
+                    16,
                     stack_slots,
                     reg_alloc,
                     &mut code,
@@ -1385,11 +1353,9 @@ fn encode_mir_instruction_with_context(
                 )?;
                 code.extend_from_slice(&encode_blr(16)?);
 
-                // Restore SP.
                 let add_sp = 0x9100_03FFu32 | ((home_area_size & 0xFFF) << 10);
                 code.extend_from_slice(&add_sp.to_le_bytes());
             } else {
-                // Internal direct call (BL). Emit placeholder and patch later.
                 let is_internal = function_offsets.contains_key(name)
                     || (name.starts_with('@') && function_offsets.contains_key(&name[1..]))
                     || (!name.starts_with('@')
@@ -1421,7 +1387,7 @@ fn encode_mir_instruction_with_context(
                     && let Some(offset) = stack_slots.get(vreg)
                 {
                     code.extend_from_slice(&encode_str(
-                        "x0", 29, // x29 (FP)
+                        "x0", 29,
                         *offset,
                     )?);
                 }
@@ -1556,7 +1522,6 @@ mod aarch64_jit_tail_call_tests {
         );
     }
 
-    /// Stack-passed call arguments beyond ~64 used a broken STR immediate in the JIT encoder.
     #[test]
     fn compile_mir_aarch64_eighty_arg_call_encodes() {
         const M: usize = 80;
@@ -1607,8 +1572,6 @@ mod aarch64_jit_tail_call_tests {
         );
     }
 
-    /// BaseOffset loads/stores used to mask the displacement with 0x1FF while allowing up to 0xFFF,
-    /// corrupting addresses for offsets in [255, 0xFFF] (same failure mode as multi-arg call STR).
     #[test]
     fn compile_mir_aarch64_load_scaled_base_offset_encodes() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
@@ -1801,7 +1764,7 @@ mod aarch64_jit_tail_call_tests {
         assert!(code.ends_with(&[0xC0, 0x03, 0x5F, 0xD6]));
     }
 
-    /// Instruction words use scratch `w9`..=`w11` (`A64RegAlloc` order), not `w10`..=`w12`.
+    /// Instruction words use scratch `w9`..=`w11` (`A64RegAlloc` order).
     #[test]
     fn jit_a64_i32_udiv_w_encoding_present() {
         let code = compile_single_i32_binop_a64(IntBinOp::UDiv);
