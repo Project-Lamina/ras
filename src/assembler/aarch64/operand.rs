@@ -153,7 +153,6 @@ pub(super) fn materialize_return_value(
     }
 }
 
-/// Materialize an operand into a register (AArch64)
 /// Loads from stack slot if operand is a virtual register, or moves immediate
 #[cfg(feature = "encoder")]
 pub(super) fn materialize_operand(
@@ -167,7 +166,6 @@ pub(super) fn materialize_operand(
 ) -> Result<(), RasError> {
     match op {
         Operand::Immediate(imm) => {
-            // MOVZ/MOVK sequence (64-bit).
             let imm_val: u64 = match imm {
                 Immediate::I8(v) => *v as i64 as u64,
                 Immediate::I16(v) => *v as i64 as u64,
@@ -180,14 +178,12 @@ pub(super) fn materialize_operand(
                 }
             };
 
-            // Fast path: single MOVZ.
             if imm_val <= 0xFFFF {
                 let movz = 0xD280_0000u32 | ((imm_val as u32) << 5) | (dst_reg as u32);
                 code.extend_from_slice(&movz.to_le_bytes());
                 return Ok(());
             }
 
-            // General path: MOVZ for low 16 bits + MOVK for remaining chunks.
             let chunk0 = (imm_val & 0xFFFF) as u16;
             let chunk1 = ((imm_val >> 16) & 0xFFFF) as u16;
             let chunk2 = ((imm_val >> 32) & 0xFFFF) as u16;
@@ -213,13 +209,12 @@ pub(super) fn materialize_operand(
             }
         }
         Operand::Register(Register::Virtual(vreg)) => {
-            // Load from stack slot
             // FrameMap stack slots are FP-relative offsets (negative for locals).
             if let Some(offset) = stack_slots.get(vreg) {
                 let dst_reg_str = format!("x{}", dst_reg);
                 code.extend_from_slice(&encode_ldr(
                     &dst_reg_str,
-                    29, // x29 (FP)
+                    29,
                     *offset,
                 )?);
             } else {
