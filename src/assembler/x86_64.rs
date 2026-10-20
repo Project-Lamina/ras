@@ -7,9 +7,6 @@ use lamina_mir::{MirType, ScalarType};
 use std::collections::HashMap;
 
 /// Compile MIR to binary for x86_64
-///
-/// This reuses the instruction emission logic from mir_codegen/x86_64
-/// but generates binary instead of assembly text.
 #[cfg(feature = "encoder")]
 pub fn compile_mir_x86_64_function(
     assembler: &mut RasAssembler,
@@ -55,8 +52,7 @@ pub fn compile_mir_x86_64_function(
     code.reserve(reserve_hint);
 
     for (func_name, func) in functions_to_compile {
-        // Current x86_64 binary encoder is intentionally minimal.
-        // Refuse complex control flow for now so we don't produce nonsense binaries.
+        // Complex control flow is rejected: the encoder cannot emit it correctly.
         if func.blocks.len() != 1 {
             return Err(RasError::EncodingError(format!(
                 "x86_64 JIT encoder currently supports only single-block functions; '{}' has {} block(s)",
@@ -91,7 +87,6 @@ pub fn compile_mir_x86_64_function(
         let mut used_regs: std::collections::HashSet<lamina_mir::VirtualReg> =
             std::collections::HashSet::new();
 
-        // Collect register usage (reuse logic from mir_codegen)
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Some(dst) = inst.def_reg()
@@ -107,7 +102,6 @@ pub fn compile_mir_x86_64_function(
             }
         }
 
-        // Allocate stack slots (reuse logic from mir_codegen)
         for vreg in &def_regs {
             if !stack_slots.contains_key(vreg) {
                 let slot_index = stack_slots.len();
@@ -124,7 +118,6 @@ pub fn compile_mir_x86_64_function(
         let stack_size = stack_slots.len() * 8;
         let aligned_stack_size = (stack_size + 15) & !15;
 
-        // Generate function prologue (binary encoded)
         let prologue = encode_prologue_x86_64(aligned_stack_size as u32)?;
         code.extend_from_slice(&prologue);
 
@@ -133,7 +126,6 @@ pub fn compile_mir_x86_64_function(
             Some(lamina_mir::Instruction::Unreachable)
         );
 
-        // Handle function parameters (reuse ABI logic)
         if !func.sig.params.is_empty() {
             let arg_regs = abi.arg_registers();
             for (index, param) in func.sig.params.iter().enumerate() {
@@ -141,11 +133,9 @@ pub fn compile_mir_x86_64_function(
                     && let Some(slot_off) = stack_slots.get(vreg)
                 {
                     if index < arg_regs.len() {
-                        // MOV from argument register to stack slot
                         let mov_bytes = encode_mov_reg_mem_x86_64(arg_regs[index], *slot_off)?;
                         code.extend_from_slice(&mov_bytes);
                     } else {
-                        // Handle stack arguments
                         let caller_off = 16 + ((index - arg_regs.len()) as i32) * 8;
                         let mov1 = encode_mov_mem_reg_x86_64(caller_off, "rax")?;
                         code.extend_from_slice(&mov1);
@@ -156,7 +146,6 @@ pub fn compile_mir_x86_64_function(
             }
         }
 
-        // Compile each block
         for block in &func.blocks {
             for inst in &block.instructions {
                 let inst_bytes = encode_mir_instruction_x86_64(
@@ -181,7 +170,6 @@ pub fn compile_mir_x86_64_function(
     Ok((code, function_offsets))
 }
 
-/// Encode x86_64 prologue
 fn encode_prologue_x86_64(stack_size: u32) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::with_capacity(16);
     // push rbp: 55
@@ -203,7 +191,6 @@ fn encode_prologue_x86_64(stack_size: u32) -> Result<Vec<u8>, RasError> {
     Ok(code)
 }
 
-/// Encode x86_64 epilogue
 fn encode_epilogue_x86_64() -> Result<Vec<u8>, RasError> {
     let mut code = Vec::with_capacity(8);
     // mov rsp, rbp: 48 89 EC
@@ -213,7 +200,6 @@ fn encode_epilogue_x86_64() -> Result<Vec<u8>, RasError> {
     Ok(code)
 }
 
-/// Encode MOV register to memory
 fn encode_mov_reg_mem_x86_64(src_reg: &str, offset: i32) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
     let src = parse_register_x86_64(src_reg)?;
@@ -476,7 +462,6 @@ fn encode_mov_membase_reg_x86_64(src: u8, base: u8, disp: i32) -> Result<Vec<u8>
     Ok(code)
 }
 
-/// Encode MOV memory to register
 fn encode_mov_mem_reg_x86_64(offset: i32, dst_reg: &str) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
     let dst = parse_register_x86_64(dst_reg)?;
@@ -851,7 +836,6 @@ fn store_int_binop_result_x86_64(
     }
 }
 
-/// Parse register name to encoding (x86_64)
 fn parse_register_x86_64(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {
@@ -888,10 +872,6 @@ fn rex_w_r_b(w: bool, reg: u8, rm: u8) -> u8 {
     0x40 | ((w as u8) << 3) | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1)
 }
 
-/// Encode MIR instruction to binary (x86_64)
-///
-/// This reuses the instruction emission logic from mir_codegen/x86_64
-/// but generates binary instead of assembly text.
 #[cfg(feature = "encoder")]
 fn encode_mir_instruction_x86_64(
     inst: &lamina_mir::Instruction,
@@ -980,7 +960,6 @@ fn encode_mir_instruction_x86_64(
             Operand::Register(reg) => match reg {
                 Register::Virtual(v) => load_vreg_to_reg(slots, v, dst_reg),
                 Register::Physical(p) => {
-                    // mov dst, phys
                     let dst = parse_register_x86_64(dst_reg)?;
                     let src = parse_register_x86_64(p.name)?;
                     if dst == src {
