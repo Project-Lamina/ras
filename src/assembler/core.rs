@@ -7,7 +7,8 @@
 use crate::{
     encoder::{
         aarch64::AArch64Encoder, arx64::Arx64Encoder, riscv::RiscVEncoder,
-        traits::InstructionEncoder, x86_64::X86_64Encoder,
+        traits::{InstructionEncoder, ParsedInstruction, RipFixup},
+        x86_64::X86_64Encoder,
     },
     error::RasError,
     object::{
@@ -34,6 +35,18 @@ struct ShortJump {
 struct LayoutCache {
     sizes: Vec<usize>,
     short_jumps: Vec<ShortJump>,
+    code: Vec<u8>,
+    line_offsets: Vec<usize>,
+    rip_fixups: Vec<(usize, RipFixup)>,
+}
+
+impl LayoutCache {
+    fn rip_fixup(&self, index: usize) -> Option<RipFixup> {
+        self.rip_fixups
+            .binary_search_by_key(&index, |&(line, _)| line)
+            .ok()
+            .map(|position| self.rip_fixups[position].1)
+    }
 }
 
 struct RelaxationEvent {
@@ -82,6 +95,7 @@ struct Layout {
     patch_points: Vec<PatchPoint>,
     mapping_symbols: Vec<ObjectSymbol>,
     short_jumps: Vec<ShortJump>,
+    rip_fixups: Vec<(usize, RipFixup)>,
 }
 
 #[cfg(windows)]
@@ -281,6 +295,7 @@ impl RasAssembler {
                         section.flags.exec,
                         &positions,
                         &mut layout_caches[index],
+                        true,
                     )?);
                     layout_inputs[index] = inputs;
                 }
@@ -532,6 +547,7 @@ impl RasAssembler {
         executable: bool,
         positions: &HashMap<String, (String, usize)>,
         cache: &mut Option<LayoutCache>,
+        reuse_encodings: bool,
     ) -> Result<Layout, RasError> {
         let mut labels = HashMap::new();
         let mut regions = Vec::with_capacity(lines.len());
@@ -557,7 +573,7 @@ impl RasAssembler {
             }
         }
         if cache.is_none() {
-            let layout = self.layout_lines(lines, executable, &long_jumps, positions)?;
+            let layout = self.layout_lines(lines, executable, &long_jumps, positions, None)?;
             let sizes = layout
                 .line_offsets
                 .iter()
@@ -573,6 +589,9 @@ impl RasAssembler {
             *cache = Some(LayoutCache {
                 sizes,
                 short_jumps: layout.short_jumps,
+                code: layout.code,
+                line_offsets: layout.line_offsets,
+                rip_fixups: layout.rip_fixups,
             });
         }
         let cache = cache.as_mut().unwrap();
@@ -710,7 +729,13 @@ impl RasAssembler {
             lines.len(),
             events.len()
         );
-        self.layout_lines(lines, executable, &long_jumps, positions)
+        self.layout_lines(
+            lines,
+            executable,
+            &long_jumps,
+            positions,
+            reuse_encodings.then_some(&*cache),
+        )
     }
 
     fn layout_lines(
@@ -719,6 +744,7 @@ impl RasAssembler {
         executable: bool,
         long_jumps: &HashSet<usize>,
         positions: &HashMap<String, (String, usize)>,
+        reuse: Option<&LayoutCache>,
     ) -> Result<Layout, RasError> {
         let global_labels: HashSet<&str> = lines
             .iter()
@@ -734,6 +760,7 @@ impl RasAssembler {
         let mut mapping_mode = "";
         let mut current_offset = 0usize;
         let mut short_jumps = Vec::new();
+        let mut rip_fixups = Vec::new();
         let mut line_offsets = Vec::with_capacity(lines.len());
 
         for (index, line) in lines.iter().enumerate() {
@@ -927,58 +954,54 @@ impl RasAssembler {
                         continue;
                     }
 
-                    if is_jmp_call
+                    if self.target_arch == TargetArchitecture::X86_64
+                        && is_jmp_call
                         && inst.operands.len() == 1
                         && !inst.operands[0].trim().starts_with('*')
                     {
                         let target = inst.operands[0].trim();
-                        if self.target_arch == TargetArchitecture::X86_64 {
-                            let is_call = opcode == "call";
-                            if !is_call && !long_jumps.contains(&index) {
-                                code.extend_from_slice(&[0xeb, 0]);
-                                short_jumps.push(ShortJump {
-                                    index,
-                                    offset: current_offset,
-                                    target: target.to_string(),
-                                });
-                                current_offset += 2;
-                                continue;
-                            }
-                            let opcode_byte: u8 = if is_call { 0xe8 } else { 0xe9 };
-                            code.push(opcode_byte);
-                            code.extend_from_slice(&[0u8; 4]);
-                            patch_points.push(PatchPoint::X86Rel32 {
-                                offset: current_offset + 1,
+                        let is_call = opcode == "call";
+                        if !is_call && !long_jumps.contains(&index) {
+                            code.extend_from_slice(&[0xeb, 0]);
+                            short_jumps.push(ShortJump {
+                                index,
+                                offset: current_offset,
                                 target: target.to_string(),
-                                relocate: is_call && global_labels.contains(target),
                             });
-                            current_offset += 5;
-                        } else {
-                            let bytes = self
-                                .encoder
-                                .encode_instruction(inst)
-                                .map_err(|e| RasError::EncodingError(e.to_string()))?;
-                            code.extend_from_slice(&bytes);
-                            current_offset += bytes.len();
+                            current_offset += 2;
+                            continue;
                         }
+                        let opcode_byte: u8 = if is_call { 0xe8 } else { 0xe9 };
+                        code.push(opcode_byte);
+                        code.extend_from_slice(&[0u8; 4]);
+                        patch_points.push(PatchPoint::X86Rel32 {
+                            offset: current_offset + 1,
+                            target: target.to_string(),
+                            relocate: is_call && global_labels.contains(target),
+                        });
+                        current_offset += 5;
+                    } else if let Some(cache) = reuse {
+                        let size = cache.sizes[index];
+                        let start = cache.line_offsets[index];
+                        code.extend_from_slice(&cache.code[start..start + size]);
+                        if let Some(patch) = cache.rip_fixup(index).and_then(|fixup| {
+                            rip_relative_patch(inst, fixup, current_offset, &global_labels)
+                        }) {
+                            patch_points.push(patch);
+                        }
+                        current_offset += size;
                     } else {
                         let bytes = self
                             .encoder
                             .encode_instruction(inst)
                             .map_err(|e| RasError::EncodingError(e.to_string()))?;
-                        if let Some(fixup) = self.encoder.take_rip_fixup()
-                            && let Some((label, addend)) = inst
-                                .operands
-                                .iter()
-                                .find_map(|op| extract_rip_label(op.trim().trim_start_matches('*')))
-                        {
-                            patch_points.push(PatchPoint::X86RipRel32 {
-                                offset: current_offset + fixup.disp_offset,
-                                target: label.to_string(),
-                                trailing: fixup.trailing,
-                                addend,
-                                relocate: global_labels.contains(label),
-                            });
+                        if let Some(fixup) = self.encoder.take_rip_fixup() {
+                            rip_fixups.push((index, fixup));
+                            if let Some(patch) =
+                                rip_relative_patch(inst, fixup, current_offset, &global_labels)
+                            {
+                                patch_points.push(patch);
+                            }
                         }
                         code.extend_from_slice(&bytes);
                         current_offset += bytes.len();
@@ -994,6 +1017,7 @@ impl RasAssembler {
             patch_points,
             mapping_symbols,
             short_jumps,
+            rip_fixups,
         })
     }
 
@@ -1577,6 +1601,25 @@ fn x86_cond_jmp_byte(opcode: &str) -> Option<u8> {
 }
 
 /// Returns the label name if `op` has the form `label(%rip)` (RIP-relative addressing).
+fn rip_relative_patch(
+    inst: &ParsedInstruction,
+    fixup: RipFixup,
+    offset: usize,
+    global_labels: &HashSet<&str>,
+) -> Option<PatchPoint> {
+    let (label, addend) = inst
+        .operands
+        .iter()
+        .find_map(|op| extract_rip_label(op.trim().trim_start_matches('*')))?;
+    Some(PatchPoint::X86RipRel32 {
+        offset: offset + fixup.disp_offset,
+        target: label.to_string(),
+        trailing: fixup.trailing,
+        addend,
+        relocate: global_labels.contains(label),
+    })
+}
+
 fn extract_rip_label(op: &str) -> Option<(&str, i64)> {
     let op = op
         .strip_prefix("jmp ")
@@ -1613,5 +1656,65 @@ fn absolute_expression(
         _ => Err(RasError::EncodingError(format!(
             "Unsupported absolute expression: {expression}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod layout_cache_tests {
+    use super::*;
+
+    fn relaxation_source() -> String {
+        let mut text = String::from("f:\n    jne .Lend\n");
+        for _ in 0..5 {
+            text.push_str("    jmp .Lfar\n");
+        }
+        for i in 0..46 {
+            text.push_str("    xorl %eax, %eax\n");
+            if i % 20 == 0 {
+                text.push_str("    movq gsym(%rip), %rdx\n");
+            }
+        }
+        text.push_str(".Lend:\n    movq gsym(%rip), %rax\n");
+        for _ in 0..200 {
+            text.push_str("    xorl %ecx, %ecx\n");
+        }
+        text.push_str(".Lfar:\n    ret\n");
+        text
+    }
+
+    fn rip_patches(layout: &Layout) -> Vec<(usize, String)> {
+        layout
+            .patch_points
+            .iter()
+            .filter_map(|patch| match patch {
+                PatchPoint::X86RipRel32 { offset, target, .. } => Some((*offset, target.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cached_layout_matches_full_reencode_after_relaxation() {
+        let parsed = AssemblyParser::new()
+            .parse(&relaxation_source())
+            .expect("parse");
+        let positions = HashMap::new();
+        let mut asm = RasAssembler::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .expect("assembler");
+
+        let mut cache = None;
+        let cached = asm
+            .layout_two_pass(&parsed.lines, true, &positions, &mut cache, true)
+            .expect("cached layout");
+        let mut full_cache = None;
+        let full = asm
+            .layout_two_pass(&parsed.lines, true, &positions, &mut full_cache, false)
+            .expect("full layout");
+
+        assert_eq!(cached.code[0], 0x0f, "top branch should be promoted");
+        assert_eq!(cached.code, full.code);
+        assert_eq!(cached.symbol_offsets, full.symbol_offsets);
+        assert_eq!(rip_patches(&cached), rip_patches(&full));
+        assert!(!rip_patches(&full).is_empty());
     }
 }
