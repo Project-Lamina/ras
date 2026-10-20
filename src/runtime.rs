@@ -339,12 +339,9 @@ mod tests {
 
     #[test]
     fn executable_memory_allocate_and_write() {
-        // Allocate a small writable+executable region and verify the written bytes
-        // can be read back before making the region executable.
         let mut mem = ExecutableMemory::allocate_writable(4096).expect("alloc failed");
-        let code = [0x90u8, 0x90, 0x90, 0xc3]; // three NOPs + ret (x86_64)
+        let code = [0x90u8, 0x90, 0x90, 0xc3];
         mem.write_code(&code).expect("write failed");
-        // After making it executable the pointer should remain non-null.
         mem.make_executable().expect("make_executable failed");
         assert!(!mem.code_start().is_null());
     }

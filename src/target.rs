@@ -156,9 +156,7 @@ mod tests {
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Linux
         ));
-        // macOS reports unsupported because MachOWriter::write_object_file is a stub
-        // that always errors. This used to assert true, which meant the failure only
-        // showed up at the end of a compile.
+        // macOS reports unsupported because MachOWriter::write_object_file is a stub that always errors.
         assert!(!is_object_file_supported(
             TargetArchitecture::X86_64,
             TargetOperatingSystem::MacOS
@@ -171,7 +169,6 @@ mod tests {
             TargetArchitecture::Riscv64,
             TargetOperatingSystem::MacOS
         ));
-        // The COFF writer rejects everything but x86_64.
         assert!(is_object_file_supported(
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Windows
