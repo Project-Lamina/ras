@@ -156,8 +156,6 @@ main:
 
     #[test]
     fn test_assemble_rip_relative_lea_label() {
-        // Verify that `leaq label(%rip), %reg` with an .asciz data label assembles
-        // without error and that the RIP-relative displacement is correct.
         let asm = r#"
 .section .rodata
 .L_fmt: .asciz "%lld\n"
@@ -173,7 +171,6 @@ get_fmt:
         ras.assemble(asm, &path).expect("assemble should succeed");
         let buf = std::fs::read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
-        // Must be a valid ELF file
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
 

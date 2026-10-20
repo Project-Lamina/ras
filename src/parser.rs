@@ -124,7 +124,6 @@ impl AssemblyParser {
                 continue;
             }
 
-            // Handle "label:" and "label: directive/instruction" forms.
             // A label token has no internal whitespace and ends with ':'.
             if let Some(colon_pos) = line.find(':') {
                 let before = &line[..colon_pos];
