@@ -50,9 +50,6 @@ pub struct ExternalReloc {
 }
 
 /// All data needed to write a single relocatable object file.
-///
-/// Passed to [`ObjectWriter::write_object_file`] so the trait method signature
-/// stays below clippy's argument-count threshold without losing any information.
 pub struct ObjectWriteRequest<'a> {
     pub code: &'a [u8],
     pub sections: &'a [Section],
@@ -733,7 +730,6 @@ impl ObjectWriter for CoffWriter {
             )));
         }
 
-        // Collect unique external symbols referenced by relocations.
         let mut extern_names: Vec<String> = Vec::new();
         for r in relocations {
             if !extern_names.contains(&r.symbol) {
@@ -741,13 +737,11 @@ impl ObjectWriter for CoffWriter {
             }
         }
 
-        // Collect global exported functions (defined in this object).
         let exported: Vec<&ObjectSymbol> = symbols
             .iter()
             .filter(|s| s.global && !s.name.starts_with(".L"))
             .collect();
 
-        // Build symbol table and string table.
         // Symbol index layout: 0 = .text section, 1..=exported, then extern symbols.
         let mut strtab: Vec<u8> = vec![0u8; 4]; // size placeholder
         let mut sym_bytes: Vec<u8> = Vec::new();
@@ -776,7 +770,6 @@ impl ObjectWriter for CoffWriter {
             sym_bytes.extend_from_slice(&entry);
         };
 
-        // Index 0: .text section symbol
         push_sym(
             &mut sym_bytes,
             &mut strtab,
@@ -786,7 +779,6 @@ impl ObjectWriter for CoffWriter {
             0,
             IMAGE_SYM_CLASS_STATIC,
         );
-        // Indices 1..=exported: defined global functions
         for sym in &exported {
             push_sym(
                 &mut sym_bytes,
@@ -798,8 +790,7 @@ impl ObjectWriter for CoffWriter {
                 2, /* EXTERNAL */
             );
         }
-        // Indices after exported: undefined external symbols (printf, etc.)
-        let extern_base_idx = 1 + exported.len(); // 0-based index of first extern sym
+        let extern_base_idx = 1 + exported.len();
         for name in &extern_names {
             push_sym(&mut sym_bytes, &mut strtab, name, 0, 0, 0x20, 2);
         }
@@ -868,19 +859,16 @@ impl ObjectWriter for CoffWriter {
         f.write_all(&0u16.to_le_bytes()).map_err(map)?; // NumberOfLinenumbers
         f.write_all(&sec_flags.to_le_bytes()).map_err(map)?; // Characteristics
 
-        // Raw data
         f.write_all(code).map_err(map)?;
         let pad = padded_len as usize - code.len();
         if pad > 0 {
             f.write_all(&vec![0u8; pad]).map_err(map)?;
         }
 
-        // Relocation table
         if !reloc_bytes.is_empty() {
             f.write_all(&reloc_bytes).map_err(map)?;
         }
 
-        // Symbol table + string table
         f.write_all(&sym_bytes).map_err(map)?;
         f.write_all(&strtab).map_err(map)?;
 
@@ -889,9 +877,6 @@ impl ObjectWriter for CoffWriter {
 }
 
 /// Returns the object writer for `target_os` (ELF, Mach-O, or COFF).
-///
-/// This is the single dispatch point used by [`crate::assembler::RasAssembler`];
-/// add new OS families here instead of duplicating `match` arms.
 pub fn object_writer_for_os(
     target_os: TargetOperatingSystem,
 ) -> Result<Box<dyn ObjectWriter>, RasError> {
