@@ -115,7 +115,7 @@ pub struct RasAssembler {
     encoder: Box<dyn InstructionEncoder>,
     object_writer: Box<dyn ObjectWriter>,
     object_write_options: ObjectWriteOptions,
-    pub(crate) function_pointers: HashMap<String, u64>, // Function name -> address
+    pub(crate) function_pointers: HashMap<String, u64>,
     #[cfg(feature = "encoder")]
     pub(crate) current_module: Option<*const lamina_mir::Module>, // Current module being compiled (for internal call detection)
 }
@@ -176,7 +176,6 @@ impl RasAssembler {
         target_os: TargetOperatingSystem,
         object_write_options: ObjectWriteOptions,
     ) -> Result<Self, RasError> {
-        // Create encoder based on target architecture
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
             TargetArchitecture::X86_64 => Box::new(X86_64Encoder::new()),
             TargetArchitecture::Aarch64 => Box::new(AArch64Encoder::new()),
@@ -1299,7 +1298,6 @@ impl RasAssembler {
 
             if ptr.is_null() {
                 // Fallback: try opening libc explicitly
-                // Clear any previous error
                 unsafe {
                     libc::dlerror();
                 }
@@ -1322,7 +1320,6 @@ impl RasAssembler {
                     )));
                 }
 
-                // Clear error before dlsym
                 unsafe {
                     libc::dlerror();
                 }
@@ -1416,9 +1413,7 @@ impl RasAssembler {
         module: &lamina_mir::Module,
         function_name: Option<&str>,
     ) -> Result<(Vec<u8>, std::collections::HashMap<String, usize>), RasError> {
-        // Store module reference for checking internal vs external calls
         self.current_module = Some(module);
-        // Reuse register allocation and ABI from mir_codegen
         match self.target_arch {
             TargetArchitecture::X86_64 => {
                 crate::assembler::x86_64::compile_mir_x86_64_function(self, module, function_name)
