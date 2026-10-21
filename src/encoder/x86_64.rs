@@ -1421,7 +1421,7 @@ impl InstructionEncoder for X86_64Encoder {
             }
             // REX.W 0x99: sign-extend rax into rdx:rax (needed before idivq)
             "cqto" | "cqo" => {
-                code.push(0x48); // REX.W
+                code.push(0x48);
                 code.push(0x99);
             }
             // REX.W 0x99 for 32-bit sign-extend eax into edx:eax
