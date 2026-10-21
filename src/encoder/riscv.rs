@@ -23,14 +23,9 @@ impl RiscVEncoder {
         Self { position: 0, rv64 }
     }
 
-    // -----------------------------------------------------------------------
-    // Register parser
-    // -----------------------------------------------------------------------
-
     fn parse_register(&self, s: &str) -> Result<u8, RasError> {
         let s = s.trim_start_matches('%').trim();
         match s {
-            // Numeric names
             "x0" => Ok(0),
             "x1" => Ok(1),
             "x2" => Ok(2),
@@ -63,7 +58,6 @@ impl RiscVEncoder {
             "x29" => Ok(29),
             "x30" => Ok(30),
             "x31" => Ok(31),
-            // ABI names
             "zero" => Ok(0),
             "ra" => Ok(1),
             "sp" => Ok(2),
@@ -135,10 +129,6 @@ impl RiscVEncoder {
             Ok((self.parse_register(s)?, 0))
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Instruction format encoders
-    // -----------------------------------------------------------------------
 
     #[inline]
     fn r_type(funct7: u8, rs2: u8, rs1: u8, funct3: u8, rd: u8, opcode: u8) -> u32 {
@@ -218,10 +208,6 @@ impl RiscVEncoder {
     fn emit(word: u32) -> Vec<u8> {
         word.to_le_bytes().to_vec()
     }
-
-    // -----------------------------------------------------------------------
-    // Convenience dispatch for common 3-operand R-type ops
-    // -----------------------------------------------------------------------
 
     fn encode_r3(
         &self,
@@ -334,7 +320,6 @@ impl InstructionEncoder for RiscVEncoder {
         let ops = &inst.operands;
 
         let bytes = match opcode.as_str() {
-            // ------- Integer Arithmetic (R-type, opcode 0x33) -------
             "add" => self.encode_r3(ops, 0x00, 0x0, 0x33)?,
             "sub" => self.encode_r3(ops, 0x20, 0x0, 0x33)?,
             "sll" => self.encode_r3(ops, 0x00, 0x1, 0x33)?,
@@ -346,7 +331,6 @@ impl InstructionEncoder for RiscVEncoder {
             "or" => self.encode_r3(ops, 0x00, 0x6, 0x33)?,
             "and" => self.encode_r3(ops, 0x00, 0x7, 0x33)?,
 
-            // ------- M-extension multiply/divide (R-type, funct7=1, opcode 0x33) -------
             "mul" => self.encode_r3(ops, 0x01, 0x0, 0x33)?,
             "mulh" => self.encode_r3(ops, 0x01, 0x1, 0x33)?,
             "mulhsu" => self.encode_r3(ops, 0x01, 0x2, 0x33)?,
@@ -356,7 +340,6 @@ impl InstructionEncoder for RiscVEncoder {
             "rem" => self.encode_r3(ops, 0x01, 0x6, 0x33)?,
             "remu" => self.encode_r3(ops, 0x01, 0x7, 0x33)?,
 
-            // ------- RV64 word-width R-type (opcode 0x3B) -------
             "addw" => self.encode_r3(ops, 0x00, 0x0, 0x3B)?,
             "subw" => self.encode_r3(ops, 0x20, 0x0, 0x3B)?,
             "sllw" => self.encode_r3(ops, 0x00, 0x1, 0x3B)?,
@@ -368,7 +351,6 @@ impl InstructionEncoder for RiscVEncoder {
             "remw" => self.encode_r3(ops, 0x01, 0x6, 0x3B)?,
             "remuw" => self.encode_r3(ops, 0x01, 0x7, 0x3B)?,
 
-            // ------- Integer Immediate (I-type, opcode 0x13) -------
             "addi" => self.encode_i3(ops, 0x0, 0x13)?,
             "slti" => self.encode_i3(ops, 0x2, 0x13)?,
             "sltiu" => self.encode_i3(ops, 0x3, 0x13)?,
@@ -379,13 +361,11 @@ impl InstructionEncoder for RiscVEncoder {
             "srli" => self.encode_shift_imm(ops, 0x00, 0x5, 0x13)?,
             "srai" => self.encode_shift_imm(ops, 0x20, 0x5, 0x13)?,
 
-            // ------- RV64 word-width immediate (opcode 0x1B) -------
             "addiw" => self.encode_i3(ops, 0x0, 0x1B)?,
             "slliw" => self.encode_shift_imm(ops, 0x00, 0x1, 0x1B)?,
             "srliw" => self.encode_shift_imm(ops, 0x00, 0x5, 0x1B)?,
             "sraiw" => self.encode_shift_imm(ops, 0x20, 0x5, 0x1B)?,
 
-            // ------- Loads -------
             "lb" => self.encode_load(ops, 0x0)?,
             "lh" => self.encode_load(ops, 0x1)?,
             "lw" => self.encode_load(ops, 0x2)?,
@@ -394,13 +374,11 @@ impl InstructionEncoder for RiscVEncoder {
             "lhu" => self.encode_load(ops, 0x5)?,
             "lwu" => self.encode_load(ops, 0x6)?,
 
-            // ------- Stores -------
             "sb" => self.encode_store(ops, 0x0)?,
             "sh" => self.encode_store(ops, 0x1)?,
             "sw" => self.encode_store(ops, 0x2)?,
             "sd" => self.encode_store(ops, 0x3)?,
 
-            // ------- Branches -------
             "beq" => self.encode_branch(ops, 0x0)?,
             "bne" => self.encode_branch(ops, 0x1)?,
             "blt" => self.encode_branch(ops, 0x4)?,
@@ -408,7 +386,6 @@ impl InstructionEncoder for RiscVEncoder {
             "bltu" => self.encode_branch(ops, 0x6)?,
             "bgeu" => self.encode_branch(ops, 0x7)?,
 
-            // ------- JAL (J-type) -------
             "jal" => {
                 if ops.len() != 2 {
                     return Err(RasError::EncodingError(
@@ -420,7 +397,6 @@ impl InstructionEncoder for RiscVEncoder {
                 Self::emit(Self::j_type(offset, rd, 0x6F))
             }
 
-            // ------- JALR (I-type) -------
             "jalr" => {
                 if ops.len() == 3 {
                     // jalr rd, rs1, imm  (explicit form)
@@ -444,7 +420,6 @@ impl InstructionEncoder for RiscVEncoder {
                 }
             }
 
-            // ------- LUI / AUIPC (U-type) -------
             "lui" => {
                 if ops.len() != 2 {
                     return Err(RasError::EncodingError(
@@ -466,12 +441,10 @@ impl InstructionEncoder for RiscVEncoder {
                 Self::emit(Self::u_type(imm20, rd, 0x17))
             }
 
-            // ------- SYSTEM / FENCE -------
             "ecall" => Self::emit(Self::i_type(0, 0, 0, 0, 0x73)),
             "ebreak" => Self::emit(Self::i_type(1, 0, 0, 0, 0x73)),
             "fence" | "fence.i" => Self::emit(Self::i_type(0, 0, 0, 0, 0x0F)),
 
-            // ------- Pseudo-instructions -------
             // `nop` = addi x0, x0, 0
             "nop" => Self::emit(Self::i_type(0, 0, 0, 0, 0x13)),
             // `ret` = jalr x0, 0(ra)
@@ -565,58 +538,53 @@ mod tests {
 
     #[test]
     fn test_add_encoding() {
-        // add a0, a1, a2  → R-type opcode=0x33 funct3=0 funct7=0
         let bytes = enc()
             .encode_instruction(&instr("add", &["a0", "a1", "a2"]))
             .unwrap();
         assert_eq!(bytes.len(), 4);
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!(word & 0x7F, 0x33); // opcode
-        assert_eq!((word >> 12) & 7, 0); // funct3
-        assert_eq!((word >> 25) & 0x7F, 0); // funct7
-        assert_eq!((word >> 7) & 0x1F, 10); // rd = a0 = 10
+        assert_eq!(word & 0x7F, 0x33);
+        assert_eq!((word >> 12) & 7, 0);
+        assert_eq!((word >> 25) & 0x7F, 0);
+        assert_eq!((word >> 7) & 0x1F, 10);
     }
 
     #[test]
     fn test_addi_encoding() {
-        // addi t0, zero, 42  → I-type
         let bytes = enc()
             .encode_instruction(&instr("addi", &["t0", "zero", "42"]))
             .unwrap();
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!(word & 0x7F, 0x13); // opcode OP-IMM
-        assert_eq!((word >> 7) & 0x1F, 5); // rd = t0 = 5
-        assert_eq!((word >> 20) as i32, 42); // imm = 42 (sign-extended)
+        assert_eq!(word & 0x7F, 0x13);
+        assert_eq!((word >> 7) & 0x1F, 5);
+        assert_eq!((word >> 20) as i32, 42);
     }
 
     #[test]
     fn test_ret_pseudo() {
-        // ret → jalr x0, 0(ra) → I-type i=0, rs1=1, funct3=0, rd=0, opcode=0x67
         let bytes = enc().encode_instruction(&instr("ret", &[])).unwrap();
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!(word & 0x7F, 0x67); // JALR opcode
-        assert_eq!((word >> 7) & 0x1F, 0); // rd = x0
-        assert_eq!((word >> 15) & 0x1F, 1); // rs1 = ra
-        assert_eq!(word >> 20, 0); // imm = 0
+        assert_eq!(word & 0x7F, 0x67);
+        assert_eq!((word >> 7) & 0x1F, 0);
+        assert_eq!((word >> 15) & 0x1F, 1);
+        assert_eq!(word >> 20, 0);
     }
 
     #[test]
     fn test_load_store_encoding() {
-        // sw a0, 0(sp)
         let bytes = enc()
             .encode_instruction(&instr("sw", &["a0", "0(sp)"]))
             .unwrap();
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!(word & 0x7F, 0x23); // STORE opcode
-        assert_eq!((word >> 12) & 7, 0x2); // funct3 = SW
+        assert_eq!(word & 0x7F, 0x23);
+        assert_eq!((word >> 12) & 7, 0x2);
 
-        // lw a1, 4(sp)
         let bytes = enc()
             .encode_instruction(&instr("lw", &["a1", "4(sp)"]))
             .unwrap();
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!(word & 0x7F, 0x03); // LOAD opcode
-        assert_eq!((word >> 12) & 7, 0x2); // funct3 = LW
+        assert_eq!(word & 0x7F, 0x03);
+        assert_eq!((word >> 12) & 7, 0x2);
     }
 
     #[test]
@@ -630,7 +598,6 @@ mod tests {
 
     #[test]
     fn test_abi_register_aliases() {
-        // Both 'zero' and 'x0' should parse to 0
         let mut e = enc();
         let b1 = e
             .encode_instruction(&instr("addi", &["zero", "zero", "0"]))
@@ -643,11 +610,10 @@ mod tests {
 
     #[test]
     fn test_mul_encoding() {
-        // mul a0, a1, a2 → R-type funct7=1
         let bytes = enc()
             .encode_instruction(&instr("mul", &["a0", "a1", "a2"]))
             .unwrap();
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!((word >> 25) & 0x7F, 1); // funct7 = M-extension
+        assert_eq!((word >> 25) & 0x7F, 1);
     }
 }
