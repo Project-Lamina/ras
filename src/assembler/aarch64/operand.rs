@@ -225,8 +225,6 @@ pub(super) fn materialize_operand(
             }
         }
         Operand::Register(Register::Physical(_)) => {
-            // Physical registers are already in place, but we need to move to dst
-            // For now, assume it's already correct (this is a simplification)
             return Err(RasError::EncodingError(
                 "Physical register operands not yet fully supported".to_string(),
             ));
