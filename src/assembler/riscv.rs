@@ -847,8 +847,6 @@ pub fn compile_mir_riscv_function(
             // Stack args beyond 8 not yet supported
         }
 
-        let func_base = function_offsets[func_name.as_str()];
-
         let mut block_offsets: HashMap<String, usize> = HashMap::new();
         let mut local_fixups: Vec<(usize, String, BranchFixupOp)> = Vec::new();
 
@@ -900,8 +898,6 @@ pub fn compile_mir_riscv_function(
                 });
             }
         }
-
-        let _ = func_base;
     }
 
     for fixup in cross_fn_fixups {
