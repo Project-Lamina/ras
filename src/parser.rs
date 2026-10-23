@@ -594,7 +594,7 @@ pub(crate) enum DataExpression {
 }
 
 pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasError> {
-    if let Ok(value) = parse_integer(text) {
+    if let Some(value) = parse_integer_opt(text) {
         return Ok(DataExpression::Constant(value));
     }
     let symbol = |s: &str| {
@@ -613,7 +613,7 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
         let left = text[..index].trim();
         let right = text[index + 1..].trim();
         if operand(left) {
-            if let Ok(value) = parse_integer(right) {
+            if let Some(value) = parse_integer_opt(right) {
                 return Ok(DataExpression::Symbol(
                     left.into(),
                     if op == '-' { -value } else { value },
@@ -632,15 +632,18 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
 }
 
 pub(crate) fn parse_integer(text: &str) -> Result<i128, RasError> {
+    parse_integer_opt(text)
+        .ok_or_else(|| RasError::ParseError(format!("Invalid integer: {text}")))
+}
+
+fn parse_integer_opt(text: &str) -> Option<i128> {
     let (sign, digits) = text.strip_prefix('-').map_or((1, text), |s| (-1, s));
     let result = if let Some(hex) = digits.strip_prefix("0x") {
         i128::from_str_radix(hex, 16)
     } else {
         digits.parse()
     };
-    result
-        .map(|n| sign * n)
-        .map_err(|_| RasError::ParseError(format!("Invalid integer: {text}")))
+    result.ok().map(|n| sign * n)
 }
 
 fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
