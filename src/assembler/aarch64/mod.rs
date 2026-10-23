@@ -1643,6 +1643,30 @@ mod aarch64_jit_tail_call_tests {
     }
 
     #[test]
+    fn compile_mir_aarch64_physical_return_operand_is_rejected() {
+        use lamina_mir::{PhysicalReg, RegisterClass};
+
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let mut f = Function::new(Signature::new("pick").with_return(i64_ty));
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(Register::Physical(PhysicalReg::new(
+                "x1",
+                RegisterClass::Gpr,
+            )))),
+        });
+        f.add_block(entry);
+        let mut m = Module::new("phys_ret");
+        m.add_function(f);
+
+        let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+            .expect("assembler");
+        let err = compile_mir_aarch64_function(&mut asm, &m, None)
+            .expect_err("physical register operand must not encode");
+        assert!(format!("{err:?}").contains("Physical register"));
+    }
+
+    #[test]
     fn compile_mir_aarch64_select_encodes() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
         let cond_v = Register::Virtual(VirtualReg::gpr(0));
