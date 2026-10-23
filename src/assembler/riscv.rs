@@ -716,7 +716,7 @@ fn encode_instruction(
             code.truncate(new_len);
             let target_name = name.trim_start_matches('@');
             let jal_abs = base_offset + code.len();
-            branch_fixups.push((jal_abs, target_name.to_string(), BranchFixupOp::Jal));
+            branch_fixups.push((jal_abs, target_name.to_string(), BranchFixupOp::TailJal));
             code.extend_from_slice(&emit_jal_zero(0));
         }
 
@@ -736,9 +736,10 @@ fn encode_instruction(
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BranchFixupOp {
-    Jal,   // JAL x0, offset  (unconditional, offset in J-type)
-    JalRa, // JAL ra, offset  (call, offset in J-type)
-    Bne,   // BNE rs1, x0, offset  (rs1 already baked in the placeholder)
+    Jal,     // JAL x0, offset  (unconditional, offset in J-type)
+    JalRa,   // JAL ra, offset  (call, offset in J-type)
+    TailJal, // JAL x0, offset  (tail call, target is always a function)
+    Bne,     // BNE rs1, x0, offset  (rs1 already baked in the placeholder)
 }
 
 #[cfg(feature = "encoder")]
@@ -885,7 +886,10 @@ pub fn compile_mir_riscv_function(
         }
 
         for (abs_off, target, op) in local_fixups {
-            if let Some(&target_off) = block_offsets.get(&target) {
+            let is_function_target = matches!(op, BranchFixupOp::JalRa | BranchFixupOp::TailJal);
+            if let Some(&target_off) = block_offsets.get(&target)
+                && !is_function_target
+            {
                 patch_branch(&mut code, abs_off, target_off, op)?;
             } else {
                 // Maybe an inter-function call target — defer
@@ -922,7 +926,7 @@ fn patch_branch(
     let delta = target_abs as i64 - patch_abs as i64;
 
     match op {
-        BranchFixupOp::Jal => {
+        BranchFixupOp::Jal | BranchFixupOp::TailJal => {
             if !(-0x10_0000i64..0x10_0000i64).contains(&delta) {
                 return Err(RasError::EncodingError(format!(
                     "RISC-V JAL fixup: offset {} out of ±1MiB range",
@@ -993,5 +997,63 @@ mod tests {
         assert_eq!(riscv_reg_num("sp").unwrap(), 2);
         assert_eq!(riscv_reg_num("x31").unwrap(), 31);
         assert!(riscv_reg_num("bogus").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "encoder"))]
+mod mir_call_tests {
+    use super::*;
+    use lamina_mir::{
+        block::Block,
+        function::{Function, Signature},
+        instruction::Instruction,
+        module::Module,
+    };
+    use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+    fn call_with_block_named_like_callee() -> Module {
+        let mut helper = Function::new(Signature::new("helper"));
+        let mut helper_entry = Block::new("entry");
+        helper_entry.push(Instruction::Ret { value: None });
+        helper.add_block(helper_entry);
+
+        let mut caller = Function::new(Signature::new("caller"));
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::Call {
+            name: "helper".to_string(),
+            args: Vec::new(),
+            ret: None,
+        });
+        entry.push(Instruction::Ret { value: None });
+        caller.add_block(entry);
+        let mut shadow = Block::new("helper");
+        shadow.push(Instruction::Ret { value: None });
+        caller.add_block(shadow);
+
+        let mut m = Module::new("call_shadow");
+        m.add_function(helper);
+        m.add_function(caller);
+        m
+    }
+
+    #[test]
+    fn call_targets_function_even_when_block_shares_its_name() {
+        let mut asm = RasAssembler::new(TargetArchitecture::Riscv64, TargetOperatingSystem::Linux)
+            .expect("assembler");
+        let module = call_with_block_named_like_callee();
+        let (code, offsets) =
+            compile_mir_riscv_function(&mut asm, &module, None, true).expect("compile");
+
+        let caller_start = offsets["caller"];
+        let helper_start = offsets["helper"];
+        let call_at = (caller_start..code.len())
+            .step_by(4)
+            .find(|&p| {
+                let w = u32::from_le_bytes(code[p..p + 4].try_into().unwrap());
+                w & 0x7f == 0x6f && (w >> 7) & 0x1f == u32::from(REG_RA)
+            })
+            .expect("call instruction in caller");
+        let expected = j_type((helper_start as i64 - call_at as i64) as i32, REG_RA);
+        assert_eq!(&code[call_at..call_at + 4], &expected[..]);
     }
 }
