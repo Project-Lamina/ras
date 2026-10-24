@@ -624,3 +624,50 @@ fn logical_immediates_reject_values_that_cannot_be_encoded() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn wide_mov_immediates_lower_to_move_wide_chains() {
+    assert_eq!(
+        assemble_words(".text\nmov x0, #0x12345678\n").unwrap(),
+        [0xd28a_cf00, 0xf2a2_4680]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov x0, #0x123456789abcdef0\n").unwrap(),
+        [0xd29b_de00, 0xf2b3_5780, 0xf2ca_cf00, 0xf2e2_4680]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov x0, #0xffffffffffff1234\n").unwrap(),
+        [0x929d_b960]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov w0, #-1\n").unwrap(),
+        [0x1280_0000]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov w0, #0xffff0000\n").unwrap(),
+        [0x52bf_ffe0]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov x0, #0x0000ffff0000ffff\n").unwrap(),
+        [0xb200_3fe0]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov w0, #74565\n").unwrap(),
+        [0x5284_68a0, 0x72a0_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\nmovn x0, #1\n").unwrap(),
+        [0x9280_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\nmovn w0, #0xffff, lsl #16\n").unwrap(),
+        [0x12bf_ffe0]
+    );
+    for asm in [
+        ".text\nmovn w0, #0x10000\n",
+        ".text\nmovn x0, #1, lsl #3\n",
+        ".text\nmov d0, #1\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
