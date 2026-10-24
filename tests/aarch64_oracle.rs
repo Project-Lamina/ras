@@ -132,3 +132,30 @@ fn bl_to_same_section_local_label_resolves_in_place() {
     assert_eq!(text(&bytes)[..4], 0x9400_0002u32.to_le_bytes());
     std::fs::remove_file(output).unwrap();
 }
+
+#[test]
+fn hints_system_calls_and_register_branches_encode_like_clang() {
+    let output = std::env::temp_dir().join(format!("ras_hints_aarch64_{}.o", std::process::id()));
+    let asm = ".text\nnop\nyield\nwfi\nsvc #0\nbrk #0x1234\nbr x1\nblr x30\n";
+    Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(asm, &output)
+        .unwrap();
+    let words: Vec<u32> = text(&std::fs::read(&output).unwrap())
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    std::fs::remove_file(output).unwrap();
+    assert_eq!(
+        words,
+        [
+            0xd503_201f,
+            0xd503_203f,
+            0xd503_207f,
+            0xd400_0001,
+            0xd420_0000 | (0x1234 << 5),
+            0xd61f_0020,
+            0xd63f_03c0,
+        ]
+    );
+}
