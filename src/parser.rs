@@ -480,6 +480,12 @@ impl AssemblyParser {
             }
             ".align" | ".balign" | ".p2align" => {
                 let items: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
+                if items.len() > 3 {
+                    return Err(RasError::ParseError(format!(
+                        "{} takes at most three operands",
+                        parts[0]
+                    )));
+                }
                 let value = usize::try_from(parse_integer(items[0])?)
                     .map_err(|_| RasError::ParseError("Invalid alignment".into()))?;
                 let fill = items

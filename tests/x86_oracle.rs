@@ -236,6 +236,7 @@ fn invalid_compiler_operands_fail() {
         "ud2 %eax",
         "call *%eax",
         "jmp *%r9d",
+        ".p2align 4,,,",
         "notrack jmp %rax",
         "lock cmpq $1, (%rax)",
         "rep addq %rax, %rbx",
