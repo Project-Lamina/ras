@@ -762,3 +762,14 @@ fn unscaled_loads_and_stores_have_no_writeback_form() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn post_indexed_loads_and_stores_reject_an_inner_offset() {
+    for asm in [
+        ".text\nldr x9, [sp, #8], #8\n",
+        ".text\nstr w9, [sp, #8], #8\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+    assert!(assemble_words(".text\nldr x9, [sp], #8\n").is_ok());
+}
