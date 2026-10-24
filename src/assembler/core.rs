@@ -1356,7 +1356,7 @@ fn finish_layout(
                     }
                     PatchPoint::Arx64Jal { offset, rd, .. } => {
                         let rel = (target_offset as i64) - (*offset as i64);
-                        let word = arx64_j_type(rel as i32, *rd);
+                        let word = arx64_j_type(RiscVEncoder::jump_offset(rel)?, *rd);
                         code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
                     }
                     PatchPoint::Arx64Branch {
@@ -1367,7 +1367,8 @@ fn finish_layout(
                         ..
                     } => {
                         let rel = (target_offset as i64) - (*offset as i64);
-                        let word = arx64_b_type(rel as i32, *rs2, *rs1, *funct3);
+                        let word =
+                            arx64_b_type(RiscVEncoder::branch_offset(rel)?, *rs2, *rs1, *funct3);
                         code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
                     }
                 }
