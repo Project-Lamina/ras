@@ -186,7 +186,7 @@ impl RiscVEncoder {
     /// Bits: [31]=imm[12], [30:25]=imm[10:5], [24:20]=rs2, [19:15]=rs1,
     ///       [14:12]=funct3, [11:8]=imm[4:1], [7]=imm[11], [6:0]=opcode
     #[inline]
-    fn b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8, opcode: u8) -> u32 {
+    pub(crate) fn b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8, opcode: u8) -> u32 {
         let o = offset as u32;
         let imm12 = (o >> 12) & 1;
         let imm11 = (o >> 11) & 1;
@@ -212,7 +212,7 @@ impl RiscVEncoder {
     /// Bits: [31]=imm[20], [30:21]=imm[10:1], [20]=imm[11], [19:12]=imm[19:12],
     ///       [11:7]=rd, [6:0]=opcode
     #[inline]
-    fn j_type(offset: i32, rd: u8, opcode: u8) -> u32 {
+    pub(crate) fn j_type(offset: i32, rd: u8, opcode: u8) -> u32 {
         let o = offset as u32;
         let imm20 = (o >> 20) & 1;
         let imm19_12 = (o >> 12) & 0xFF;
@@ -293,6 +293,41 @@ impl RiscVEncoder {
         Ok(Self::emit(Self::i_type(imm12, rs1, funct3, rd, opcode)))
     }
 
+    /// Byte offset of a B-type branch: even, within ±4 KiB.
+    pub(crate) fn branch_offset(offset: i64) -> Result<i32, RasError> {
+        if offset % 2 != 0 {
+            return Err(RasError::EncodingError(
+                "RISC-V branch offset is not 2-byte aligned".to_string(),
+            ));
+        }
+        if !(-4096..=4094).contains(&offset) {
+            return Err(RasError::EncodingError(
+                "RISC-V branch out of range".to_string(),
+            ));
+        }
+        Ok(offset as i32)
+    }
+
+    /// Byte offset of a J-type jump: even, within ±1 MiB.
+    pub(crate) fn jump_offset(offset: i64) -> Result<i32, RasError> {
+        if offset % 2 != 0 {
+            return Err(RasError::EncodingError(
+                "RISC-V jump offset is not 2-byte aligned".to_string(),
+            ));
+        }
+        if !(-(1 << 20)..=(1 << 20) - 2).contains(&offset) {
+            return Err(RasError::EncodingError(
+                "RISC-V jump out of range".to_string(),
+            ));
+        }
+        Ok(offset as i32)
+    }
+
+    fn branch_word(&self, rs1: u8, rs2: u8, offset: &str, funct3: u8) -> Result<Vec<u8>, RasError> {
+        let offset = Self::branch_offset(self.parse_imm(offset)?)?;
+        Ok(Self::emit(Self::b_type(offset, rs2, rs1, funct3, 0x63)))
+    }
+
     /// B-type branch: `mnemonic rs1, rs2, offset`
     fn encode_branch(&self, ops: &[String], funct3: u8) -> Result<Vec<u8>, RasError> {
         if ops.len() != 3 {
@@ -302,8 +337,47 @@ impl RiscVEncoder {
         }
         let rs1 = self.parse_register(&ops[0])?;
         let rs2 = self.parse_register(&ops[1])?;
-        let offset = self.parse_imm(&ops[2])? as i32;
-        Ok(Self::emit(Self::b_type(offset, rs2, rs1, funct3, 0x63)))
+        self.branch_word(rs1, rs2, &ops[2], funct3)
+    }
+
+    /// Branch pseudo-instructions: compare against `zero`, or swap the two
+    /// registers for the `bgt`/`ble` family.
+    fn encode_branch_pseudo(
+        &self,
+        opcode: &str,
+        ops: &[String],
+    ) -> Result<Option<Vec<u8>>, RasError> {
+        let funct3 = match opcode {
+            "beqz" => 0x0,
+            "bnez" => 0x1,
+            "bltz" | "bgtz" | "bgt" => 0x4,
+            "bgez" | "blez" | "ble" => 0x5,
+            "bgtu" => 0x6,
+            "bleu" => 0x7,
+            _ => return Ok(None),
+        };
+        let two_regs = matches!(opcode, "bgt" | "ble" | "bgtu" | "bleu");
+        let expected = if two_regs { 3 } else { 2 };
+        if ops.len() != expected {
+            return Err(RasError::EncodingError(format!(
+                "{} requires {} operands",
+                opcode.to_uppercase(),
+                expected
+            )));
+        }
+        let (rs1, rs2, offset) = if two_regs {
+            let rs = self.parse_register(&ops[0])?;
+            let rt = self.parse_register(&ops[1])?;
+            (rt, rs, &ops[2])
+        } else {
+            let rs = self.parse_register(&ops[0])?;
+            let (rs1, rs2) = match opcode {
+                "blez" | "bgtz" => (0, rs),
+                _ => (rs, 0),
+            };
+            (rs1, rs2, &ops[1])
+        };
+        self.branch_word(rs1, rs2, offset, funct3).map(Some)
     }
 
     /// `fence` takes predecessor and successor sets, each a subset of `iorw`
@@ -368,6 +442,11 @@ impl InstructionEncoder for RiscVEncoder {
     fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         let opcode = inst.opcode.to_lowercase();
         let ops = &inst.operands;
+
+        if let Some(bytes) = self.encode_branch_pseudo(&opcode, ops)? {
+            self.position += bytes.len();
+            return Ok(bytes);
+        }
 
         let bytes = match opcode.as_str() {
             "add" => self.encode_r3(ops, 0x00, 0x0, 0x33)?,
@@ -436,16 +515,22 @@ impl InstructionEncoder for RiscVEncoder {
             "bltu" => self.encode_branch(ops, 0x6)?,
             "bgeu" => self.encode_branch(ops, 0x7)?,
 
-            "jal" => {
-                if ops.len() != 2 {
+            "jal" => match ops.len() {
+                1 => {
+                    let offset = Self::jump_offset(self.parse_imm(&ops[0])?)?;
+                    Self::emit(Self::j_type(offset, 1, 0x6F))
+                }
+                2 => {
+                    let rd = self.parse_register(&ops[0])?;
+                    let offset = Self::jump_offset(self.parse_imm(&ops[1])?)?;
+                    Self::emit(Self::j_type(offset, rd, 0x6F))
+                }
+                _ => {
                     return Err(RasError::EncodingError(
-                        "JAL requires 2 operands: rd, offset".to_string(),
+                        "JAL requires 1 or 2 operands: [rd,] offset".to_string(),
                     ));
                 }
-                let rd = self.parse_register(&ops[0])?;
-                let offset = self.parse_imm(&ops[1])? as i32;
-                Self::emit(Self::j_type(offset, rd, 0x6F))
-            }
+            },
 
             "jalr" => {
                 if ops.len() == 3 {
@@ -537,7 +622,7 @@ impl InstructionEncoder for RiscVEncoder {
                         "J requires 1 operand: offset".to_string(),
                     ));
                 }
-                let offset = self.parse_imm(&ops[0])? as i32;
+                let offset = Self::jump_offset(self.parse_imm(&ops[0])?)?;
                 Self::emit(Self::j_type(offset, 0, 0x6F))
             }
             // `call offset` = jal ra, offset
@@ -547,7 +632,7 @@ impl InstructionEncoder for RiscVEncoder {
                         "CALL requires 1 operand: offset".to_string(),
                     ));
                 }
-                let offset = self.parse_imm(&ops[0])? as i32;
+                let offset = Self::jump_offset(self.parse_imm(&ops[0])?)?;
                 Self::emit(Self::j_type(offset, 1, 0x6F))
             }
 
@@ -672,6 +757,46 @@ mod tests {
         assert_eq!(word("fence", &["iorw", "i"]), 0x0F80_000F);
         assert_eq!(word("fence.i", &[]), 0x0000_100F);
         assert_eq!(word("fence.tso", &[]), 0x8330_000F);
+    }
+
+    #[test]
+    fn test_branch_and_jump_offset_limits() {
+        assert!(
+            enc()
+                .encode_instruction(&instr("beq", &["a0", "a1", "4094"]))
+                .is_ok()
+        );
+        assert!(
+            enc()
+                .encode_instruction(&instr("beq", &["a0", "a1", "-4096"]))
+                .is_ok()
+        );
+        assert!(
+            enc()
+                .encode_instruction(&instr("beq", &["a0", "a1", "4096"]))
+                .is_err()
+        );
+        assert!(
+            enc()
+                .encode_instruction(&instr("beq", &["a0", "a1", "3"]))
+                .is_err()
+        );
+        assert!(
+            enc()
+                .encode_instruction(&instr("jal", &["ra", "1048574"]))
+                .is_ok()
+        );
+        assert!(
+            enc()
+                .encode_instruction(&instr("jal", &["ra", "1048576"]))
+                .is_err()
+        );
+        assert!(enc().encode_instruction(&instr("j", &["-1048576"])).is_ok());
+        assert!(
+            enc()
+                .encode_instruction(&instr("j", &["-1048578"]))
+                .is_err()
+        );
     }
 
     #[test]
