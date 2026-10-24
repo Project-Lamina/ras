@@ -671,3 +671,43 @@ fn wide_mov_immediates_lower_to_move_wide_chains() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn pre_and_post_indexed_loads_and_stores_encode_their_writeback() {
+    assert_eq!(
+        assemble_words(".text\nldr x9, [x0, #8]!\n").unwrap(),
+        [0xf840_8c09]
+    );
+    assert_eq!(
+        assemble_words(".text\nstr w9, [x0], #8\n").unwrap(),
+        [0xb800_8409]
+    );
+    assert_eq!(
+        assemble_words(".text\nldrb w9, [x0], #-1\n").unwrap(),
+        [0x385f_f409]
+    );
+    assert_eq!(
+        assemble_words(".text\nldr d0, [x1], #16\n").unwrap(),
+        [0xfc41_0420]
+    );
+    assert_eq!(
+        assemble_words(".text\nstr x9, [sp, #-16]!\n")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn writeback_forms_reject_unencodable_offsets_and_registers() {
+    for asm in [
+        ".text\nldr x9, [x0, #256]!\n",
+        ".text\nldr x9, [x0], #256\n",
+        ".text\nldr x9, [x0], x1\n",
+        ".text\nldr x0, [x0, #8]!\n",
+        ".text\nstr x0, [x0], #8\n",
+        ".text\nldr x9, [x0], #8, #8\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}

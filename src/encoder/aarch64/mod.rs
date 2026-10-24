@@ -579,9 +579,16 @@ impl AArch64Encoder {
                         | t1
                 }
             }
-            "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldur" | "stur" => {
+            "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldur" | "stur" | "ldurb"
+            | "sturb" | "ldurh" | "sturh" => {
                 let mem = p.get(1..).unwrap_or_default().join(",");
-                let inside = mem
+                let (inside, post_offset) = match mem.split_once("],") {
+                    Some((address, offset)) => (format!("{address}]"), Some(offset.trim())),
+                    None => (mem.trim().trim_end_matches('!').to_string(), None),
+                };
+                let pre = mem.trim().ends_with("]!");
+                let post = post_offset.is_some();
+                let inside = inside
                     .trim()
                     .strip_prefix('[')
                     .and_then(|s| s.strip_suffix(']'))
@@ -606,16 +613,31 @@ impl AArch64Encoder {
                     (false, DataKind::S) => (2, true),
                     (false, DataKind::D) => (3, true),
                 };
-                let offset = fields.get(1).map_or(Ok(0), |s| immediate(s))?;
+                let offset = match post_offset {
+                    Some(text) => immediate(text)?,
+                    None => fields.get(1).map_or(Ok(0), |s| immediate(s))?,
+                };
+                let writeback = pre || post;
+                if writeback && matches!(kind, DataKind::W | DataKind::X) && rn == rt && rn != 31 {
+                    return Err(error(format!("Unpredictable writeback for {op}")));
+                }
                 let load = op.starts_with('l');
-                let scaled = !op.contains("ur")
+                let scaled = !writeback
+                    && !op.contains("ur")
                     && offset >= 0
                     && offset % (1 << size) == 0
                     && offset / (1 << size) <= 4095;
                 let base = ((size as u32) << 30)
                     | if scaled { 0x3900_0000 } else { 0x3800_0000 }
                     | if fp { 0x0400_0000 } else { 0 }
-                    | if load { 1 << 22 } else { 0 };
+                    | if load { 1 << 22 } else { 0 }
+                    | if pre {
+                        0x0C00
+                    } else if post {
+                        0x0400
+                    } else {
+                        0
+                    };
                 let imm = if scaled {
                     ((offset >> size) as u32) << 10
                 } else {
