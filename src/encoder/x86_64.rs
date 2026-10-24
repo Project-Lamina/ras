@@ -1127,12 +1127,13 @@ impl InstructionEncoder for X86_64Encoder {
                 }
                 code = self.emit(self.encode_sse_rm(&[], &[0x0f, 0x12], &inst.operands)?);
             }
-            "cvtss2sd" | "minsd" => {
-                code = self.emit(self.encode_sse_rm(
-                    &[if opcode == "minsd" { 0xf2 } else { 0xf3 }],
-                    &[0x0f, if opcode == "minsd" { 0x5d } else { 0x5a }],
-                    &inst.operands,
-                )?);
+            "cvtss2sd" | "cvtsd2ss" | "minsd" => {
+                let (prefix, op) = match opcode.as_str() {
+                    "cvtss2sd" => (0xf3, 0x5a),
+                    "cvtsd2ss" => (0xf2, 0x5a),
+                    _ => (0xf2, 0x5d),
+                };
+                code = self.emit(self.encode_sse_rm(&[prefix], &[0x0f, op], &inst.operands)?);
             }
             "pextrw" | "pinsrw" => {
                 let [imm, src, dst] = inst.operands.as_slice() else {
