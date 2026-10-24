@@ -507,7 +507,8 @@ impl AssemblyParser {
                             })
                         })
                     })
-                    .transpose()?;
+                    .transpose()?
+                    .filter(|maximum| *maximum != 0);
                 let directive = if self.darwin && parts[0] == ".align" {
                     ".p2align"
                 } else {
