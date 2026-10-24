@@ -289,6 +289,39 @@ impl RiscVEncoder {
         Ok(Self::emit(Self::b_type(offset, rs2, rs1, funct3, 0x63)))
     }
 
+    /// `fence` takes predecessor and successor sets, each a subset of `iorw`
+    /// or a 4-bit number. With no operands it orders everything (`iorw, iorw`).
+    fn encode_fence(&self, ops: &[String]) -> Result<Vec<u8>, RasError> {
+        let (pred, succ) = match ops {
+            [] => (0xF, 0xF),
+            [pred, succ] => (Self::fence_set(pred)?, Self::fence_set(succ)?),
+            _ => {
+                return Err(RasError::EncodingError(
+                    "FENCE requires 0 or 2 operands: pred, succ".to_string(),
+                ));
+            }
+        };
+        Ok(Self::emit((pred << 24) | (succ << 20) | 0x0F))
+    }
+
+    fn fence_set(s: &str) -> Result<u32, RasError> {
+        let s = s.trim();
+        if !s.is_empty() && s.chars().all(|c| "iorw".contains(c)) {
+            return Ok(s.chars().fold(0, |bits, c| {
+                bits | match c {
+                    'i' => 8,
+                    'o' => 4,
+                    'r' => 2,
+                    _ => 1,
+                }
+            }));
+        }
+        match s.parse::<u32>() {
+            Ok(value) if value <= 0xF => Ok(value),
+            _ => Err(RasError::EncodingError(format!("Invalid FENCE set: {}", s))),
+        }
+    }
+
     /// Load: `mnemonic rd, offset(rs1)`
     fn encode_load(&self, ops: &[String], funct3: u8) -> Result<Vec<u8>, RasError> {
         if ops.len() != 2 {
@@ -443,7 +476,10 @@ impl InstructionEncoder for RiscVEncoder {
 
             "ecall" => Self::emit(Self::i_type(0, 0, 0, 0, 0x73)),
             "ebreak" => Self::emit(Self::i_type(1, 0, 0, 0, 0x73)),
-            "fence" | "fence.i" => Self::emit(Self::i_type(0, 0, 0, 0, 0x0F)),
+            "fence" => self.encode_fence(ops)?,
+            "fence.i" => Self::emit(0x0000_100F),
+            "fence.tso" => Self::emit(0x8330_000F),
+            "pause" => Self::emit(0x0100_000F),
 
             // `nop` = addi x0, x0, 0
             "nop" => Self::emit(Self::i_type(0, 0, 0, 0, 0x13)),
@@ -606,6 +642,19 @@ mod tests {
             .encode_instruction(&instr("addi", &["x0", "x0", "0"]))
             .unwrap();
         assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn test_fence_sets_and_fence_i() {
+        let word = |opcode: &str, ops: &[&str]| {
+            let bytes = enc().encode_instruction(&instr(opcode, ops)).unwrap();
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        };
+        assert_eq!(word("fence", &[]), 0x0FF0_000F);
+        assert_eq!(word("fence", &["rw", "w"]), 0x0310_000F);
+        assert_eq!(word("fence", &["iorw", "i"]), 0x0F80_000F);
+        assert_eq!(word("fence.i", &[]), 0x0000_100F);
+        assert_eq!(word("fence.tso", &[]), 0x8330_000F);
     }
 
     #[test]
