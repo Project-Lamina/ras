@@ -258,6 +258,42 @@ fn encode_logical(op: &str, p: &[String]) -> Result<u32, RasError> {
     Ok(base_reg | flags_reg | (rm << 16) | (rn << 5) | rd)
 }
 
+/// Moves `value` into `rd` with one `movz` or `movn`, a bitmask `orr` from the zero register,
+/// or a `movz` and `movk` chain, in that order of preference.
+fn mov_immediate_words(value: u64, wide: bool, rd: u32) -> Vec<u32> {
+    let sf = if wide { 0x8000_0000 } else { 0 };
+    let chunks = if wide { 4 } else { 2 };
+    let chunk = |i: u32| ((value >> (i * 16)) & 0xffff) as u32;
+    let ones = (0..chunks).filter(|&i| chunk(i) == 0xffff).count();
+    let zeros = (0..chunks).filter(|&i| chunk(i) == 0).count();
+    let invert = ones > zeros;
+    let skip = if invert { 0xffff } else { 0 };
+    let mut words = Vec::new();
+    for i in 0..chunks {
+        let c = chunk(i);
+        if c == skip {
+            continue;
+        }
+        let (base, imm) = match (words.is_empty(), invert) {
+            (true, false) => (0x5280_0000, c),
+            (true, true) => (0x1280_0000, !c & 0xffff),
+            (false, _) => (0x7280_0000, if invert { !c & 0xffff } else { c }),
+        };
+        words.push(base | sf | (i << 21) | (imm << 5) | rd);
+    }
+    if words.is_empty() {
+        let base = if invert { 0x1280_0000 } else { 0x5280_0000 };
+        return vec![base | sf | rd];
+    }
+    if words.len() > 1 {
+        if let Some((n, immr, imms)) = logical_immediate(value, wide) {
+            let base = if wide { 0xb200_0000 } else { 0x3200_0000 };
+            return vec![base | (n << 22) | (immr << 16) | (imms << 10) | (31 << 5) | rd];
+        }
+    }
+    words
+}
+
 fn is_stack_pointer(reg: &str) -> bool {
     matches!(reg, "sp" | "wsp")
 }
@@ -375,7 +411,7 @@ impl AArch64Encoder {
                 base | (rn << 5)
             }
             "dmb" if arg(0)? == "sy" => 0xd503_3fbf,
-            "movz" | "movk" => {
+            "movz" | "movk" | "movn" => {
                 let imm = immediate(arg(1)?)?;
                 let shift = if p.len() > 2 {
                     immediate(
@@ -392,10 +428,10 @@ impl AArch64Encoder {
                 {
                     return Err(error("Invalid move-wide immediate or shift"));
                 }
-                (if op == "movz" {
-                    0x5280_0000
-                } else {
-                    0x7280_0000
+                (match op {
+                    "movz" => 0x5280_0000,
+                    "movn" => 0x1280_0000,
+                    _ => 0x7280_0000,
                 }) | sf
                     | ((shift as u32 / 16) << 21)
                     | ((imm as u32) << 5)
@@ -411,35 +447,10 @@ impl AArch64Encoder {
                             "mov immediate out of range for w register: {raw}"
                         )));
                     }
+                    let (dst, _) = gpr(arg(0)?)?;
                     let value = raw as u64 & if wide { u64::MAX } else { u32::MAX as u64 };
-                    let chunks = if wide { 4 } else { 2 };
-                    let mut encoding = None;
-                    for i in 0..chunks {
-                        let mask = 0xffffu64 << (i * 16);
-                        if value & !mask == 0 {
-                            encoding = Some(
-                                0x5280_0000
-                                    | sf
-                                    | (i << 21)
-                                    | (((value >> (i * 16)) as u32) << 5)
-                                    | dst,
-                            );
-                            break;
-                        }
-                        if value | mask == if wide { u64::MAX } else { u32::MAX as u64 } {
-                            encoding = Some(
-                                0x1280_0000
-                                    | sf
-                                    | (i << 21)
-                                    | (((!value >> (i * 16)) as u32 & 0xffff) << 5)
-                                    | dst,
-                            );
-                            break;
-                        }
-                    }
-                    encoding.ok_or_else(|| {
-                        error("mov immediate requires a single move-wide instruction")
-                    })?
+                    let words = mov_immediate_words(value, wide, dst);
+                    return Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect());
                 } else if arg(0)? == "sp" || src == "sp" || arg(0)? == "wsp" || src == "wsp" {
                     0x1100_0000 | sf | (r(1)? << 5) | dst
                 } else {
