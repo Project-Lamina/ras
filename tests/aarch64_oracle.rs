@@ -119,3 +119,16 @@ fn duplicate_symbols_are_rejected() {
             .is_err()
     );
 }
+
+#[test]
+fn bl_to_same_section_local_label_resolves_in_place() {
+    let output = std::env::temp_dir().join(format!("ras_bl_local_{}.o", std::process::id()));
+    let asm = ".text\nentry:\n  bl local\n  ret\nlocal:\n  ret\n";
+    Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(asm, &output)
+        .unwrap();
+    let bytes = std::fs::read(&output).unwrap();
+    assert_eq!(text(&bytes)[..4], 0x9400_0002u32.to_le_bytes());
+    std::fs::remove_file(output).unwrap();
+}
