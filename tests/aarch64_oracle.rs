@@ -334,3 +334,19 @@ fn extra_operands_on_fixed_arity_instructions_are_rejected() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn w_register_mov_immediates_must_fit_in_32_bits() {
+    for asm in [
+        ".text\nmov w0, #0x1ffff0000\n",
+        ".text\nmov w0, #8589869056\n",
+        ".text\nmov w0, #4294967296\n",
+        ".text\nmov w0, #-2147483649\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+    assert_eq!(
+        assemble_words(".text\nmov w0, #-2147483648\n").unwrap(),
+        [0x52b0_0000]
+    );
+}
