@@ -96,3 +96,18 @@ fn global_and_undefined_jump_targets_stay_relocations() {
         [0x0000_006f, 0x0000_00ef]
     );
 }
+
+#[test]
+fn align_counts_powers_of_two_and_pads_text_with_nops() {
+    let object = assemble("align", ".text\n  addi a0, a0, 1\n  .align 4\n  ret\n").unwrap();
+    assert_eq!(
+        words(&section(&object, ".text")),
+        [
+            0x0015_0513,
+            0x0000_0013,
+            0x0000_0013,
+            0x0000_0013,
+            0x0000_8067
+        ]
+    );
+}
