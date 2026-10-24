@@ -56,7 +56,7 @@ fn add_sub_imm12(imm: i64, shift: Option<&str>) -> Result<(i64, u32), RasError> 
     }
 }
 
-fn gpr(reg: &str) -> Result<(u32, bool), RasError> {
+pub(crate) fn gpr(reg: &str) -> Result<(u32, bool), RasError> {
     let wide = match reg.as_bytes().first() {
         Some(b'x' | b'w') => reg.starts_with('x'),
         _ if matches!(reg, "sp" | "fp" | "lr") => true,

@@ -476,3 +476,41 @@ fn local_branch_targets_honor_their_addend() {
         [0x1400_0002, 0xd65f_03c0]
     );
 }
+
+#[test]
+fn got_and_lo12_relocations_use_their_own_kinds() {
+    let rel = relocations(
+        &assemble_bytes(
+            ".text\nadrp x0, :got:sym\nldr x0, [x0, :got_lo12:sym]\nldr x1, [x2, #:lo12:sym]\n",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rel,
+        [
+            (0, 311, "sym".to_string(), 0),
+            (4, 312, "sym".to_string(), 0),
+            (8, 286, "sym".to_string(), 0),
+        ]
+    );
+    assert_eq!(
+        assemble_words(
+            ".text\nadrp x0, :got:sym\nldr x0, [x0, :got_lo12:sym]\nldr x1, [x2, :lo12:sym]\n"
+        )
+        .unwrap(),
+        [0x9000_0000, 0xf940_0000, 0xf940_0041]
+    );
+}
+
+#[test]
+fn unsupported_relocation_modifiers_are_rejected() {
+    for asm in [
+        ".text\nadrp x0, :gottprel:sym\n",
+        ".text\nadrp x0, :tlsdesc:sym\n",
+        ".text\nldr w0, [x1, :lo12:sym]\n",
+        ".text\nldr x0, [x0, :tprel_lo12_nc:sym]\n",
+        ".text\nmovz x0, :abs_g0:sym\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}

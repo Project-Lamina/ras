@@ -975,7 +975,17 @@ impl RasAssembler {
                                     && self.target_os != TargetOperatingSystem::MacOS,
                             })
                         } else if opcode == "adrp" && operands.len() == 2 {
-                            let (symbol, addend) = split_addend(&operands[1])?;
+                            let (page, kind) = match operands[1].strip_prefix(":got:") {
+                                Some(symbol) => (symbol, 311),
+                                None if operands[1].starts_with(':') => {
+                                    return Err(RasError::EncodingError(format!(
+                                        "Unsupported relocation modifier: {}",
+                                        operands[1]
+                                    )));
+                                }
+                                None => (operands[1].as_str(), 275),
+                            };
+                            let (symbol, addend) = split_addend(page)?;
                             Some(PatchPoint::AArch64 {
                                 offset: current_offset,
                                 target: symbol.to_string(),
@@ -983,7 +993,42 @@ impl RasAssembler {
                                 word: 0x9000_0000
                                     | u32::from(crate::encoder::aarch64::register(&operands[0])?),
                                 bits: 0,
-                                kind: 275,
+                                kind,
+                                relocate: true,
+                            })
+                        } else if opcode == "ldr"
+                            && operands.len() == 3
+                            && operands[1].starts_with('[')
+                            && operands[2].trim_start_matches('#').starts_with(':')
+                            && operands[2].ends_with(']')
+                        {
+                            let modifier = operands[2].trim_start_matches('#');
+                            let (symbol, kind) = match modifier.split_once(':').map(|(_, r)| r) {
+                                Some(rest) if rest.starts_with("got_lo12:") => (&rest[9..], 312),
+                                Some(rest) if rest.starts_with("lo12:") => (&rest[5..], 286),
+                                _ => {
+                                    return Err(RasError::EncodingError(format!(
+                                        "Unsupported relocation modifier: {}",
+                                        operands[2]
+                                    )));
+                                }
+                            };
+                            let symbol = symbol.trim_end_matches(']');
+                            let (base, base_wide) =
+                                crate::encoder::aarch64::gpr(&operands[1][1..])?;
+                            let (rt, rt_wide) = crate::encoder::aarch64::gpr(&operands[0])?;
+                            if !base_wide || !rt_wide {
+                                return Err(RasError::EncodingError(
+                                    "Relocated ldr takes 64-bit registers".into(),
+                                ));
+                            }
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: symbol.to_string(),
+                                addend: 0,
+                                word: 0xf940_0000 | (base << 5) | rt,
+                                bits: 0,
+                                kind,
                                 relocate: true,
                             })
                         } else if opcode == "add"
