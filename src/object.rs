@@ -681,6 +681,8 @@ const PLATFORM_MACOS: u32 = 1;
 const MACOS_MINOS: u32 = 11 << 16;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_SUBTYPE_X86_64_ALL: u32 = 3;
+const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
 const S_ZEROFILL: u32 = 0x1;
 const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
 const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
@@ -700,6 +702,11 @@ const X86_64_RELOC_GOT_LOAD: u32 = 3;
 const X86_64_RELOC_SIGNED_1: u32 = 6;
 const X86_64_RELOC_SIGNED_2: u32 = 7;
 const X86_64_RELOC_SIGNED_4: u32 = 8;
+const ARM64_RELOC_UNSIGNED: u32 = 0;
+const ARM64_RELOC_BRANCH26: u32 = 2;
+const ARM64_RELOC_PAGE21: u32 = 3;
+const ARM64_RELOC_PAGEOFF12: u32 = 4;
+const ARM64_RELOC_ADDEND: u32 = 10;
 
 const NLIST_GROUP_LOCAL: u8 = 0;
 const NLIST_GROUP_EXTDEF: u8 = 1;
@@ -729,6 +736,25 @@ struct MachORelocSpec {
     r_type: u32,
     width_log2: u32,
     pcrel: bool,
+}
+
+fn arm64_reloc_spec(kind: u32) -> Result<MachORelocSpec, RasError> {
+    let spec = |r_type: u32, width_log2: u32, pcrel: bool| MachORelocSpec {
+        r_type,
+        width_log2,
+        pcrel,
+    };
+    match kind {
+        257 => Ok(spec(ARM64_RELOC_UNSIGNED, 3, false)),
+        258 => Ok(spec(ARM64_RELOC_UNSIGNED, 2, false)),
+        259 => Ok(spec(ARM64_RELOC_UNSIGNED, 1, false)),
+        282 | 283 => Ok(spec(ARM64_RELOC_BRANCH26, 2, true)),
+        275 => Ok(spec(ARM64_RELOC_PAGE21, 2, true)),
+        277 => Ok(spec(ARM64_RELOC_PAGEOFF12, 2, false)),
+        _ => Err(RasError::ObjectError(format!(
+            "arm64 relocation kind {kind} has no Mach-O equivalent"
+        ))),
+    }
 }
 
 fn x86_64_reloc_spec(
@@ -846,11 +872,13 @@ fn write_field(data: &mut [u8], offset: usize, width: usize, value: i64) -> Resu
 }
 
 fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+    let arm64 = req.target_arch == TargetArchitecture::Aarch64;
     let (cputype, cpusubtype) = match req.target_arch {
         TargetArchitecture::X86_64 => (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL),
+        TargetArchitecture::Aarch64 => (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL),
         other => {
             return Err(RasError::ObjectError(format!(
-                "Mach-O objects are written for x86_64 only, not {other:?}"
+                "Mach-O objects are written for x86_64 and arm64 only, not {other:?}"
             )));
         }
     };
@@ -930,6 +958,18 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
 
     let mut nlists: Vec<MachONlist> = Vec::new();
     let mut index_of: HashMap<String, u32> = HashMap::new();
+    if arm64 {
+        for (ord, sec) in sections.iter().enumerate() {
+            nlists.push(MachONlist {
+                name: format!("ltmp{ord}"),
+                n_type: N_SECT,
+                n_sect: (ord + 1) as u8,
+                n_desc: 0,
+                n_value: sec.addr,
+                group: NLIST_GROUP_LOCAL,
+            });
+        }
+    }
     for sym in req.symbols.iter().filter(|s| !macho_is_private(s)) {
         let ext = sym.global || sym.attributes.weak;
         let nlist = match sym.section.as_str() {
@@ -1062,9 +1102,13 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
                 reloc.section
             )));
         }
-        let spec = x86_64_reloc_spec(reloc.kind, reloc.addend, reloc.trailing, reloc.branch)?;
+        let spec = if arm64 {
+            arm64_reloc_spec(reloc.kind)?
+        } else {
+            x86_64_reloc_spec(reloc.kind, reloc.addend, reloc.trailing, reloc.branch)?
+        };
         // clang stores addend minus the immediate width, so the content bias stays 4.
-        let bias = if spec.pcrel { 4 } else { 0 };
+        let bias = if spec.pcrel && !arm64 { 4 } else { 0 };
         let field = reloc.offset as u64;
         let field_addr = sections[ord].addr + field;
         let width = 1usize << spec.width_log2;
@@ -1083,19 +1127,26 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
                 let sym_ord = *section_ord.get(sym.section.as_str()).ok_or_else(|| {
                     RasError::ObjectError(format!("symbol {} has unknown section", sym.name))
                 })?;
-                let atom = atoms
-                    .iter()
-                    .filter(|(o, value, _)| *o == sym_ord && *value <= sym.value)
-                    .max_by_key(|(_, value, _)| *value);
-                match atom {
-                    Some(&(_, atom_value, atom_name)) => MachORef::Extern {
-                        index: index_of[atom_name],
-                        delta: (sym.value - atom_value) as i64,
-                    },
-                    None => MachORef::Section {
-                        ord: sym_ord,
-                        value: sym.value,
-                    },
+                if arm64 {
+                    MachORef::Extern {
+                        index: index_of[format!("ltmp{sym_ord}").as_str()],
+                        delta: sym.value as i64,
+                    }
+                } else {
+                    let atom = atoms
+                        .iter()
+                        .filter(|(o, value, _)| *o == sym_ord && *value <= sym.value)
+                        .max_by_key(|(_, value, _)| *value);
+                    match atom {
+                        Some(&(_, atom_value, atom_name)) => MachORef::Extern {
+                            index: index_of[atom_name],
+                            delta: (sym.value - atom_value) as i64,
+                        },
+                        None => MachORef::Section {
+                            ord: sym_ord,
+                            value: sym.value,
+                        },
+                    }
                 }
             }
             Some(sym) if macho_is_private(sym) => {
@@ -1110,29 +1161,58 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
             },
         };
 
-        let (symbol_num, is_extern, content) = match target {
-            MachORef::Extern { index, delta } => (index, true, addend + delta),
-            MachORef::Section {
-                ord: target_ord,
-                value,
-            } => {
-                let target_addr = sections[target_ord].addr as i64 + value as i64 + addend;
-                let content = if spec.pcrel {
-                    target_addr - (field_addr as i64 + 4)
-                } else {
-                    target_addr
-                };
-                ((target_ord + 1) as u32, false, content)
+        let r_address = u32::try_from(reloc.offset)
+            .map_err(|_| RasError::ObjectError("relocation offset too large".into()))?;
+        let (symbol_num, is_extern) = if arm64 {
+            let MachORef::Extern { index, delta } = target else {
+                return Err(RasError::ObjectError(format!(
+                    "arm64 relocation in {} has no symbol to bind",
+                    reloc.section
+                )));
+            };
+            let total = reloc.addend + delta;
+            if spec.r_type == ARM64_RELOC_UNSIGNED {
+                write_field(&mut sections[ord].data, reloc.offset, width, total)?;
+            } else if total != 0 {
+                // The instruction keeps a zero immediate; the addend travels in an ADDEND entry.
+                let value = u32::try_from(total)
+                    .ok()
+                    .filter(|v| *v <= 0x00ff_ffff)
+                    .ok_or_else(|| {
+                        RasError::ObjectError(format!(
+                            "arm64 addend {total} in {} is outside 0..2^24",
+                            reloc.section
+                        ))
+                    })?;
+                sections[ord]
+                    .relocs
+                    .push((r_address, value | (2 << 25) | (ARM64_RELOC_ADDEND << 28)));
             }
+            (index, true)
+        } else {
+            let (symbol_num, is_extern, content) = match target {
+                MachORef::Extern { index, delta } => (index, true, addend + delta),
+                MachORef::Section {
+                    ord: target_ord,
+                    value,
+                } => {
+                    let target_addr = sections[target_ord].addr as i64 + value as i64 + addend;
+                    let content = if spec.pcrel {
+                        target_addr - (field_addr as i64 + 4)
+                    } else {
+                        target_addr
+                    };
+                    ((target_ord + 1) as u32, false, content)
+                }
+            };
+            write_field(&mut sections[ord].data, reloc.offset, width, content)?;
+            (symbol_num, is_extern)
         };
-        write_field(&mut sections[ord].data, reloc.offset, width, content)?;
         let info = (symbol_num & 0x00ff_ffff)
             | (u32::from(spec.pcrel) << 24)
             | (spec.width_log2 << 25)
             | (u32::from(is_extern) << 27)
             | (spec.r_type << 28);
-        let r_address = u32::try_from(reloc.offset)
-            .map_err(|_| RasError::ObjectError("relocation offset too large".into()))?;
         sections[ord].relocs.push((r_address, info));
     }
 
