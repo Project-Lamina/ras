@@ -402,15 +402,17 @@ impl AssemblyParser {
             }
             ".asciz" | ".string" => {
                 let rest = line[parts[0].len()..].trim();
-                if let Some(bytes) = parse_quoted_string_bytes(rest, true) {
-                    self.lines.push(Line::Data(bytes));
-                }
+                let bytes = parse_quoted_string_bytes(rest, true).ok_or_else(|| {
+                    RasError::ParseError(format!("{} requires a quoted string", parts[0]))
+                })?;
+                self.lines.push(Line::Data(bytes));
             }
             ".ascii" => {
                 let rest = line[parts[0].len()..].trim();
-                if let Some(bytes) = parse_quoted_string_bytes(rest, false) {
-                    self.lines.push(Line::Data(bytes));
-                }
+                let bytes = parse_quoted_string_bytes(rest, false).ok_or_else(|| {
+                    RasError::ParseError(format!("{} requires a quoted string", parts[0]))
+                })?;
+                self.lines.push(Line::Data(bytes));
             }
             ".ras_cfi_advance" => {
                 let expression = line[parts[0].len()..].trim();
@@ -672,13 +674,20 @@ fn parse_integer_opt(text: &str) -> Option<i128> {
 }
 
 fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
-    let s = s.trim();
-    let s = s.strip_prefix('"')?.strip_suffix('"')?;
+    let body = s.trim().strip_prefix('"')?;
     let mut out = Vec::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next()? {
+    let mut chars = body.char_indices().peekable();
+    loop {
+        let (index, c) = chars.next()?;
+        match c {
+            '"' => {
+                let rest = body[index + 1..].trim();
+                if !(rest.is_empty() || rest.starts_with('#') || rest.starts_with("//")) {
+                    return None;
+                }
+                break;
+            }
+            '\\' => match chars.next()?.1 {
                 'b' => out.push(8),
                 'f' => out.push(12),
                 'v' => out.push(11),
@@ -688,7 +697,7 @@ fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
                 digit @ '0'..='7' => {
                     let mut value = digit as u8 - b'0';
                     for _ in 0..2 {
-                        if let Some(next @ '0'..='7') = chars.peek().copied() {
+                        if let Some(next @ '0'..='7') = chars.peek().map(|&(_, c)| c) {
                             chars.next();
                             value = value.wrapping_mul(8).wrapping_add(next as u8 - b'0');
                         } else {
@@ -697,12 +706,24 @@ fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
                     }
                     out.push(value);
                 }
+                'x' => {
+                    let mut value = 0u8;
+                    let mut digits = 0;
+                    while let Some(digit) = chars.peek().and_then(|&(_, c)| c.to_digit(16)) {
+                        chars.next();
+                        value = value.wrapping_mul(16).wrapping_add(digit as u8);
+                        digits += 1;
+                    }
+                    if digits == 0 {
+                        return None;
+                    }
+                    out.push(value);
+                }
                 '"' => out.push(b'"'),
                 '\\' => out.push(b'\\'),
-                c => out.push(c as u8),
-            }
-        } else {
-            out.push(c as u8);
+                c => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            },
+            c => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
         }
     }
     if null_terminate {
@@ -757,6 +778,29 @@ mod tests {
 
     fn parse(src: &str) -> ParsedAssembly {
         AssemblyParser::new().parse(src).expect("parse failed")
+    }
+
+    fn string_bytes(src: &str) -> Vec<u8> {
+        let asm = parse(src);
+        match &asm.lines[..] {
+            [Line::Data(bytes)] => bytes.clone(),
+            other => panic!("expected one data line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_directives_decode_escapes_and_utf8() {
+        assert_eq!(string_bytes(".ascii \"\\x41B\"\n"), b"\x1b");
+        assert_eq!(string_bytes(".ascii \"\\101\\\"\"\n"), b"A\"");
+        assert_eq!(string_bytes(".ascii \"\u{e9}\"\n"), "\u{e9}".as_bytes());
+        assert_eq!(string_bytes(".asciz \"ok\" # note\n"), b"ok\0");
+    }
+
+    #[test]
+    fn malformed_string_directives_are_rejected() {
+        for src in [".asciz hello\n", ".ascii \"open\n", ".ascii \"\\x\"\n", ".asciz \"a\" junk\n"] {
+            assert!(AssemblyParser::new().parse(src).is_err(), "{src:?} was accepted");
+        }
     }
 
     #[test]
