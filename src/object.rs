@@ -1829,6 +1829,217 @@ mod tests {
         assert!(err.to_string().contains("kind 24"), "{err}");
     }
 
+    fn macho_arm64_object(
+        sections: &[Section],
+        symbols: &[ObjectSymbol],
+        relocations: &[ExternalReloc],
+    ) -> Result<Vec<u8>, RasError> {
+        let opts = ObjectWriteOptions::default();
+        macho_object_bytes(&ObjectWriteRequest {
+            code: &[],
+            sections,
+            symbols,
+            relocations,
+            target_arch: TargetArchitecture::Aarch64,
+            target_os: TargetOperatingSystem::MacOS,
+            opts: &opts,
+        })
+    }
+
+    fn arm64_section(name: &str, exec: bool, data: Vec<u8>) -> Section {
+        Section {
+            group: None,
+            name: name.into(),
+            flags: SectionFlags {
+                alloc: true,
+                exec,
+                write: false,
+            },
+            data,
+            alignment: 4,
+        }
+    }
+
+    fn arm64_symbol(name: &str, global: bool, section: &str, value: u64) -> ObjectSymbol {
+        ObjectSymbol {
+            attributes: Default::default(),
+            name: name.into(),
+            global,
+            section: section.into(),
+            value,
+        }
+    }
+
+    fn macho_symbol_names(buf: &[u8]) -> Vec<String> {
+        let symtab = (0..le32(buf, 16))
+            .scan(32usize, |off, _| {
+                let at = *off;
+                *off += le32(buf, at + 4) as usize;
+                Some(at)
+            })
+            .find(|&at| le32(buf, at) == LC_SYMTAB)
+            .expect("LC_SYMTAB");
+        let symoff = le32(buf, symtab + 8) as usize;
+        let nsyms = le32(buf, symtab + 12) as usize;
+        let stroff = le32(buf, symtab + 16) as usize;
+        (0..nsyms)
+            .map(|i| {
+                let start = stroff + le32(buf, symoff + 16 * i) as usize;
+                let len = buf[start..].iter().position(|&b| b == 0).expect("nul");
+                String::from_utf8_lossy(&buf[start..start + len]).into_owned()
+            })
+            .collect()
+    }
+
+    fn macho_section_header(section: usize) -> usize {
+        32 + 72 + 80 * section
+    }
+
+    fn macho_section_bytes(buf: &[u8], section: usize) -> &[u8] {
+        let base = macho_section_header(section);
+        let offset = le32(buf, base + 48) as usize;
+        let size = le32(buf, base + 40) as usize;
+        &buf[offset..offset + size]
+    }
+
+    fn macho_reloc_entries(buf: &[u8], section: usize) -> Vec<(u32, u32)> {
+        let base = macho_section_header(section);
+        let reloff = le32(buf, base + 56) as usize;
+        let nreloc = le32(buf, base + 60) as usize;
+        (0..nreloc)
+            .map(|i| (le32(buf, reloff + 8 * i), le32(buf, reloff + 8 * i + 4)))
+            .collect()
+    }
+
+    #[test]
+    fn macho_arm64_header_declares_arm64_object() {
+        let sections = [arm64_section(
+            ".text",
+            true,
+            vec![0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6],
+        )];
+        let symbols = [arm64_symbol("_leaf", true, ".text", 0)];
+        let buf = macho_arm64_object(&sections, &symbols, &[]).expect("write");
+        assert_eq!(le32(&buf, 4), 0x0100_000c, "CPU_TYPE_ARM64");
+        assert_eq!(le32(&buf, 8), 0, "CPU_SUBTYPE_ARM64_ALL");
+        assert_eq!(le32(&buf, 12), 1, "MH_OBJECT");
+    }
+
+    #[test]
+    fn macho_arm64_section_label_binds_to_ltmp_with_addend() {
+        let sections = [
+            arm64_section(
+                ".text",
+                true,
+                vec![0, 0, 0, 0x90, 0, 0, 0, 0x91, 0xc0, 0x03, 0x5f, 0xd6],
+            ),
+            arm64_section(".rodata", false, b"x\0yz\0".to_vec()),
+        ];
+        let symbols = [
+            arm64_symbol("_f", true, ".text", 0),
+            arm64_symbol("L.str", false, ".rodata", 2),
+        ];
+        let relocations = [
+            ExternalReloc {
+                offset: 0,
+                symbol: "L.str".into(),
+                section: ".text".into(),
+                kind: 275,
+                addend: 0,
+                trailing: 0,
+                branch: false,
+            },
+            ExternalReloc {
+                offset: 4,
+                symbol: "L.str".into(),
+                section: ".text".into(),
+                kind: 277,
+                addend: 0,
+                trailing: 0,
+                branch: false,
+            },
+        ];
+        let buf = macho_arm64_object(&sections, &symbols, &relocations).expect("write");
+        let names = macho_symbol_names(&buf);
+        assert_eq!(
+            names[..2],
+            ["ltmp0", "ltmp1"],
+            "one section symbol per section"
+        );
+        assert!(
+            !names.iter().any(|n| n == "L.str"),
+            "private label stays out"
+        );
+
+        let text = macho_section_bytes(&buf, 0);
+        assert_eq!(
+            &text[0..4],
+            &0x9000_0000u32.to_le_bytes(),
+            "adrp keeps a zero immediate"
+        );
+        assert_eq!(
+            &text[4..8],
+            &0x9100_0000u32.to_le_bytes(),
+            "add keeps a zero immediate"
+        );
+
+        let entries = macho_reloc_entries(&buf, 0);
+        assert_eq!(entries.len(), 4, "each page reference adds an ADDEND");
+        let (addr, info) = entries[0];
+        assert_eq!((addr, info >> 28), (0, ARM64_RELOC_ADDEND));
+        assert_eq!(
+            info & 0x00ff_ffff,
+            2,
+            "addend is the offset of L.str in .rodata"
+        );
+        let (addr, info) = entries[1];
+        assert_eq!((addr, info >> 28), (0, ARM64_RELOC_PAGE21));
+        assert_eq!(
+            info & 0x00ff_ffff,
+            1,
+            "bound to ltmp1, the .rodata section symbol"
+        );
+        assert_eq!(info >> 24 & 1, 1, "pc-relative");
+        assert_eq!(info >> 27 & 1, 1, "extern");
+        let (addr, info) = entries[3];
+        assert_eq!((addr, info >> 28), (4, ARM64_RELOC_PAGEOFF12));
+        assert_eq!(info & 0x00ff_ffff, 1);
+    }
+
+    #[test]
+    fn macho_arm64_call_to_undefined_symbol_is_extern_branch26() {
+        let sections = [arm64_section(
+            ".text",
+            true,
+            vec![0, 0, 0, 0x94, 0xc0, 0x03, 0x5f, 0xd6],
+        )];
+        let symbols = [arm64_symbol("_caller", true, ".text", 0)];
+        let relocations = [ExternalReloc {
+            offset: 0,
+            symbol: "_puts".into(),
+            section: ".text".into(),
+            kind: 283,
+            addend: 0,
+            trailing: 0,
+            branch: true,
+        }];
+        let buf = macho_arm64_object(&sections, &symbols, &relocations).expect("write");
+        assert_eq!(
+            &macho_section_bytes(&buf, 0)[0..4],
+            &[0, 0, 0, 0x94],
+            "bl with zero immediate"
+        );
+        let entries = macho_reloc_entries(&buf, 0);
+        assert_eq!(entries.len(), 1, "no ADDEND for a bare reference");
+        let (addr, info) = entries[0];
+        assert_eq!(addr, 0);
+        assert_eq!(info >> 28, ARM64_RELOC_BRANCH26);
+        assert_eq!(info >> 27 & 1, 1, "extern");
+        assert_eq!(info >> 25 & 3, 2, "four-byte field");
+        let names = macho_symbol_names(&buf);
+        assert_eq!(names[(info & 0x00ff_ffff) as usize], "_puts");
+    }
+
     #[test]
     fn test_coff_amd64_write() {
         let mut w = CoffWriter::new();
