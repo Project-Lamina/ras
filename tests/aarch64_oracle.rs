@@ -800,3 +800,15 @@ fn register_mov_requires_matching_widths_and_general_registers() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn symbol_operands_must_name_a_symbol() {
+    for asm in [
+        ".text\nadd x0, x1, :lo12:\n",
+        ".text\nadrp x0, :got:\n",
+        ".text\nadrp x0, \n",
+        ".text\nbl +4\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
