@@ -245,11 +245,20 @@ impl RasAssembler {
             } else {
                 &["#"]
             };
-        let parsed = AssemblyParser::new()
+        let mut parsed = AssemblyParser::new()
             .with_darwin_directives(self.target_os == TargetOperatingSystem::MacOS)
             .with_line_comments(comment_markers)
             .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
+        let constants = absolute_aliases(&parsed.aliases)?;
+        for line in &mut parsed.lines {
+            if let Line::DataExpression { expression, .. } = line
+                && let DataExpression::Symbol(name, addend) = parse_data_expression(expression)?
+                && let Some(value) = constants.get(&name)
+            {
+                *expression = (value + addend).to_string();
+            }
+        }
 
         let mut sections = parsed.sections.clone();
         if !sections.iter().any(|s| s.name == ".text") {
@@ -1805,6 +1814,24 @@ fn extract_rip_label(op: &str) -> Option<(&str, i64)> {
         return None;
     }
     crate::encoder::x86_64::rip_expression(op[..paren].trim())
+}
+
+fn absolute_aliases(aliases: &[(String, String)]) -> Result<HashMap<String, i128>, RasError> {
+    let mut values = HashMap::new();
+    for _ in 0..aliases.len() {
+        for (name, expression) in aliases {
+            let value = match parse_data_expression(expression)? {
+                DataExpression::Constant(value) => value,
+                DataExpression::Symbol(target, addend) => match values.get(&target) {
+                    Some(base) => base + addend,
+                    None => continue,
+                },
+                DataExpression::Difference(..) => continue,
+            };
+            values.insert(name.clone(), value);
+        }
+    }
+    Ok(values)
 }
 
 fn absolute_expression(
