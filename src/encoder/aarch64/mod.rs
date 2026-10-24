@@ -652,6 +652,9 @@ impl AArch64Encoder {
                 if writeback && op.contains("ur") {
                     return Err(error(format!("{op} has no writeback form")));
                 }
+                if post && fields.len() > 1 {
+                    return Err(error(format!("Post-indexed {op} takes no inner offset")));
+                }
                 if writeback && matches!(kind, DataKind::W | DataKind::X) && rn == rt && rn != 31 {
                     return Err(error(format!("Unpredictable writeback for {op}")));
                 }
