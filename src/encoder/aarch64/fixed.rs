@@ -55,6 +55,7 @@ pub(crate) fn encode_add_rrr(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     w.to_le_bytes().to_vec()
 }
 
+#[cfg(feature = "encoder")]
 pub(crate) fn encode_and_rrr(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let w = 0x8A000000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
@@ -69,6 +70,7 @@ pub(crate) fn encode_msub_w(rd: u8, rn: u8, rm: u8, ra: u8) -> Vec<u8> {
     w.to_le_bytes().to_vec()
 }
 
+#[cfg(feature = "encoder")]
 pub(crate) fn encode_and_w_rrr(rd: u8, rn: u8, rm: u8) -> Vec<u8> {
     let w = 0x0A00_0000u32 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32);
     w.to_le_bytes().to_vec()
