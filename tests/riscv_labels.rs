@@ -111,3 +111,13 @@ fn align_counts_powers_of_two_and_pads_text_with_nops() {
         ]
     );
 }
+
+#[test]
+fn riscv32_object_output_is_refused_rather_than_written_as_elf64() {
+    let output = std::env::temp_dir().join(format!("ras_riscv32_{}.o", std::process::id()));
+    let result = Ras::new(TargetArchitecture::Riscv32, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(".text\n  ret\n", &output);
+    assert!(result.is_err());
+    assert!(!output.exists());
+}
