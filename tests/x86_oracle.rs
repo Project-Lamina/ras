@@ -198,6 +198,13 @@ fn absolute_symbols_in_data_directives_match_gas() {
 }
 
 #[test]
+fn direct_branches_to_symbols_match_gas() {
+    let asm = ".text\ncall foo@PLT\njmp bar+8\nje baz-4\njne .Lend\ncall foo\n.Lend: ret\n";
+    let (output, reference) = oracle(asm, "direct_branch");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn rip_addends_and_prefixed_fixups_match_gas() {
     let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
     let (output, reference) = oracle(asm, "rip_addends");
@@ -251,6 +258,11 @@ fn invalid_compiler_operands_fail() {
         "call *%eax",
         "jmp *%r9d",
         ".p2align 4,,,",
+        "call %rax",
+        "jmp 8(%rax)",
+        "je %rax",
+        "call foo bar",
+        "call $5",
         "notrack jmp %rax",
         "lock cmpq $1, (%rax)",
         "rep addq %rax, %rbx",

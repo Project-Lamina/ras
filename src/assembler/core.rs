@@ -1015,6 +1015,7 @@ impl RasAssembler {
                         && let Some(cc_byte) = x86_cond_jmp_byte(&opcode)
                     {
                         let target = inst.operands[0].trim();
+                        check_branch_target(target)?;
                         if !long_jumps.contains(&index) {
                             code.extend_from_slice(&[cc_byte - 0x10, 0]);
                             short_jumps.push(ShortJump {
@@ -1041,6 +1042,7 @@ impl RasAssembler {
                         && !inst.operands[0].trim().starts_with('*')
                     {
                         let target = inst.operands[0].trim();
+                        check_branch_target(target)?;
                         let is_call = opcode == "call";
                         if !is_call && !long_jumps.contains(&index) {
                             code.extend_from_slice(&[0xeb, 0]);
@@ -1609,6 +1611,20 @@ fn finish_layout(
                 self.target_arch
             ))),
         }
+    }
+}
+
+fn check_branch_target(target: &str) -> Result<(), RasError> {
+    let mut chars = target.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && chars
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '+' | '-' | '@'));
+    if valid {
+        Ok(())
+    } else {
+        Err(RasError::EncodingError(format!(
+            "Invalid direct branch target: {target}"
+        )))
     }
 }
 
