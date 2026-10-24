@@ -229,6 +229,13 @@ fn alignment_sensitive_branches_match_gas() {
 }
 
 #[test]
+fn zero_max_skip_aligns_like_gas() {
+    let asm = ".data\n.byte 1\n.p2align 4,,0\n.byte 2\n.p2align 4,,4\n.byte 3\n";
+    let (output, reference) = oracle(asm, "zero_max_skip");
+    assert_eq!(section(&output, ".data"), section(&reference, ".data"));
+}
+
+#[test]
 fn compiler_string_escapes_match_gas() {
     let asm = r#".text
 .ascii "\001\012\123\377\0x\b\f\v\a\n\t\r\\\""
