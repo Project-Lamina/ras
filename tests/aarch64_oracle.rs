@@ -751,3 +751,14 @@ fn scalar_fp_register_31_is_valid_but_general_register_31_is_not() {
     assert!(assemble_words(".text\nadd x0, x31, x1\n").is_err());
     assert!(assemble_words(".text\nmov w31, w0\n").is_err());
 }
+
+#[test]
+fn unscaled_loads_and_stores_have_no_writeback_form() {
+    for asm in [
+        ".text\nldur x9, [x0, #8]!\n",
+        ".text\nstur w9, [x0], #8\n",
+        ".text\nldurb w9, [x0], #8\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
