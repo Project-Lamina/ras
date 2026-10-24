@@ -324,7 +324,7 @@ impl AssemblyParser {
                     });
                 }
             }
-            ".set" => {
+            ".set" | ".equ" => {
                 let (name, expression) =
                     line[parts[0].len()..].split_once(',').ok_or_else(|| {
                         RasError::ParseError(".set requires symbol and expression".into())
@@ -436,12 +436,25 @@ impl AssemblyParser {
                     });
                 }
             }
+            ".float" | ".single" | ".double" => {
+                for item in line[parts[0].len()..].split(',') {
+                    let value: f64 = item.trim().parse().map_err(|_| {
+                        RasError::ParseError(format!("Invalid float: {}", item.trim()))
+                    })?;
+                    let bytes = if parts[0] == ".double" {
+                        value.to_le_bytes().to_vec()
+                    } else {
+                        (value as f32).to_le_bytes().to_vec()
+                    };
+                    self.lines.push(Line::Data(bytes));
+                }
+            }
             ".byte" | ".short" | ".hword" | ".value" | ".int" | ".long" | ".quad"
-            | ".xword" => {
+            | ".xword" | ".word" | ".half" | ".dword" | ".2byte" | ".4byte" | ".8byte" => {
                 let width = match parts[0] {
                     ".byte" => 1,
-                    ".short" | ".hword" | ".value" => 2,
-                    ".quad" | ".xword" => 8,
+                    ".short" | ".hword" | ".value" | ".half" | ".2byte" => 2,
+                    ".quad" | ".xword" | ".dword" | ".8byte" => 8,
                     _ => 4,
                 };
                 for item in line[parts[0].len()..].split(',') {
