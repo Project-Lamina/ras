@@ -939,8 +939,20 @@ impl RasAssembler {
 
                     if self.target_arch == TargetArchitecture::Aarch64 {
                         let operands = &inst.operands;
-                        let patch = if matches!(opcode.as_str(), "b" | "bl")
-                            || opcode.starts_with("b.")
+                        let patch = if let Some((word, target, bits, kind)) =
+                            aarch64_compare_branch(&opcode, operands)?
+                        {
+                            let (symbol, addend) = split_addend(&target)?;
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: symbol.to_string(),
+                                addend,
+                                word,
+                                bits,
+                                kind,
+                                relocate: false,
+                            })
+                        } else if matches!(opcode.as_str(), "b" | "bl") || opcode.starts_with("b.")
                         {
                             let target = operands
                                 .first()
@@ -1348,7 +1360,7 @@ fn finish_layout(
                 let global = global_symbols.contains(target);
                 let external = match *kind {
                     283 => *relocate && global,
-                    280 | 282 => !macho && global,
+                    279 | 280 | 282 => !macho && global,
                     _ => *relocate,
                 };
                 if !external && let Some(&target_offset) = symbol_offsets.get(target) {
@@ -1361,7 +1373,7 @@ fn finish_layout(
                         ));
                     }
                     let imm = (delta / 4) as u32 & ((1 << bits) - 1);
-                    let instruction = word | if *bits == 19 { imm << 5 } else { imm };
+                    let instruction = word | if *bits == 26 { imm } else { imm << 5 };
                     code[*offset..*offset + 4].copy_from_slice(&instruction.to_le_bytes());
                 } else {
                     external_relocs.push(ExternalReloc {
@@ -1683,6 +1695,58 @@ fn check_branch_target(target: &str) -> Result<(), RasError> {
 
 /// `call puts@PLT` names the symbol `puts`; the suffix selects the relocation,
 /// it is not part of the name.
+/// `cbz`, `cbnz`, `tbz` and `tbnz`: the word without its label offset, the label,
+/// the offset width and the relocation kind.
+fn aarch64_compare_branch(
+    opcode: &str,
+    operands: &[String],
+) -> Result<Option<(u32, String, u32, u32)>, RasError> {
+    let count_error = || RasError::EncodingError(format!("Wrong operand count for {opcode}"));
+    let stack_pointer_error = || RasError::EncodingError(format!("{opcode} cannot take sp"));
+    match opcode {
+        "cbz" | "cbnz" => {
+            let [reg, label] = operands else {
+                return Err(count_error());
+            };
+            let (rt, wide) = crate::encoder::aarch64::gpr(reg)?;
+            if matches!(reg.as_str(), "sp" | "wsp") {
+                return Err(stack_pointer_error());
+            }
+            let base = if opcode == "cbz" {
+                0x3400_0000
+            } else {
+                0x3500_0000
+            };
+            let word = base | if wide { 0x8000_0000 } else { 0 } | rt;
+            Ok(Some((word, label.clone(), 19, 280)))
+        }
+        "tbz" | "tbnz" => {
+            let [reg, bit, label] = operands else {
+                return Err(count_error());
+            };
+            let (rt, wide) = crate::encoder::aarch64::gpr(reg)?;
+            if matches!(reg.as_str(), "sp" | "wsp") {
+                return Err(stack_pointer_error());
+            }
+            let bit = crate::encoder::aarch64::immediate(bit)?;
+            if !(0..64).contains(&bit) || (bit >= 32 && !wide) {
+                return Err(RasError::EncodingError(format!(
+                    "Invalid bit number for {opcode}: {bit}"
+                )));
+            }
+            let bit = bit as u32;
+            let base = if opcode == "tbz" {
+                0x3600_0000
+            } else {
+                0x3700_0000
+            };
+            let word = base | ((bit >> 5) << 31) | ((bit & 31) << 19) | rt;
+            Ok(Some((word, label.clone(), 14, 279)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Splits a trailing decimal or hex `+N` or `-N` displacement off a symbol operand.
 fn split_addend(target: &str) -> Result<(&str, i64), RasError> {
     let Some(at) = target.rfind(['+', '-']).filter(|&at| at > 0) else {
