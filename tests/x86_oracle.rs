@@ -234,6 +234,8 @@ fn invalid_compiler_operands_fail() {
         "cqto %rax",
         "syscall $1",
         "ud2 %eax",
+        "call *%eax",
+        "jmp *%r9d",
         "notrack jmp %rax",
         "lock cmpq $1, (%rax)",
         "rep addq %rax, %rbx",
