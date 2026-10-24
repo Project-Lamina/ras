@@ -1207,6 +1207,8 @@ fn finish_layout(
                             (TargetArchitecture::Aarch64, 2) => 259,
                             (TargetArchitecture::Aarch64, 4) => 258,
                             (TargetArchitecture::Aarch64, 8) => 257,
+                            (TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64, 4) => 1,
+                            (TargetArchitecture::Riscv64, 8) => 2,
                             _ => {
                                 return Err(RasError::EncodingError(
                                     "Unsupported data relocation width or architecture".into(),
