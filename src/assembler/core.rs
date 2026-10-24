@@ -1097,6 +1097,8 @@ impl RasAssembler {
                                 section: String::new(),
                                 kind,
                                 addend: *offset as i64 - right as i64,
+                                trailing: 0,
+                                branch: false,
                             });
                         } else {
                             return Err(RasError::EncodingError(format!(
@@ -1129,6 +1131,8 @@ impl RasAssembler {
                                     "Data relocation addend out of range".into(),
                                 )
                             })?,
+                            trailing: 0,
+                            branch: false,
                         });
                     }
                 }
@@ -1171,6 +1175,8 @@ impl RasAssembler {
                         section: String::new(),
                         kind: *kind,
                         addend: 0,
+                        trailing: 0,
+                        branch: false,
                     });
                 }
                 continue;
@@ -1235,6 +1241,8 @@ impl RasAssembler {
                                 4
                             },
                             addend: -4,
+                            trailing: 0,
+                            branch: true,
                         });
                     }
                     PatchPoint::X86RipRel32 {
@@ -1250,6 +1258,8 @@ impl RasAssembler {
                             section: String::new(),
                             kind: if got { R_X86_64_REX_GOTPCRELX } else { 2 },
                             addend: *addend - (4 + *trailing as i64),
+                            trailing: *trailing,
+                            branch: false,
                         });
                     }
                     _ => {

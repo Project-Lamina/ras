@@ -47,6 +47,10 @@ pub struct ExternalReloc {
     pub section: String,
     pub kind: u32,
     pub addend: i64,
+    /// x86_64: bytes that follow the 4-byte displacement in the instruction (an immediate).
+    pub trailing: usize,
+    /// x86_64: the reference is a call or jump target, encoded as a Mach-O branch.
+    pub branch: bool,
 }
 
 /// All data needed to write a single relocatable object file.
