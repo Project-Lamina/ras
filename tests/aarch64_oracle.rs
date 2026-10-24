@@ -514,3 +514,53 @@ fn unsupported_relocation_modifiers_are_rejected() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn compare_and_test_branches_encode_their_label_offsets() {
+    assert_eq!(
+        assemble_words(".text\ncbz x0, tgt\ntgt:\nret\n").unwrap(),
+        [0xb400_0020, 0xd65f_03c0]
+    );
+    assert_eq!(
+        assemble_words(".text\ncbnz w1, tgt\ntgt:\nret\n").unwrap(),
+        [0x3500_0021, 0xd65f_03c0]
+    );
+    assert_eq!(
+        assemble_words(".text\ntbz x0, #3, tgt\ntgt:\nret\n").unwrap(),
+        [0x3618_0020, 0xd65f_03c0]
+    );
+    assert_eq!(
+        assemble_words(".text\ntbnz w0, #31, tgt\ntgt:\nret\n").unwrap(),
+        [0x37f8_0020, 0xd65f_03c0]
+    );
+    assert_eq!(
+        assemble_words(".text\ntbnz x0, #40, tgt\ntgt:\nret\n").unwrap(),
+        [0xb740_0020, 0xd65f_03c0]
+    );
+}
+
+#[test]
+fn compare_and_test_branches_reject_out_of_range_labels() {
+    for asm in [
+        ".text\ncbz x0, tgt\n.space 1048572\ntgt:\nret\n",
+        ".text\ntbz x0, #3, tgt\n.space 32764\ntgt:\nret\n",
+        ".text\ntgt:\n.space 32772\ntbz x0, #3, tgt\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+    assert!(assemble_words(".text\ncbz x0, tgt\n.space 1048568\ntgt:\nret\n").is_ok());
+    assert!(assemble_words(".text\ntbz x0, #3, tgt\n.space 32760\ntgt:\nret\n").is_ok());
+}
+
+#[test]
+fn compare_and_test_branches_reject_bad_operands() {
+    for asm in [
+        ".text\ncbz x0\n",
+        ".text\ncbz sp, tgt\n",
+        ".text\ntbz w0, #32, tgt\n",
+        ".text\ntbz x0, #64, tgt\n",
+        ".text\ntbz x0, tgt\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}

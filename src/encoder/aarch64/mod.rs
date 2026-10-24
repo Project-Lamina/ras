@@ -29,7 +29,7 @@ pub(crate) fn register(reg: &str) -> Result<u8, RasError> {
     }
 }
 
-fn immediate(text: &str) -> Result<i64, RasError> {
+pub(crate) fn immediate(text: &str) -> Result<i64, RasError> {
     let text = text.trim().trim_start_matches('#');
     let (negative, digits) = text.strip_prefix('-').map_or((false, text), |s| (true, s));
     let n = if let Some(hex) = digits.strip_prefix("0x") {
