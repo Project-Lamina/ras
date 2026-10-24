@@ -45,6 +45,17 @@ fn immediate(text: &str) -> Result<i64, RasError> {
     })
 }
 
+fn add_sub_imm12(imm: i64, shift: Option<&str>) -> Result<(i64, u32), RasError> {
+    let fits = |v: i64| (0..=4095).contains(&v);
+    match shift {
+        None if fits(imm) => Ok((imm, 0)),
+        None if imm & 0xfff == 0 && fits(imm >> 12) && imm > 0 => Ok((imm >> 12, 1)),
+        Some("lsl #0") if fits(imm) => Ok((imm, 0)),
+        Some("lsl #12") if fits(imm) => Ok((imm, 1)),
+        _ => Err(error("Arithmetic immediate out of range")),
+    }
+}
+
 pub(crate) fn condition(text: &str) -> Result<u32, RasError> {
     [
         "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
@@ -184,17 +195,13 @@ impl AArch64Encoder {
                     0
                 };
                 if operand.starts_with('#') {
-                    let imm = immediate(operand)?;
-                    if !(0..=4095).contains(&imm) {
-                        return Err(error("Arithmetic immediate out of range"));
-                    }
-                    0x1100_0000 | sf | flags | ((imm as u32) << 10) | (rn << 5) | rd
+                    let (imm, shift) = add_sub_imm12(
+                        immediate(operand)?,
+                        p.get(if compare { 2 } else { 3 }).map(|s| s.trim()),
+                    )?;
+                    0x1100_0000 | sf | flags | (shift << 22) | ((imm as u32) << 10) | (rn << 5) | rd
                 } else if op == "add" && wide {
-                    return Ok(encode_add_rrr(
-                        rd as u8,
-                        rn as u8,
-                        register(operand)?,
-                    ));
+                    return Ok(encode_add_rrr(rd as u8, rn as u8, register(operand)?));
                 } else {
                     0x0b00_0000
                         | sf
