@@ -191,6 +191,13 @@ fn movabs_immediates_match_gas() {
 }
 
 #[test]
+fn absolute_symbols_in_data_directives_match_gas() {
+    let asm = ".text\n.byte foo\n.long foo\n.quad later\n.byte later+1\n.short bar-2\n.set foo, 5\n.equ bar, 0x20\n.set later, 9\n.set alias, foo\n.byte alias\n.set alias2, alias+3\n.quad alias2\nret\n";
+    let (output, reference) = oracle(asm, "abs_data");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn rip_addends_and_prefixed_fixups_match_gas() {
     let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
     let (output, reference) = oracle(asm, "rip_addends");
