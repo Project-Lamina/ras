@@ -356,12 +356,14 @@ impl RasAssembler {
                 &global_symbols,
                 self.target_os == TargetOperatingSystem::MacOS,
             )?;
-            section.alignment =
-                if self.target_arch == TargetArchitecture::Aarch64 && section.flags.exec {
-                    4
-                } else {
-                    1
-                };
+            section.alignment = if self.target_arch == TargetArchitecture::Aarch64
+                && section.flags.exec
+                && self.target_os != TargetOperatingSystem::MacOS
+            {
+                4
+            } else {
+                1
+            };
             for line in lines {
                 if let Line::Align {
                     value, directive, ..
@@ -1324,7 +1326,9 @@ fn finish_layout(
             })
             .collect();
 
-        symbols.extend(mapping_symbols);
+        if !macho {
+            symbols.extend(mapping_symbols);
+        }
         Ok((code, symbols, external_relocs))
     }
 
