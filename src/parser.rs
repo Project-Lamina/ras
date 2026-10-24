@@ -347,6 +347,7 @@ impl AssemblyParser {
                             operand
                         }
                     }
+                    None if self.darwin => 1,
                     None => size.next_power_of_two().min(16),
                 };
                 if !alignment.is_power_of_two() {
