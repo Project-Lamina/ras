@@ -234,8 +234,15 @@ impl RasAssembler {
         output_path: &std::path::Path,
     ) -> Result<(), RasError> {
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
+        let comment_markers: &'static [&'static str] =
+            if self.target_arch == TargetArchitecture::Aarch64 {
+                &["//"]
+            } else {
+                &["#"]
+            };
         let parsed = AssemblyParser::new()
             .with_darwin_directives(self.target_os == TargetOperatingSystem::MacOS)
+            .with_line_comments(comment_markers)
             .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
 
