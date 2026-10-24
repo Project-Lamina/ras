@@ -724,3 +724,20 @@ fn barrier_options_and_carry_condition_aliases_encode() {
     );
     assert!(assemble_words(".text\ndmb foo\n").is_err());
 }
+
+#[test]
+fn fmul_takes_scalar_registers_of_one_size() {
+    assert_eq!(
+        assemble_words(".text\nfmul d0, d1, d2\nfmul s0, s1, s2\n").unwrap(),
+        [0x1e62_0820, 0x1e22_0820]
+    );
+    for asm in [
+        ".text\nfmul x0, x1, x2\n",
+        ".text\nfmul d0, s1, d2\n",
+        ".text\nfmul s0, d1, d2\n",
+        ".text\nfmul d0, sp, d2\n",
+        ".text\nfmul d0, d1\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
