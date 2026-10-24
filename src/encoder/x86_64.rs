@@ -1012,7 +1012,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_cvtt_to_int(legacy, opcode.ends_with('q'), &inst.operands)?;
                 code = self.emit(enc);
             }
-            "cvtsi2sdl" | "cvtsi2sdq" | "cvtsi2ssq" => {
+            "cvtsi2sdl" | "cvtsi2sdq" | "cvtsi2ssl" | "cvtsi2ssq" => {
                 let [src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError(
                         "cvtsi2sd requires 2 operands".into(),
@@ -1025,7 +1025,11 @@ impl InstructionEncoder for X86_64Encoder {
                     RasError::EncodingError("cvtsi2sd requires xmm destination".into())
                 })?;
                 code = self.emit(encode_op(Op {
-                    legacy: &[if opcode == "cvtsi2ssq" { 0xf3 } else { 0xf2 }],
+                    legacy: &[if opcode.starts_with("cvtsi2ss") {
+                        0xf3
+                    } else {
+                        0xf2
+                    }],
                     wide,
                     opcode: &[0x0f, 0x2a],
                     reg,

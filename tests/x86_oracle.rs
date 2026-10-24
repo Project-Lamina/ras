@@ -170,6 +170,13 @@ fn float_width_conversions_match_gas() {
 }
 
 #[test]
+fn integer_to_single_conversions_match_gas() {
+    let asm = ".text\ncvtsi2ssl %eax, %xmm0\ncvtsi2ssl %r9d, %xmm10\ncvtsi2ssl (%rsp), %xmm1\ncvtsi2ssl -12(%r12), %xmm7\ncvtsi2ssq %r9, %xmm10\ncvtsi2ssq 8(%rbp), %xmm2\nret\n";
+    let (output, reference) = oracle(asm, "int_to_single");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn rip_addends_and_prefixed_fixups_match_gas() {
     let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
     let (output, reference) = oracle(asm, "rip_addends");
