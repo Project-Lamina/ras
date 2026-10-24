@@ -641,27 +641,30 @@ impl X86_64Encoder {
         })
     }
 
-    fn encode_cvttsd2si(&self, wide: bool, operands: &[String]) -> Result<Encoded, RasError> {
+    fn encode_cvtt_to_int(
+        &self,
+        legacy: u8,
+        wide: bool,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
-            return Err(RasError::EncodingError(
-                "cvttsd2si requires 2 operands".into(),
-            ));
+            return Err(RasError::EncodingError("cvtt requires 2 operands".into()));
         }
         let (src, _) = self.parse_rm(&operands[0], true)?;
         let (dst, dst_gpr) = self.parse_rm(&operands[1], false)?;
         let Rm::Reg(reg) = dst else {
             return Err(RasError::EncodingError(
-                "cvttsd2si: destination must be a register".into(),
+                "cvtt: destination must be a register".into(),
             ));
         };
         let expected = if wide { 64 } else { 32 };
         if dst_gpr.is_none_or(|gpr| gpr.width != expected) {
             return Err(RasError::EncodingError(
-                "cvttsd2si: destination width does not match suffix".into(),
+                "cvtt: destination width does not match suffix".into(),
             ));
         }
         encode_op(Op {
-            legacy: &[0xf2],
+            legacy: &[legacy],
             wide,
             opcode: &[0x0f, 0x2c],
             reg,
@@ -1000,8 +1003,13 @@ impl InstructionEncoder for X86_64Encoder {
             "ret" => code.push(0xC3),
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
             "leave" => code.push(0xC9),
-            "cvttsd2sil" | "cvttsd2siq" => {
-                let enc = self.encode_cvttsd2si(opcode == "cvttsd2siq", &inst.operands)?;
+            "cvttsd2sil" | "cvttsd2siq" | "cvttss2sil" | "cvttss2siq" => {
+                let legacy = if opcode.starts_with("cvttss") {
+                    0xf3
+                } else {
+                    0xf2
+                };
+                let enc = self.encode_cvtt_to_int(legacy, opcode.ends_with('q'), &inst.operands)?;
                 code = self.emit(enc);
             }
             "cvtsi2sdl" | "cvtsi2sdq" | "cvtsi2ssq" => {

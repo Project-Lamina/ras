@@ -156,6 +156,13 @@ fn gcc_instruction_forms_match_gas() {
 }
 
 #[test]
+fn truncating_float_to_integer_conversions_match_gas() {
+    let asm = ".text\ncvttss2sil %xmm0, %eax\ncvttss2siq %xmm9, %r10\ncvttss2siq 8(%rsp), %rax\ncvttss2sil -4(%r13), %r9d\ncvttsd2siq %xmm1, %rcx\ncvttsd2sil 16(%r12), %edx\nret\n";
+    let (output, reference) = oracle(asm, "cvtt_to_int");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn rip_addends_and_prefixed_fixups_match_gas() {
     let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
     let (output, reference) = oracle(asm, "rip_addends");
