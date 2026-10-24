@@ -1246,7 +1246,10 @@ fn finish_layout(
             } = patch
             {
                 let target = reloc_symbol(target);
-                if !relocate && let Some(&target_offset) = symbol_offsets.get(target) {
+                let preemptible_call = *kind == 283 && global_symbols.contains(target);
+                if (!relocate || (*kind == 283 && !preemptible_call))
+                    && let Some(&target_offset) = symbol_offsets.get(target)
+                {
                     let delta = target_offset as i64 - *offset as i64;
                     if delta % 4 != 0
                         || !(-(1i64 << (bits + 1))..(1i64 << (bits + 1))).contains(&delta)
