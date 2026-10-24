@@ -812,3 +812,14 @@ fn symbol_operands_must_name_a_symbol() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn udf_encodes_bare_immediate() {
+    assert_eq!(
+        assemble_words(".text\nudf #0\nudf #1\nudf #0xffff\nudf #0x1234\n").unwrap(),
+        [0x0000_0000, 0x0000_0001, 0x0000_ffff, 0x0000_1234]
+    );
+    assert!(assemble_words(".text\nudf #0x10000\n").is_err());
+    assert!(assemble_words(".text\nudf\n").is_err());
+    assert!(assemble_words(".text\nudf #0, #1\n").is_err());
+}
