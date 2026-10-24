@@ -159,3 +159,19 @@ fn hints_system_calls_and_register_branches_encode_like_clang() {
         ]
     );
 }
+
+#[test]
+fn branches_to_global_same_section_labels_are_relocated() {
+    let output = std::env::temp_dir().join(format!("ras_global_b_{}.o", std::process::id()));
+    let asm = ".text\n.globl g\ng:\n  b g\n  b.eq g\n  ret\n";
+    Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(asm, &output)
+        .unwrap();
+    let words: Vec<u32> = text(&std::fs::read(&output).unwrap())
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    std::fs::remove_file(output).unwrap();
+    assert_eq!(words[..2], [0x1400_0000, 0x5400_0000]);
+}
