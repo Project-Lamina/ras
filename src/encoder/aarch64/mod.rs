@@ -65,6 +65,29 @@ fn gpr(reg: &str) -> Result<(u32, bool), RasError> {
     Ok((u32::from(register(reg)?), wide))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataKind {
+    W,
+    X,
+    S,
+    D,
+}
+
+/// A load or store data register and its kind; a stack pointer is not a data register.
+fn data_reg(reg: &str) -> Result<(u32, DataKind), RasError> {
+    if is_stack_pointer(reg) {
+        return Err(error(format!("Expected a load or store register: {reg}")));
+    }
+    let kind = match reg.as_bytes().first() {
+        Some(b'w') => DataKind::W,
+        Some(b'x') => DataKind::X,
+        Some(b's') => DataKind::S,
+        Some(b'd') => DataKind::D,
+        _ => return Err(error(format!("Expected a load or store register: {reg}"))),
+    };
+    Ok((u32::from(register(reg)?), kind))
+}
+
 /// Register numbers of the first `N` operands, all general purpose registers of one width.
 fn gpr_regs<const N: usize>(p: &[String]) -> Result<([u32; N], bool), RasError> {
     let mut regs = [0; N];
@@ -402,6 +425,9 @@ impl AArch64Encoder {
                     | r(0)?
             }
             "stp" | "ldp" => {
+                if p.len() < 3 {
+                    return Err(error(format!("Missing address operand for {op}")));
+                }
                 let mem = p[2..].join(",");
                 let pre = mem.ends_with('!');
                 let post = mem.contains("],");
@@ -410,18 +436,34 @@ impl AArch64Encoder {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .collect();
-                let rn = register(
-                    fields
-                        .first()
-                        .ok_or_else(|| error("Missing pair address"))?,
-                )?;
+                let base = fields
+                    .first()
+                    .ok_or_else(|| error("Missing pair address"))?;
+                let (rn, base_wide) = gpr(base)?;
+                if !base_wide || *base == "xzr" {
+                    return Err(error("Pair address must use an x register or sp"));
+                }
                 let offset = fields.get(1).map_or(Ok(0), |s| immediate(s))?;
+                let (t1, kind) = data_reg(arg(0)?)?;
+                let (t2, kind2) = data_reg(arg(1)?)?;
+                if kind != kind2 {
+                    return Err(error(format!("Mismatched pair register types for {op}")));
+                }
+                let gpr_pair = matches!(kind, DataKind::W | DataKind::X);
+                if gpr_pair && (pre || post) && rn != 31 && (t1 == rn || t2 == rn) {
+                    return Err(error(format!("Unpredictable writeback for {op}")));
+                }
                 if wide && op == "stp" && pre {
-                    enc_stp_pre_64(r(0)? as u8, r(1)? as u8, rn, offset as i32)?
+                    enc_stp_pre_64(t1 as u8, t2 as u8, rn as u8, offset as i32)?
                 } else if wide && op == "ldp" && post {
-                    enc_ldp_post_64(r(0)? as u8, r(1)? as u8, rn, offset as i32)?
+                    enc_ldp_post_64(t1 as u8, t2 as u8, rn as u8, offset as i32)?
                 } else {
-                    let scale = if wide { 8 } else { 4 };
+                    let (scale, width_bits) = match kind {
+                        DataKind::W => (4, 0),
+                        DataKind::X => (8, 0x8000_0000),
+                        DataKind::S => (4, 0x0400_0000),
+                        DataKind::D => (8, 0x4400_0000),
+                    };
                     if offset % scale != 0 || !(-64..=63).contains(&(offset / scale)) {
                         return Err(error("Pair offset out of range"));
                     }
@@ -431,16 +473,16 @@ impl AArch64Encoder {
                         0x2880_0000
                     } else {
                         0x2900_0000
-                    }) | if wide { 0x8000_0000 } else { 0 }
+                    }) | width_bits
                         | if op == "ldp" { 1 << 22 } else { 0 }
                         | (((offset / scale) as u32 & 127) << 15)
-                        | (r(1)? << 10)
-                        | (u32::from(rn) << 5)
-                        | r(0)?
+                        | (t2 << 10)
+                        | (rn << 5)
+                        | t1
                 }
             }
             "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldur" | "stur" => {
-                let mem = p[1..].join(",");
+                let mem = p.get(1..).unwrap_or_default().join(",");
                 let inside = mem
                     .trim()
                     .strip_prefix('[')
@@ -450,17 +492,23 @@ impl AArch64Encoder {
                 if fields.len() > 2 {
                     return Err(error(format!("Too many address operands for {op}")));
                 }
-                let rn = register(fields[0])?;
-                let offset = fields.get(1).map_or(Ok(0), |s| immediate(s))?;
-                let size = if op.ends_with('b') {
-                    0
-                } else if op.ends_with('h') {
-                    1
-                } else if wide {
-                    3
-                } else {
-                    2
+                let (rn, base_wide) = gpr(fields[0])?;
+                if !base_wide || fields[0] == "xzr" {
+                    return Err(error("Address base must be an x register or sp"));
+                }
+                let (rt, kind) = data_reg(arg(0)?)?;
+                let narrow = op.ends_with('b') || op.ends_with('h');
+                let (size, fp) = match (narrow, kind) {
+                    (true, DataKind::W) => (if op.ends_with('b') { 0 } else { 1 }, false),
+                    (true, _) => {
+                        return Err(error(format!("{op} takes a 32-bit register")));
+                    }
+                    (false, DataKind::W) => (2, false),
+                    (false, DataKind::X) => (3, false),
+                    (false, DataKind::S) => (2, true),
+                    (false, DataKind::D) => (3, true),
                 };
+                let offset = fields.get(1).map_or(Ok(0), |s| immediate(s))?;
                 let load = op.starts_with('l');
                 let scaled = !op.contains("ur")
                     && offset >= 0
@@ -468,6 +516,7 @@ impl AArch64Encoder {
                     && offset / (1 << size) <= 4095;
                 let base = ((size as u32) << 30)
                     | if scaled { 0x3900_0000 } else { 0x3800_0000 }
+                    | if fp { 0x0400_0000 } else { 0 }
                     | if load { 1 << 22 } else { 0 };
                 let imm = if scaled {
                     ((offset >> size) as u32) << 10
@@ -477,7 +526,7 @@ impl AArch64Encoder {
                     }
                     ((offset as u32) & 511) << 12
                 };
-                base | imm | (u32::from(rn) << 5) | r(0)?
+                base | imm | (rn << 5) | rt
             }
             _ => return Err(error(format!("Unsupported instruction: {op}"))),
         };
