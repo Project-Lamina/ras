@@ -110,6 +110,28 @@ impl RiscVEncoder {
         }
     }
 
+    fn imm12(&self, s: &str) -> Result<i32, RasError> {
+        let imm = self.parse_imm(s)?;
+        if !(-2048..=2047).contains(&imm) {
+            return Err(RasError::EncodingError(format!(
+                "Immediate {} out of 12-bit signed range [-2048, 2047]",
+                imm
+            )));
+        }
+        Ok(imm as i32)
+    }
+
+    fn imm20(&self, s: &str) -> Result<i32, RasError> {
+        let imm = self.parse_imm(s)?;
+        if !(0..=0xF_FFFF).contains(&imm) {
+            return Err(RasError::EncodingError(format!(
+                "Immediate {} out of 20-bit range [0, 1048575]",
+                imm
+            )));
+        }
+        Ok(imm as i32)
+    }
+
     /// Parse `base_reg` and optional offset from an address operand like
     /// `(sp)`, `8(sp)`, `-4(s0)`.
     fn parse_mem_operand(&self, s: &str) -> Result<(u8, i32), RasError> {
@@ -120,7 +142,7 @@ impl RiscVEncoder {
             let offset = if offset_str.is_empty() {
                 0i32
             } else {
-                self.parse_imm(offset_str)? as i32
+                self.imm12(offset_str)?
             };
             let base = self.parse_register(reg_str)?;
             Ok((base, offset))
@@ -238,13 +260,7 @@ impl RiscVEncoder {
         }
         let rd = self.parse_register(&ops[0])?;
         let rs1 = self.parse_register(&ops[1])?;
-        let imm = self.parse_imm(&ops[2])? as i32;
-        if !(-2048..=2047).contains(&imm) {
-            return Err(RasError::EncodingError(format!(
-                "Immediate {} out of 12-bit signed range [-2048, 2047]",
-                imm
-            )));
-        }
+        let imm = self.imm12(&ops[2])?;
         Ok(Self::emit(Self::i_type(imm, rs1, funct3, rd, opcode)))
     }
 
@@ -263,14 +279,15 @@ impl RiscVEncoder {
         }
         let rd = self.parse_register(&ops[0])?;
         let rs1 = self.parse_register(&ops[1])?;
-        let shamt = self.parse_imm(&ops[2])? as u32;
-        let max_shamt = if self.rv64 { 63u32 } else { 31u32 };
-        if shamt > max_shamt {
+        let shamt = self.parse_imm(&ops[2])?;
+        let max_shamt = if self.rv64 { 63 } else { 31 };
+        if !(0..=max_shamt).contains(&shamt) {
             return Err(RasError::EncodingError(format!(
                 "Shift amount {} exceeds maximum {}",
                 shamt, max_shamt
             )));
         }
+        let shamt = shamt as u32;
         // For RV64: imm[11:0] = funct7[6:1] | shamt[5:0]
         let imm12 = ((funct7 as i32) << 5) | (shamt as i32 & 0x3F);
         Ok(Self::emit(Self::i_type(imm12, rs1, funct3, rd, opcode)))
@@ -435,7 +452,7 @@ impl InstructionEncoder for RiscVEncoder {
                     // jalr rd, rs1, imm  (explicit form)
                     let rd = self.parse_register(&ops[0])?;
                     let rs1 = self.parse_register(&ops[1])?;
-                    let imm = self.parse_imm(&ops[2])? as i32;
+                    let imm = self.imm12(&ops[2])?;
                     Self::emit(Self::i_type(imm, rs1, 0x0, rd, 0x67))
                 } else if ops.len() == 2 {
                     // jalr rd, offset(rs1)  (memory form)
@@ -460,7 +477,7 @@ impl InstructionEncoder for RiscVEncoder {
                     ));
                 }
                 let rd = self.parse_register(&ops[0])?;
-                let imm20 = self.parse_imm(&ops[1])? as i32;
+                let imm20 = self.imm20(&ops[1])?;
                 Self::emit(Self::u_type(imm20, rd, 0x37))
             }
             "auipc" => {
@@ -470,7 +487,7 @@ impl InstructionEncoder for RiscVEncoder {
                     ));
                 }
                 let rd = self.parse_register(&ops[0])?;
-                let imm20 = self.parse_imm(&ops[1])? as i32;
+                let imm20 = self.imm20(&ops[1])?;
                 Self::emit(Self::u_type(imm20, rd, 0x17))
             }
 
@@ -504,14 +521,14 @@ impl InstructionEncoder for RiscVEncoder {
                     ));
                 }
                 let rd = self.parse_register(&ops[0])?;
-                let imm = self.parse_imm(&ops[1])? as i32;
+                let imm = self.parse_imm(&ops[1])?;
                 if !(-2048..=2047).contains(&imm) {
                     return Err(RasError::EncodingError(format!(
                         "LI pseudo-instruction only supports 12-bit immediates ({} out of range)",
                         imm
                     )));
                 }
-                Self::emit(Self::i_type(imm, 0, 0, rd, 0x13))
+                Self::emit(Self::i_type(imm as i32, 0, 0, rd, 0x13))
             }
             // `j offset` = jal x0, offset
             "j" => {
