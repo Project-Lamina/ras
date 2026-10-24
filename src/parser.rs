@@ -331,13 +331,14 @@ impl AssemblyParser {
                     })?;
                 parse_data_expression(expression.trim())?;
                 self.aliases
-                    .push((name.trim().into(), expression.trim().into()));
+                    .push((symbol_name(name.trim())?.into(), expression.trim().into()));
             }
             ".comm" => {
                 let fields: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
                 if !(2..=3).contains(&fields.len()) || fields[0].is_empty() {
                     return Err(RasError::ParseError("Invalid .comm operands".into()));
                 }
+                symbol_name(fields[0])?;
                 let size = u64::try_from(parse_integer(fields[1])?)
                     .map_err(|_| RasError::ParseError("Invalid common size".into()))?;
                 let alignment = match fields.get(2) {
@@ -375,6 +376,7 @@ impl AssemblyParser {
                     if name.is_empty() {
                         return Err(RasError::ParseError(".local requires symbol".into()));
                     }
+                    symbol_name(name)?;
                     self.attributes.entry(name.into()).or_default().local = true;
                 }
             }
@@ -383,6 +385,7 @@ impl AssemblyParser {
                     if name.is_empty() {
                         return Err(RasError::ParseError(".hidden requires symbol".into()));
                     }
+                    symbol_name(name)?;
                     self.attributes.entry(name.into()).or_default().hidden = true;
                 }
             }
@@ -391,6 +394,7 @@ impl AssemblyParser {
                     if name.is_empty() {
                         return Err(RasError::ParseError(".weak requires symbol".into()));
                     }
+                    symbol_name(name)?;
                     self.attributes.entry(name.into()).or_default().weak = true;
                 }
             }
@@ -520,6 +524,7 @@ impl AssemblyParser {
                 let (name, kind) = line[parts[0].len()..]
                     .split_once(',')
                     .ok_or_else(|| RasError::ParseError("Invalid .type".into()))?;
+                let name = symbol_name(name.trim())?;
                 let kind = match kind.trim().trim_start_matches(['@', '%']) {
                     "notype" => 0,
                     "object" => 1,
@@ -536,6 +541,7 @@ impl AssemblyParser {
                 let (name, expression) = line[parts[0].len()..]
                     .split_once(',')
                     .ok_or_else(|| RasError::ParseError("Invalid .size".into()))?;
+                let name = symbol_name(name.trim())?;
                 let expression = match parse_data_expression(expression.trim())? {
                     DataExpression::Difference(left, right) if left == "." || right == "." => {
                         let location = format!("{}_{}", self.generated_prefix, self.lines.len());
@@ -698,6 +704,17 @@ fn parse_integer_opt(text: &str) -> Option<i128> {
         digits.parse()
     };
     result.ok().map(|n| sign * n)
+}
+
+fn symbol_name(name: &str) -> Result<&str, RasError> {
+    let mut chars = name.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '.')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'));
+    if valid {
+        Ok(name)
+    } else {
+        Err(RasError::ParseError(format!("Invalid symbol name: {name}")))
+    }
 }
 
 fn strip_line_comment<'a>(line: &'a str, markers: &[&str]) -> &'a str {
