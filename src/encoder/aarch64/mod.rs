@@ -338,7 +338,7 @@ pub(crate) fn condition(text: &str) -> Result<u32, RasError> {
         "nv",
     ]
     .iter()
-    .position(|s| *s == text)
+    .position(|s| *s == text || (*s == "hs" && text == "cs") || (*s == "lo" && text == "cc"))
     .map(|n| n as u32)
     .ok_or_else(|| error(format!("Invalid condition: {text}")))
 }
@@ -410,7 +410,30 @@ impl AArch64Encoder {
                 let base = if op == "br" { 0xd61f_0000 } else { 0xd63f_0000 };
                 base | (rn << 5)
             }
-            "dmb" if arg(0)? == "sy" => 0xd503_3fbf,
+            "dmb" | "dsb" => {
+                let option = match arg(0)? {
+                    "oshld" => 1,
+                    "oshst" => 2,
+                    "osh" => 3,
+                    "nshld" => 5,
+                    "nshst" => 6,
+                    "nsh" => 7,
+                    "ishld" => 9,
+                    "ishst" => 0xa,
+                    "ish" => 0xb,
+                    "ld" => 0xd,
+                    "st" => 0xe,
+                    "sy" => 0xf,
+                    other => return Err(error(format!("Invalid barrier option: {other}"))),
+                };
+                let base = if op == "dmb" {
+                    0xd503_30bf
+                } else {
+                    0xd503_309f
+                };
+                base | (option << 8)
+            }
+            "isb" if p.is_empty() || matches!(p.as_slice(), [sy] if sy == "sy") => 0xd503_3fdf,
             "movz" | "movk" | "movn" => {
                 let imm = immediate(arg(1)?)?;
                 let shift = if p.len() > 2 {

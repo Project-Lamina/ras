@@ -711,3 +711,16 @@ fn writeback_forms_reject_unencodable_offsets_and_registers() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn barrier_options_and_carry_condition_aliases_encode() {
+    assert_eq!(
+        assemble_words(".text\ndmb ish\ndmb ishld\ndsb sy\nisb\n").unwrap(),
+        [0xd503_3bbf, 0xd503_39bf, 0xd503_3f9f, 0xd503_3fdf]
+    );
+    assert_eq!(
+        assemble_words(".text\ncset w0, cc\ncset w0, cs\ncsel w0, w1, w2, cs\n").unwrap(),
+        [0x1a9f_27e0, 0x1a9f_37e0, 0x1a82_2020]
+    );
+    assert!(assemble_words(".text\ndmb foo\n").is_err());
+}
