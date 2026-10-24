@@ -888,7 +888,9 @@ impl RasAssembler {
                                 } else {
                                     282
                                 },
-                                relocate: opcode == "bl" && !target.starts_with(".L"),
+                                relocate: opcode == "bl"
+                                    && !target.starts_with(".L")
+                                    && self.target_os != TargetOperatingSystem::MacOS,
                             })
                         } else if opcode == "adrp" && operands.len() == 2 {
                             Some(PatchPoint::AArch64 {
