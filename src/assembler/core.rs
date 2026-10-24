@@ -354,6 +354,7 @@ impl RasAssembler {
                 &positions,
                 &section.name,
                 &global_symbols,
+                self.target_os == TargetOperatingSystem::MacOS,
             )?;
             section.alignment =
                 if self.target_arch == TargetArchitecture::Aarch64 && section.flags.exec {
@@ -1020,12 +1021,31 @@ impl RasAssembler {
         })
     }
 
-    fn finish_layout(
+    /// Mach-O private labels (`L` prefix, not global) never reach the symbol table.
+fn macho_private_label(name: &str, global_symbols: &HashSet<&str>) -> bool {
+    name.starts_with('L') && !global_symbols.contains(name)
+}
+
+fn macho_atom(
+    symbol_offsets: &HashMap<String, usize>,
+    global_symbols: &HashSet<&str>,
+    offset: usize,
+) -> Option<usize> {
+    symbol_offsets
+        .iter()
+        .filter(|(name, _)| !Self::macho_private_label(name, global_symbols))
+        .map(|(_, &at)| at)
+        .filter(|&at| at <= offset)
+        .max()
+}
+
+fn finish_layout(
         layout: Layout,
         lines: &[Line],
         positions: &HashMap<String, (String, usize)>,
         section: &str,
         global_symbols: &HashSet<&str>,
+        macho: bool,
     ) -> EncodeResult {
         let Layout {
             mut code,
@@ -1183,13 +1203,29 @@ impl RasAssembler {
             }
             let got = target.ends_with("@GOTPCREL");
             let target = reloc_symbol(target);
-            if let Some(&target_offset) = symbol_offsets.get(target).filter(|_| {
-                !got && !matches!(
-                    patch,
-                    PatchPoint::X86Rel32 { relocate: true, .. }
-                        | PatchPoint::X86RipRel32 { relocate: true, .. }
-                )
-            }) {
+            let (x86_rel, patch_offset) = match patch {
+                PatchPoint::X86Rel32 { offset, .. } | PatchPoint::X86RipRel32 { offset, .. } => {
+                    (true, *offset)
+                }
+                _ => (false, 0),
+            };
+            let target_offset = symbol_offsets.get(target).copied().filter(|&target_offset| {
+                let same_atom = || {
+                    Self::macho_atom(&symbol_offsets, global_symbols, target_offset)
+                        == Self::macho_atom(&symbol_offsets, global_symbols, patch_offset)
+                };
+                let macho_resolves = !macho
+                    || !x86_rel
+                    || (Self::macho_private_label(target, global_symbols) && same_atom());
+                !got
+                    && macho_resolves
+                    && !matches!(
+                        patch,
+                        PatchPoint::X86Rel32 { relocate: true, .. }
+                            | PatchPoint::X86RipRel32 { relocate: true, .. }
+                    )
+            });
+            if let Some(target_offset) = target_offset {
                 match patch {
                     PatchPoint::Data { .. } | PatchPoint::AArch64 { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
