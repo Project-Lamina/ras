@@ -91,6 +91,7 @@ pub struct AssemblyParser {
     symbol_names: HashSet<String>,
     /// Darwin reads the third `.comm` operand and `.align` as log2 exponents.
     darwin: bool,
+    line_comments: &'static [&'static str],
 }
 
 impl Default for AssemblyParser {
@@ -114,6 +115,7 @@ impl AssemblyParser {
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
             darwin: false,
+            line_comments: &["#", "//"],
         }
     }
 
@@ -122,13 +124,19 @@ impl AssemblyParser {
         self
     }
 
+    /// Markers that start a comment running to the end of a line, outside string literals.
+    pub fn with_line_comments(mut self, markers: &'static [&'static str]) -> Self {
+        self.line_comments = markers;
+        self
+    }
+
     pub fn parse(mut self, text: &str) -> Result<ParsedAssembly, RasError> {
         while text.contains(&self.generated_prefix) {
             self.generated_prefix.push('_');
         }
         for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            let line = strip_line_comment(line.trim(), self.line_comments).trim();
+            if line.is_empty() {
                 continue;
             }
 
@@ -673,6 +681,29 @@ fn parse_integer_opt(text: &str) -> Option<i128> {
     result.ok().map(|n| sign * n)
 }
 
+fn strip_line_comment<'a>(line: &'a str, markers: &[&str]) -> &'a str {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, c) in line.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if markers
+            .iter()
+            .any(|marker| line[index..].starts_with(marker))
+        {
+            return &line[..index];
+        }
+    }
+    line
+}
+
 fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
     let body = s.trim().strip_prefix('"')?;
     let mut out = Vec::new();
@@ -797,8 +828,24 @@ mod tests {
     }
 
     #[test]
+    fn trailing_comments_end_at_the_marker_outside_strings() {
+        let asm = AssemblyParser::new()
+            .with_line_comments(&["#"])
+            .parse("call bar # note\n.ascii \"a#b\" # tail\n")
+            .expect("parse failed");
+        assert!(matches!(&asm.lines[0], Line::Instruction(inst)
+            if inst.opcode == "call" && inst.operands == ["bar"]));
+        assert!(matches!(&asm.lines[1], Line::Data(bytes) if bytes == b"a#b"));
+    }
+
+    #[test]
     fn malformed_string_directives_are_rejected() {
-        for src in [".asciz hello\n", ".ascii \"open\n", ".ascii \"\\x\"\n", ".asciz \"a\" junk\n"] {
+        for src in [
+            ".asciz hello\n",
+            ".ascii \"open\n",
+            ".ascii \"\\x\"\n",
+            ".asciz \"a\" junk\n",
+        ] {
             assert!(AssemblyParser::new().parse(src).is_err(), "{src:?} was accepted");
         }
     }
