@@ -147,6 +147,12 @@ enum PatchPoint {
         addend: i64,
         relocate: bool,
     },
+    Riscv {
+        offset: usize,
+        target: String,
+        word: u32,
+        jump: bool,
+    },
     Arx64Jal {
         offset: usize,
         target: String,
@@ -850,6 +856,34 @@ impl RasAssembler {
                     let opcode = inst.opcode.to_lowercase();
                     let is_jmp_call = opcode == "jmp" || opcode == "jmpq" || opcode == "call";
 
+                    if matches!(
+                        self.target_arch,
+                        TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+                    ) && let Some((target, jump)) = riscv_label_jump(&opcode, &inst.operands)
+                    {
+                        let mut placeholder = inst.clone();
+                        if let Some(last) = placeholder.operands.last_mut() {
+                            *last = "0".into();
+                        }
+                        let bytes = self
+                            .encoder
+                            .encode_instruction(&placeholder)
+                            .map_err(|e| RasError::EncodingError(e.to_string()))?;
+                        let word =
+                            u32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
+                                RasError::EncodingError("RISC-V encoding is not 4 bytes".into())
+                            })?);
+                        code.extend_from_slice(&bytes);
+                        patch_points.push(PatchPoint::Riscv {
+                            offset: current_offset,
+                            target,
+                            word,
+                            jump,
+                        });
+                        current_offset += 4;
+                        continue;
+                    }
+
                     if self.target_arch == TargetArchitecture::Arx64
                         && let Some(patch) =
                             arx64_label_patch(&opcode, &inst.operands, current_offset)?
@@ -1163,9 +1197,40 @@ fn finish_layout(
                 }
                 continue;
             }
+            if let PatchPoint::Riscv {
+                offset,
+                target,
+                word,
+                jump,
+            } = patch
+            {
+                match symbol_offsets.get(target) {
+                    Some(&target_offset) if !global_symbols.contains(target.as_str()) => {
+                        let delta = target_offset as i64 - *offset as i64;
+                        let imm = if *jump {
+                            RiscVEncoder::j_type(RiscVEncoder::jump_offset(delta)?, 0, 0)
+                        } else {
+                            RiscVEncoder::b_type(RiscVEncoder::branch_offset(delta)?, 0, 0, 0, 0)
+                        };
+                        let instruction = word | imm;
+                        code[*offset..*offset + 4].copy_from_slice(&instruction.to_le_bytes());
+                    }
+                    _ => external_relocs.push(ExternalReloc {
+                        offset: *offset,
+                        symbol: target.clone(),
+                        section: String::new(),
+                        kind: if *jump { 17 } else { 16 },
+                        addend: 0,
+                        trailing: 0,
+                        branch: false,
+                    }),
+                }
+                continue;
+            }
             let target = match patch {
                 PatchPoint::Data { .. } => unreachable!(),
-                PatchPoint::AArch64 { target, .. }
+                PatchPoint::Riscv { target, .. }
+                | PatchPoint::AArch64 { target, .. }
                 | PatchPoint::X86Rel32 { target, .. }
                 | PatchPoint::X86RipRel32 { target, .. }
                 | PatchPoint::Arx64Jal { target, .. }
@@ -1232,7 +1297,9 @@ fn finish_layout(
             });
             if let Some(target_offset) = target_offset {
                 match patch {
-                    PatchPoint::Data { .. } | PatchPoint::AArch64 { .. } => unreachable!(),
+                    PatchPoint::Data { .. }
+                    | PatchPoint::AArch64 { .. }
+                    | PatchPoint::Riscv { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
@@ -1498,6 +1565,19 @@ fn finish_layout(
 /// it is not part of the name.
 fn reloc_symbol(target: &str) -> &str {
     target.split_once('@').map_or(target, |(name, _)| name)
+}
+
+fn riscv_label_jump(opcode: &str, operands: &[String]) -> Option<(String, bool)> {
+    let jump = match opcode {
+        "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu" | "beqz" | "bnez" | "bltz" | "bgez"
+        | "blez" | "bgtz" | "bgt" | "ble" | "bgtu" | "bleu" => false,
+        "jal" | "j" => true,
+        _ => return None,
+    };
+    let target = operands.last()?.trim();
+    target
+        .starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '.' | '$'))
+        .then(|| (target.to_string(), jump))
 }
 
 fn arx64_label_patch(
