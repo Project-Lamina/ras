@@ -292,3 +292,21 @@ fn add_sub_and_cmp_with_stack_pointer_use_the_extended_form() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn add_sub_and_cmp_reject_mixed_register_widths_and_fp_operands() {
+    for asm in [
+        ".text\nadd w0, x1, #0\n",
+        ".text\nadd x0, w1, #1\n",
+        ".text\nadd w0, w1, x2\n",
+        ".text\nadd x0, x1, w2\n",
+        ".text\nsub w0, x1, x2\n",
+        ".text\ncmp w0, x1\n",
+        ".text\nadd x0, x1, sp\n",
+        ".text\ncmp x0, sp\n",
+        ".text\nadd d0, x1, x2\n",
+        ".text\nadd x0, s1, x2\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
