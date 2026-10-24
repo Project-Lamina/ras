@@ -1000,7 +1000,24 @@ impl InstructionEncoder for X86_64Encoder {
                     ..Op::default()
                 })?);
             }
-            "ret" => code.push(0xC3),
+            "ret" => match inst.operands.as_slice() {
+                [] => code.push(0xC3),
+                [imm] => {
+                    let value = imm.strip_prefix('$').ok_or_else(|| {
+                        RasError::EncodingError("ret requires an immediate".into())
+                    })?;
+                    let value = u16::try_from(parse_imm(value)?).map_err(|_| {
+                        RasError::EncodingError("ret immediate out of range".into())
+                    })?;
+                    code.push(0xC2);
+                    code.extend_from_slice(&value.to_le_bytes());
+                }
+                _ => {
+                    return Err(RasError::EncodingError(
+                        "ret takes at most one operand".into(),
+                    ));
+                }
+            },
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
             "leave" => code.push(0xC9),
             "cvttsd2sil" | "cvttsd2siq" | "cvttss2sil" | "cvttss2siq" => {
