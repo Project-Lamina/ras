@@ -56,6 +56,24 @@ fn add_sub_imm12(imm: i64, shift: Option<&str>) -> Result<(i64, u32), RasError> 
     }
 }
 
+fn is_stack_pointer(reg: &str) -> bool {
+    matches!(reg, "sp" | "wsp")
+}
+
+fn extended_amount(shift: Option<&str>) -> Result<u32, RasError> {
+    let Some(shift) = shift else {
+        return Ok(0);
+    };
+    let amount = shift
+        .strip_prefix("lsl ")
+        .ok_or_else(|| error(format!("Invalid extension: {shift}")))
+        .and_then(immediate)?;
+    if !(0..=4).contains(&amount) {
+        return Err(error(format!("Extension amount out of range: {amount}")));
+    }
+    Ok(amount as u32)
+}
+
 fn shifted_register(shift: Option<&str>, wide: bool) -> Result<(u32, u32), RasError> {
     let Some(shift) = shift else {
         return Ok((0, 0));
@@ -222,6 +240,20 @@ impl AArch64Encoder {
                     0x1100_0000 | sf | flags | (shift << 22) | ((imm as u32) << 10) | (rn << 5) | rd
                 } else {
                     let shift = p.get(if compare { 2 } else { 3 }).map(|s| s.trim());
+                    let rn_text = arg(if compare { 0 } else { 1 })?;
+                    if is_stack_pointer(rn_text) || (!compare && is_stack_pointer(&p[0])) {
+                        let amount = extended_amount(shift)?;
+                        let option = if wide { 0b011 } else { 0b010 };
+                        let word = 0x0b20_0000
+                            | sf
+                            | flags
+                            | (u32::from(register(operand)?) << 16)
+                            | (option << 13)
+                            | (amount << 10)
+                            | (rn << 5)
+                            | rd;
+                        return Ok(word.to_le_bytes().to_vec());
+                    }
                     let (kind, amount) = shifted_register(shift, wide)?;
                     if op == "add" && wide && shift.is_none() {
                         return Ok(encode_add_rrr(rd as u8, rn as u8, register(operand)?));
