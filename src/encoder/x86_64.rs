@@ -846,6 +846,26 @@ impl InstructionEncoder for X86_64Encoder {
             return Ok(bytes);
         }
         let mut code = Vec::new();
+        if !inst.operands.is_empty()
+            && matches!(
+                opcode.as_str(),
+                "fld1"
+                    | "endbr64"
+                    | "leave"
+                    | "cwtl"
+                    | "cltq"
+                    | "cqto"
+                    | "cqo"
+                    | "cdq"
+                    | "cltd"
+                    | "ud2"
+                    | "syscall"
+            )
+        {
+            return Err(RasError::EncodingError(format!(
+                "{opcode} takes no operands"
+            )));
+        }
 
         match opcode.as_str() {
             "movq" | "mov" => {
