@@ -263,8 +263,13 @@ impl AArch64Encoder {
                 let dst = r(0)?;
                 let src = arg(1)?;
                 if src.starts_with('#') {
-                    let value =
-                        immediate(src)? as u64 & if wide { u64::MAX } else { u32::MAX as u64 };
+                    let raw = immediate(src)?;
+                    if !wide && !(-(1 << 31)..=u32::MAX as i64).contains(&raw) {
+                        return Err(error(format!(
+                            "mov immediate out of range for w register: {raw}"
+                        )));
+                    }
+                    let value = raw as u64 & if wide { u64::MAX } else { u32::MAX as u64 };
                     let chunks = if wide { 4 } else { 2 };
                     let mut encoding = None;
                     for i in 0..chunks {
