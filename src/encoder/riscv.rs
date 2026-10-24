@@ -438,6 +438,33 @@ impl RiscVEncoder {
     }
 }
 
+/// Single-instruction ALU and jump pseudo-instructions, rewritten to the base
+/// mnemonic they stand for.
+fn expand_alu_pseudo(
+    opcode: &str,
+    ops: &[String],
+) -> Result<Option<(&'static str, Vec<String>)>, RasError> {
+    let (base, operands): (&'static str, Vec<String>) = match (opcode, ops) {
+        ("not", [rd, rs]) => ("xori", vec![rd.clone(), rs.clone(), "-1".into()]),
+        ("neg", [rd, rs]) => ("sub", vec![rd.clone(), "zero".into(), rs.clone()]),
+        ("negw", [rd, rs]) => ("subw", vec![rd.clone(), "zero".into(), rs.clone()]),
+        ("sext.w", [rd, rs]) => ("addiw", vec![rd.clone(), rs.clone(), "0".into()]),
+        ("seqz", [rd, rs]) => ("sltiu", vec![rd.clone(), rs.clone(), "1".into()]),
+        ("snez", [rd, rs]) => ("sltu", vec![rd.clone(), "zero".into(), rs.clone()]),
+        ("sltz", [rd, rs]) => ("slt", vec![rd.clone(), rs.clone(), "zero".into()]),
+        ("sgtz", [rd, rs]) => ("slt", vec![rd.clone(), "zero".into(), rs.clone()]),
+        ("jr", [rs]) => ("jalr", vec!["zero".into(), format!("0({rs})")]),
+        ("not" | "neg" | "negw" | "sext.w" | "seqz" | "snez" | "sltz" | "sgtz" | "jr", _) => {
+            return Err(RasError::EncodingError(format!(
+                "{} has the wrong number of operands",
+                opcode.to_uppercase()
+            )));
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some((base, operands)))
+}
+
 impl InstructionEncoder for RiscVEncoder {
     fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         let opcode = inst.opcode.to_lowercase();
@@ -446,6 +473,12 @@ impl InstructionEncoder for RiscVEncoder {
         if let Some(bytes) = self.encode_branch_pseudo(&opcode, ops)? {
             self.position += bytes.len();
             return Ok(bytes);
+        }
+        if let Some((base, operands)) = expand_alu_pseudo(&opcode, ops)? {
+            return self.encode_instruction(&ParsedInstruction {
+                opcode: base.to_string(),
+                operands,
+            });
         }
 
         let bytes = match opcode.as_str() {
@@ -797,6 +830,38 @@ mod tests {
                 .encode_instruction(&instr("j", &["-1048578"]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_unary_pseudos_match_their_base_instruction() {
+        let pairs = [
+            (
+                ("not", &["a0", "a1"][..]),
+                ("xori", &["a0", "a1", "-1"][..]),
+            ),
+            (
+                ("neg", &["a0", "a1"][..]),
+                ("sub", &["a0", "zero", "a1"][..]),
+            ),
+            (
+                ("seqz", &["a0", "a1"][..]),
+                ("sltiu", &["a0", "a1", "1"][..]),
+            ),
+            (
+                ("sgtz", &["a0", "a1"][..]),
+                ("slt", &["a0", "zero", "a1"][..]),
+            ),
+            (("jr", &["ra"][..]), ("jalr", &["zero", "0(ra)"][..])),
+        ];
+        for ((pseudo, pseudo_ops), (base, base_ops)) in pairs {
+            assert_eq!(
+                enc()
+                    .encode_instruction(&instr(pseudo, pseudo_ops))
+                    .unwrap(),
+                enc().encode_instruction(&instr(base, base_ops)).unwrap(),
+                "{pseudo}"
+            );
+        }
     }
 
     #[test]
