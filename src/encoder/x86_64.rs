@@ -932,7 +932,12 @@ impl InstructionEncoder for X86_64Encoder {
                 let target = target.trim().strip_prefix('*').ok_or_else(|| {
                     RasError::EncodingError(format!("{}: expected indirect operand", opcode))
                 })?;
-                let (rm, _) = self.parse_rm(target, false)?;
+                let (rm, gpr) = self.parse_rm(target, false)?;
+                if gpr.is_some_and(|gpr| gpr.width != 64) {
+                    return Err(RasError::EncodingError(format!(
+                        "{opcode}: indirect target must be a 64-bit register"
+                    )));
+                }
                 let digit = if opcode == "call" { 2 } else { 4 };
                 let enc = encode_op(Op {
                     opcode: &[0xff],
