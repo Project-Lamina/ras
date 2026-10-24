@@ -741,3 +741,13 @@ fn fmul_takes_scalar_registers_of_one_size() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn scalar_fp_register_31_is_valid_but_general_register_31_is_not() {
+    assert_eq!(
+        assemble_words(".text\nfmul d31, d1, d2\n").unwrap(),
+        [0x1e62_083f]
+    );
+    assert!(assemble_words(".text\nadd x0, x31, x1\n").is_err());
+    assert!(assemble_words(".text\nmov w31, w0\n").is_err());
+}

@@ -21,11 +21,13 @@ pub(crate) fn register(reg: &str) -> Result<u8, RasError> {
         "sp" | "wsp" | "xzr" | "wzr" => Ok(31),
         "fp" => Ok(29),
         "lr" => Ok(30),
-        _ => reg
-            .strip_prefix(['x', 'w', 's', 'd'])
-            .and_then(|n| n.parse::<u8>().ok())
-            .filter(|n| *n < 31)
-            .ok_or_else(|| error(format!("Invalid AArch64 register: {reg}"))),
+        _ => {
+            let fp = reg.starts_with(['s', 'd']);
+            reg.strip_prefix(['x', 'w', 's', 'd'])
+                .and_then(|n| n.parse::<u8>().ok())
+                .filter(|n| *n < 31 || (fp && *n == 31))
+                .ok_or_else(|| error(format!("Invalid AArch64 register: {reg}")))
+        }
     }
 }
 
