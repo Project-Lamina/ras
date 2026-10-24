@@ -233,6 +233,11 @@ impl RasAssembler {
         asm_text: &str,
         output_path: &std::path::Path,
     ) -> Result<(), RasError> {
+        if self.target_arch == TargetArchitecture::Riscv32 {
+            return Err(RasError::UnsupportedTarget(
+                "riscv32 object output is not implemented: ras writes ELF64 only".into(),
+            ));
+        }
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
         let comment_markers: &'static [&'static str] =
             if self.target_arch == TargetArchitecture::Aarch64 {
