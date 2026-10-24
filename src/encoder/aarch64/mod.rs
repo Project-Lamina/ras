@@ -56,6 +56,26 @@ fn add_sub_imm12(imm: i64, shift: Option<&str>) -> Result<(i64, u32), RasError> 
     }
 }
 
+fn shifted_register(shift: Option<&str>, wide: bool) -> Result<(u32, u32), RasError> {
+    let Some(shift) = shift else {
+        return Ok((0, 0));
+    };
+    let (kind, amount) = shift
+        .split_once(' ')
+        .ok_or_else(|| error(format!("Invalid shift: {shift}")))?;
+    let kind = match kind {
+        "lsl" => 0,
+        "lsr" => 1,
+        "asr" => 2,
+        _ => return Err(error(format!("Invalid shift: {shift}"))),
+    };
+    let amount = immediate(amount)?;
+    if !(0..if wide { 64 } else { 32 }).contains(&amount) {
+        return Err(error(format!("Shift amount out of range: {amount}")));
+    }
+    Ok((kind, amount as u32))
+}
+
 pub(crate) fn condition(text: &str) -> Result<u32, RasError> {
     [
         "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
@@ -200,13 +220,18 @@ impl AArch64Encoder {
                         p.get(if compare { 2 } else { 3 }).map(|s| s.trim()),
                     )?;
                     0x1100_0000 | sf | flags | (shift << 22) | ((imm as u32) << 10) | (rn << 5) | rd
-                } else if op == "add" && wide {
-                    return Ok(encode_add_rrr(rd as u8, rn as u8, register(operand)?));
                 } else {
+                    let shift = p.get(if compare { 2 } else { 3 }).map(|s| s.trim());
+                    let (kind, amount) = shifted_register(shift, wide)?;
+                    if op == "add" && wide && shift.is_none() {
+                        return Ok(encode_add_rrr(rd as u8, rn as u8, register(operand)?));
+                    }
                     0x0b00_0000
                         | sf
                         | flags
+                        | (kind << 22)
                         | (u32::from(register(operand)?) << 16)
+                        | (amount << 10)
                         | (rn << 5)
                         | rd
                 }
