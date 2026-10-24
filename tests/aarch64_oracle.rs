@@ -230,3 +230,31 @@ fn add_sub_and_cmp_immediates_reject_unrepresentable_shifts() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn add_sub_and_cmp_shifted_registers_encode_their_shift() {
+    assert_eq!(
+        assemble_words(".text\nadd x0, x1, x2, lsl #3\n").unwrap(),
+        [0x8b02_0c20]
+    );
+    assert_eq!(
+        assemble_words(".text\nsub x0, x1, x2, lsr #5\n").unwrap(),
+        [0xcb42_1420]
+    );
+    assert_eq!(
+        assemble_words(".text\ncmp x0, x1, lsl #2\n").unwrap(),
+        [0xeb01_081f]
+    );
+}
+
+#[test]
+fn add_sub_and_cmp_reject_out_of_range_or_unknown_shifts() {
+    for asm in [
+        ".text\nadd x0, x1, x2, lsl #64\n",
+        ".text\nadd w0, w1, w2, lsl #32\n",
+        ".text\nadd x0, x1, x2, ror #1\n",
+        ".text\nadd x0, x1, x2, lsl\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
