@@ -130,6 +130,7 @@ enum PatchPoint {
     AArch64 {
         offset: usize,
         target: String,
+        addend: i64,
         word: u32,
         bits: u32,
         kind: u32,
@@ -947,6 +948,7 @@ impl RasAssembler {
                                     RasError::EncodingError("Missing branch target".into())
                                 })?
                                 .clone();
+                            let (symbol, addend) = split_addend(&target)?;
                             let conditional = opcode.starts_with("b.");
                             let word = if conditional {
                                 0x5400_0000 | crate::encoder::aarch64::condition(&opcode[2..])?
@@ -957,7 +959,8 @@ impl RasAssembler {
                             };
                             Some(PatchPoint::AArch64 {
                                 offset: current_offset,
-                                target: target.clone(),
+                                target: symbol.to_string(),
+                                addend,
                                 word,
                                 bits: if conditional { 19 } else { 26 },
                                 kind: if conditional {
@@ -968,13 +971,15 @@ impl RasAssembler {
                                     282
                                 },
                                 relocate: opcode == "bl"
-                                    && !target.starts_with(".L")
+                                    && !symbol.starts_with(".L")
                                     && self.target_os != TargetOperatingSystem::MacOS,
                             })
                         } else if opcode == "adrp" && operands.len() == 2 {
+                            let (symbol, addend) = split_addend(&operands[1])?;
                             Some(PatchPoint::AArch64 {
                                 offset: current_offset,
-                                target: operands[1].clone(),
+                                target: symbol.to_string(),
+                                addend,
                                 word: 0x9000_0000
                                     | u32::from(crate::encoder::aarch64::register(&operands[0])?),
                                 bits: 0,
@@ -985,9 +990,11 @@ impl RasAssembler {
                             && operands.len() == 3
                             && operands[2].starts_with(":lo12:")
                         {
+                            let (symbol, addend) = split_addend(&operands[2][6..])?;
                             Some(PatchPoint::AArch64 {
                                 offset: current_offset,
-                                target: operands[2][6..].into(),
+                                target: symbol.to_string(),
+                                addend,
                                 word: 0x9100_0000
                                     | (u32::from(crate::encoder::aarch64::register(&operands[1])?)
                                         << 5)
@@ -1285,6 +1292,7 @@ fn finish_layout(
             if let PatchPoint::AArch64 {
                 offset,
                 target,
+                addend,
                 word,
                 bits,
                 kind,
@@ -1299,7 +1307,7 @@ fn finish_layout(
                     _ => *relocate,
                 };
                 if !external && let Some(&target_offset) = symbol_offsets.get(target) {
-                    let delta = target_offset as i64 - *offset as i64;
+                    let delta = target_offset as i64 + *addend - *offset as i64;
                     if delta % 4 != 0
                         || !(-(1i64 << (bits + 1))..(1i64 << (bits + 1))).contains(&delta)
                     {
@@ -1316,7 +1324,7 @@ fn finish_layout(
                         symbol: target.to_string(),
                         section: String::new(),
                         kind: *kind,
-                        addend: 0,
+                        addend: *addend,
                         trailing: 0,
                         branch: false,
                     });
@@ -1630,6 +1638,24 @@ fn check_branch_target(target: &str) -> Result<(), RasError> {
 
 /// `call puts@PLT` names the symbol `puts`; the suffix selects the relocation,
 /// it is not part of the name.
+/// Splits a trailing decimal or hex `+N` or `-N` displacement off a symbol operand.
+fn split_addend(target: &str) -> Result<(&str, i64), RasError> {
+    let Some(at) = target.rfind(['+', '-']).filter(|&at| at > 0) else {
+        return Ok((target, 0));
+    };
+    let (symbol, rest) = target.split_at(at);
+    let digits = &rest[1..];
+    let magnitude = match digits.strip_prefix("0x") {
+        Some(hex) => i64::from_str_radix(hex, 16),
+        None => digits.parse::<i64>(),
+    };
+    match magnitude {
+        Ok(value) if rest.starts_with('-') => Ok((symbol, -value)),
+        Ok(value) => Ok((symbol, value)),
+        Err(_) => Ok((target, 0)),
+    }
+}
+
 fn reloc_symbol(target: &str) -> &str {
     target.split_once('@').map_or(target, |(name, _)| name)
 }
