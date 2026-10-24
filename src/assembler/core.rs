@@ -1749,6 +1749,11 @@ fn aarch64_compare_branch(
 
 /// Splits a trailing decimal or hex `+N` or `-N` displacement off a symbol operand.
 fn split_addend(target: &str) -> Result<(&str, i64), RasError> {
+    if target.is_empty() || target.starts_with(['+', '-']) {
+        return Err(RasError::EncodingError(format!(
+            "Invalid symbol operand: {target}"
+        )));
+    }
     let Some(at) = target.rfind(['+', '-']).filter(|&at| at > 0) else {
         return Ok((target, 0));
     };
