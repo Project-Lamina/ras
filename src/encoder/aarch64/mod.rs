@@ -537,13 +537,19 @@ impl AArch64Encoder {
                 base | (r(1)? << 5) | r(0)?
             }
             "fmul" => {
-                (if arg(0)?.starts_with('d') {
+                let (rd, kind) = data_reg(arg(0)?)?;
+                let (rn, kind_n) = data_reg(arg(1)?)?;
+                let (rm, kind_m) = data_reg(arg(2)?)?;
+                if !matches!(kind, DataKind::S | DataKind::D) || kind_n != kind || kind_m != kind {
+                    return Err(error("fmul takes three scalar registers of one size"));
+                }
+                (if kind == DataKind::D {
                     0x1e60_0800
                 } else {
                     0x1e20_0800
-                }) | (r(2)? << 16)
-                    | (r(1)? << 5)
-                    | r(0)?
+                }) | (rm << 16)
+                    | (rn << 5)
+                    | rd
             }
             "stp" | "ldp" => {
                 if p.len() < 3 {
