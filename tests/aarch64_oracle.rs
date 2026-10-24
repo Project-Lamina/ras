@@ -176,7 +176,7 @@ fn branches_to_global_same_section_labels_are_relocated() {
     assert_eq!(words[..2], [0x1400_0000, 0x5400_0000]);
 }
 
-fn assemble_words(asm: &str) -> Result<Vec<u32>, String> {
+fn assemble_bytes(asm: &str) -> Result<Vec<u8>, String> {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let output = std::env::temp_dir().join(format!(
         "ras_aarch64_words_{}_{}.o",
@@ -186,16 +186,47 @@ fn assemble_words(asm: &str) -> Result<Vec<u32>, String> {
     let result = Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(asm, &output)
-        .map_err(|e| e.to_string());
-    let words = result.and_then(|()| {
-        let bytes = std::fs::read(&output).map_err(|e| e.to_string())?;
-        Ok(text(&bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|()| std::fs::read(&output).map_err(|e| e.to_string()));
+    let _ = std::fs::remove_file(&output);
+    result
+}
+
+fn assemble_words(asm: &str) -> Result<Vec<u32>, String> {
+    assemble_bytes(asm).map(|bytes| {
+        text(&bytes)
             .chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect())
-    });
-    let _ = std::fs::remove_file(&output);
-    words
+            .collect()
+    })
+}
+
+/// (offset, relocation type, symbol name, addend) for every RELA entry in an object file.
+fn relocations(bytes: &[u8]) -> Vec<(u64, u32, String, i64)> {
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let shoff = u64_at(40) as usize;
+    let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+    let section = |i: usize| shoff + i * 64;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let header = section(i);
+        if u32_at(header + 4) != 4 {
+            continue;
+        }
+        let symtab = section(u32_at(header + 40) as usize);
+        let symbols = u64_at(symtab + 24) as usize;
+        let strings = u64_at(section(u32_at(symtab + 40) as usize) + 24) as usize;
+        let entries = u64_at(header + 24) as usize;
+        for entry in (entries..entries + u64_at(header + 32) as usize).step_by(24) {
+            let info = u64_at(entry + 8);
+            let name_at = strings + u32_at(symbols + (info >> 32) as usize * 24) as usize;
+            let name_len = bytes[name_at..].iter().position(|&b| b == 0).unwrap();
+            let name = String::from_utf8_lossy(&bytes[name_at..name_at + name_len]).into_owned();
+            out.push((u64_at(entry), info as u32, name, u64_at(entry + 16) as i64));
+        }
+    }
+    out
 }
 
 #[test]
@@ -426,4 +457,22 @@ fn loads_and_stores_reject_bad_base_and_data_registers() {
     ] {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
+}
+
+#[test]
+fn symbol_operands_keep_their_addend_in_relocations() {
+    let rel = relocations(
+        &assemble_bytes(".text\nbl sym+4\nadrp x0, sym+8\nadd x0, x0, :lo12:sym-4\n").unwrap(),
+    );
+    assert!(rel.contains(&(0, 283, "sym".into(), 4)), "{rel:?}");
+    assert!(rel.contains(&(4, 275, "sym".into(), 8)), "{rel:?}");
+    assert!(rel.contains(&(8, 277, "sym".into(), -4)), "{rel:?}");
+}
+
+#[test]
+fn local_branch_targets_honor_their_addend() {
+    assert_eq!(
+        assemble_words(".text\nb tgt+4\ntgt:\nret\n").unwrap(),
+        [0x1400_0002, 0xd65f_03c0]
+    );
 }
