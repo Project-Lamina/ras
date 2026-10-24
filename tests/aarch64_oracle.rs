@@ -258,3 +258,37 @@ fn add_sub_and_cmp_reject_out_of_range_or_unknown_shifts() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn add_sub_and_cmp_with_stack_pointer_use_the_extended_form() {
+    assert_eq!(
+        assemble_words(".text\nadd sp, sp, x1\n").unwrap(),
+        [0x8b21_63ff]
+    );
+    assert_eq!(
+        assemble_words(".text\nadd x0, sp, x1\n").unwrap(),
+        [0x8b21_63e0]
+    );
+    assert_eq!(
+        assemble_words(".text\nsub sp, x1, x2\n").unwrap(),
+        [0xcb22_603f]
+    );
+    assert_eq!(
+        assemble_words(".text\ncmp sp, x0\n").unwrap(),
+        [0xeb20_63ff]
+    );
+    assert_eq!(
+        assemble_words(".text\nadd wsp, w1, w2\n").unwrap(),
+        [0x0b22_403f]
+    );
+    assert_eq!(
+        assemble_words(".text\nadd x0, sp, x1, lsl #4\n").unwrap(),
+        [0x8b21_73e0]
+    );
+    for asm in [
+        ".text\nadd x0, sp, x1, lsr #2\n",
+        ".text\nadd x0, sp, x1, lsl #5\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
