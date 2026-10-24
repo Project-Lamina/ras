@@ -184,6 +184,13 @@ fn ret_with_stack_adjustment_matches_gas() {
 }
 
 #[test]
+fn movabs_immediates_match_gas() {
+    let asm = ".text\nmovabs $0x123456789abcdef0, %rcx\nmovabs $1, %rax\nmovabs $-2147483649, %r12\nmovabsq $9223372036854775807, %r9\nret\n";
+    let (output, reference) = oracle(asm, "movabs");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn rip_addends_and_prefixed_fixups_match_gas() {
     let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
     let (output, reference) = oracle(asm, "rip_addends");

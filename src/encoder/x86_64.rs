@@ -919,7 +919,7 @@ impl InstructionEncoder for X86_64Encoder {
                     }
                 }
             }
-            "movabsq" => {
+            "movabsq" | "movabs" => {
                 code = self.emit(self.encode_movabs(&inst.operands)?);
             }
             "call" | "jmp" => {
