@@ -4,6 +4,7 @@
 use crate::parser::SectionFlags;
 use crate::{error::RasError, parser::Section};
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+use std::collections::HashMap;
 use std::io::Write;
 
 /// Extra sections and metadata for [`ObjectWriter`] backends.
@@ -669,6 +670,591 @@ impl ObjectWriter for ElfWriter {
     }
 }
 
+const MH_MAGIC_64: u32 = 0xfeed_facf;
+const MH_OBJECT: u32 = 1;
+const LC_SEGMENT_64: u32 = 0x19;
+const LC_SYMTAB: u32 = 0x2;
+const LC_DYSYMTAB: u32 = 0xb;
+const LC_BUILD_VERSION: u32 = 0x32;
+const PLATFORM_MACOS: u32 = 1;
+/// Deployment target recorded in LC_BUILD_VERSION (11.0.0). arm64 Mach-O requires at least 11.0.
+const MACOS_MINOS: u32 = 11 << 16;
+const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+const CPU_SUBTYPE_X86_64_ALL: u32 = 3;
+const S_ZEROFILL: u32 = 0x1;
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
+const N_UNDF: u8 = 0x0;
+const N_EXT: u8 = 0x1;
+const N_ABS: u8 = 0x2;
+const N_SECT: u8 = 0xe;
+const N_PEXT: u8 = 0x10;
+const N_WEAK_DEF: u16 = 0x0080;
+const N_WEAK_REF: u16 = 0x0040;
+/// Absolute symbols carry N_NO_DEAD_STRIP in clang's output.
+const N_NO_DEAD_STRIP: u16 = 0x0020;
+const X86_64_RELOC_UNSIGNED: u32 = 0;
+const X86_64_RELOC_SIGNED: u32 = 1;
+const X86_64_RELOC_BRANCH: u32 = 2;
+const X86_64_RELOC_GOT_LOAD: u32 = 3;
+const X86_64_RELOC_SIGNED_1: u32 = 6;
+const X86_64_RELOC_SIGNED_2: u32 = 7;
+const X86_64_RELOC_SIGNED_4: u32 = 8;
+
+const NLIST_GROUP_LOCAL: u8 = 0;
+const NLIST_GROUP_EXTDEF: u8 = 1;
+const NLIST_GROUP_UNDEF: u8 = 2;
+
+fn macho_section_kind(name: &str) -> Option<(&'static str, &'static str, u32)> {
+    match name {
+        ".text" => Some((
+            "__TEXT",
+            "__text",
+            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        )),
+        ".rodata" => Some(("__TEXT", "__const", 0)),
+        ".data" => Some(("__DATA", "__data", 0)),
+        ".bss" => Some(("__DATA", "__bss", S_ZEROFILL)),
+        _ => None,
+    }
+}
+
+/// Mach-O requires a symbol to be private (never in the symbol table) when its name is
+/// `L`-prefixed and it is not global. Internal CFI labels are private as well.
+fn macho_is_private(sym: &ObjectSymbol) -> bool {
+    sym.attributes.internal || (sym.name.starts_with('L') && !sym.global && !sym.attributes.weak)
+}
+
+struct MachORelocSpec {
+    r_type: u32,
+    width_log2: u32,
+    pcrel: bool,
+}
+
+fn x86_64_reloc_spec(
+    kind: u32,
+    addend: i64,
+    trailing: usize,
+    branch: bool,
+) -> Result<MachORelocSpec, RasError> {
+    let abs = |width_log2| MachORelocSpec {
+        r_type: X86_64_RELOC_UNSIGNED,
+        width_log2,
+        pcrel: false,
+    };
+    let unsupported = || {
+        RasError::ObjectError(format!(
+            "x86_64 relocation kind {kind} (trailing {trailing}, branch {branch}) has no Mach-O equivalent"
+        ))
+    };
+    match kind {
+        1 => Ok(abs(3)),
+        10 => Ok(abs(2)),
+        12 => Ok(abs(1)),
+        14 => Ok(abs(0)),
+        2 | 4 if branch || kind == 4 => {
+            if trailing != 0 {
+                return Err(unsupported());
+            }
+            Ok(MachORelocSpec {
+                r_type: X86_64_RELOC_BRANCH,
+                width_log2: 2,
+                pcrel: true,
+            })
+        }
+        2 => {
+            // clang keeps the plain SIGNED type whenever the reference has an explicit
+            // addend; SIGNED_n is used only for a bare reference.
+            let explicit_zero = addend + 4 + trailing as i64 == 0;
+            let r_type = match trailing {
+                0 => X86_64_RELOC_SIGNED,
+                1 if explicit_zero => X86_64_RELOC_SIGNED_1,
+                2 if explicit_zero => X86_64_RELOC_SIGNED_2,
+                4 if explicit_zero => X86_64_RELOC_SIGNED_4,
+                1 | 2 | 4 => X86_64_RELOC_SIGNED,
+                _ => return Err(unsupported()),
+            };
+            Ok(MachORelocSpec {
+                r_type,
+                width_log2: 2,
+                pcrel: true,
+            })
+        }
+        42 if trailing == 0 => Ok(MachORelocSpec {
+            r_type: X86_64_RELOC_GOT_LOAD,
+            width_log2: 2,
+            pcrel: true,
+        }),
+        _ => Err(unsupported()),
+    }
+}
+
+struct MachONlist {
+    name: String,
+    n_type: u8,
+    n_sect: u8,
+    n_desc: u16,
+    n_value: u64,
+    group: u8,
+}
+
+struct MachOSection {
+    segment: &'static str,
+    name: &'static str,
+    flags: u32,
+    align: u64,
+    addr: u64,
+    data: Vec<u8>,
+    relocs: Vec<(u32, u32)>,
+}
+
+impl MachOSection {
+    fn is_zerofill(&self) -> bool {
+        self.flags & 0xff == S_ZEROFILL
+    }
+}
+
+enum MachORef {
+    Extern { index: u32, delta: i64 },
+    Section { ord: usize, value: u64 },
+}
+
+fn align_up(value: u64, align: u64) -> u64 {
+    value.div_ceil(align) * align
+}
+
+fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_name16(buf: &mut Vec<u8>, name: &str) {
+    let mut field = [0u8; 16];
+    field[..name.len()].copy_from_slice(name.as_bytes());
+    buf.extend_from_slice(&field);
+}
+
+fn write_field(data: &mut [u8], offset: usize, width: usize, value: i64) -> Result<(), RasError> {
+    let bits = width as u32 * 8;
+    let value = i128::from(value);
+    if value < -(1i128 << (bits - 1)) || value >= (1i128 << bits) {
+        return Err(RasError::ObjectError(format!(
+            "Mach-O relocation value {value} does not fit in {width} bytes"
+        )));
+    }
+    data[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    Ok(())
+}
+
+fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+    let (cputype, cpusubtype) = match req.target_arch {
+        TargetArchitecture::X86_64 => (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL),
+        other => {
+            return Err(RasError::ObjectError(format!(
+                "Mach-O objects are written for x86_64 only, not {other:?}"
+            )));
+        }
+    };
+
+    let mut source = req.sections.to_vec();
+    if source.is_empty() {
+        source.push(Section {
+            group: None,
+            name: ".text".into(),
+            flags: crate::parser::SectionFlags {
+                alloc: true,
+                exec: true,
+                write: false,
+            },
+            data: req.code.to_vec(),
+            alignment: 1,
+        });
+    }
+
+    let mut sections = Vec::with_capacity(source.len());
+    let mut section_ord: HashMap<&str, usize> = HashMap::new();
+    let mut addr = 0u64;
+    for s in &source {
+        let (segment, name, flags) = macho_section_kind(&s.name).ok_or_else(|| {
+            RasError::ObjectError(format!(
+                "Mach-O has no section for {}; supported sections are .text, .rodata, .data and .bss",
+                s.name
+            ))
+        })?;
+        if s.group.is_some() {
+            return Err(RasError::ObjectError(format!(
+                "Mach-O has no section groups; {} is in a comdat group",
+                s.name
+            )));
+        }
+        if !s.alignment.is_power_of_two() {
+            return Err(RasError::ObjectError(format!(
+                "section {} alignment {} is not a power of two",
+                s.name, s.alignment
+            )));
+        }
+        let align = s.alignment as u64;
+        let zerofill = flags & 0xff == S_ZEROFILL;
+        if zerofill && s.data.iter().any(|&b| b != 0) {
+            return Err(RasError::ObjectError(format!(
+                "{} holds initialized bytes but Mach-O zero-fill sections cannot",
+                s.name
+            )));
+        }
+        let flags = if flags & S_ATTR_PURE_INSTRUCTIONS != 0 && s.data.is_empty() {
+            flags & !S_ATTR_SOME_INSTRUCTIONS
+        } else {
+            flags
+        };
+        addr = align_up(addr, align);
+        section_ord.insert(s.name.as_str(), sections.len());
+        sections.push(MachOSection {
+            segment,
+            name,
+            flags,
+            align,
+            addr,
+            data: s.data.clone(),
+            relocs: Vec::new(),
+        });
+        addr += s.data.len() as u64;
+    }
+    let sections_end = addr;
+
+    let symbol_by_name = {
+        let mut map: HashMap<&str, &ObjectSymbol> = HashMap::new();
+        for sym in req.symbols {
+            map.entry(sym.name.as_str()).or_insert(sym);
+        }
+        map
+    };
+
+    let mut nlists: Vec<MachONlist> = Vec::new();
+    let mut index_of: HashMap<String, u32> = HashMap::new();
+    for sym in req.symbols.iter().filter(|s| !macho_is_private(s)) {
+        let ext = sym.global || sym.attributes.weak;
+        let nlist = match sym.section.as_str() {
+            "" => {
+                if !ext {
+                    return Err(RasError::ObjectError(format!(
+                        "local symbol {} is never defined",
+                        sym.name
+                    )));
+                }
+                MachONlist {
+                    name: sym.name.clone(),
+                    n_type: N_UNDF | N_EXT,
+                    n_sect: 0,
+                    n_desc: if sym.attributes.weak { N_WEAK_REF } else { 0 },
+                    n_value: 0,
+                    group: NLIST_GROUP_UNDEF,
+                }
+            }
+            "*COM*" => {
+                let (size, align) = sym.attributes.common.unwrap_or((0, sym.value));
+                if !align.is_power_of_two() || align > 1 << 15 {
+                    return Err(RasError::ObjectError(format!(
+                        "common symbol {} has unsupported alignment {align}",
+                        sym.name
+                    )));
+                }
+                MachONlist {
+                    name: sym.name.clone(),
+                    n_type: N_UNDF | N_EXT,
+                    n_sect: 0,
+                    n_desc: (align.trailing_zeros() as u16) << 8,
+                    n_value: size,
+                    group: NLIST_GROUP_UNDEF,
+                }
+            }
+            "*ABS*" => MachONlist {
+                name: sym.name.clone(),
+                n_type: N_ABS | if ext { N_EXT } else { 0 },
+                n_sect: 0,
+                n_desc: N_NO_DEAD_STRIP,
+                n_value: sym.value,
+                group: if ext {
+                    NLIST_GROUP_EXTDEF
+                } else {
+                    NLIST_GROUP_LOCAL
+                },
+            },
+            section => {
+                let ord = *section_ord.get(section).ok_or_else(|| {
+                    RasError::ObjectError(format!(
+                        "symbol {} is in unknown section {section}",
+                        sym.name
+                    ))
+                })?;
+                let mut n_type = N_SECT;
+                let mut n_desc = 0;
+                if ext {
+                    n_type |= N_EXT;
+                    if sym.attributes.hidden {
+                        n_type |= N_PEXT;
+                    }
+                    if sym.attributes.weak {
+                        n_desc |= N_WEAK_DEF;
+                    }
+                }
+                MachONlist {
+                    name: sym.name.clone(),
+                    n_type,
+                    n_sect: (ord + 1) as u8,
+                    n_desc,
+                    n_value: sections[ord].addr + sym.value,
+                    group: if ext {
+                        NLIST_GROUP_EXTDEF
+                    } else {
+                        NLIST_GROUP_LOCAL
+                    },
+                }
+            }
+        };
+        nlists.push(nlist);
+    }
+    for reloc in req.relocations {
+        let defined_here = symbol_by_name
+            .get(reloc.symbol.as_str())
+            .is_some_and(|s| !s.section.is_empty() && s.section != "*COM*" && s.section != "*ABS*");
+        if !defined_here && !nlists.iter().any(|n| n.name == reloc.symbol) {
+            nlists.push(MachONlist {
+                name: reloc.symbol.clone(),
+                n_type: N_UNDF | N_EXT,
+                n_sect: 0,
+                n_desc: 0,
+                n_value: 0,
+                group: NLIST_GROUP_UNDEF,
+            });
+        }
+    }
+    nlists.sort_by_key(|n| n.group);
+    for (i, nlist) in nlists.iter().enumerate() {
+        index_of.entry(nlist.name.clone()).or_insert(i as u32);
+    }
+    let count = |group| nlists.iter().filter(|n| n.group == group).count() as u32;
+    let (n_local, n_extdef, n_undef) = (
+        count(NLIST_GROUP_LOCAL),
+        count(NLIST_GROUP_EXTDEF),
+        count(NLIST_GROUP_UNDEF),
+    );
+
+    let atoms: Vec<(usize, u64, &str)> = req
+        .symbols
+        .iter()
+        .filter(|s| !macho_is_private(s))
+        .filter_map(|s| {
+            section_ord
+                .get(s.section.as_str())
+                .map(|&ord| (ord, s.value, s.name.as_str()))
+        })
+        .collect();
+
+    for reloc in req.relocations {
+        let ord = *section_ord.get(reloc.section.as_str()).ok_or_else(|| {
+            RasError::ObjectError(format!(
+                "relocation in section {} which has no Mach-O section",
+                reloc.section
+            ))
+        })?;
+        if sections[ord].is_zerofill() {
+            return Err(RasError::ObjectError(format!(
+                "relocation inside zero-fill section {}",
+                reloc.section
+            )));
+        }
+        let spec = x86_64_reloc_spec(reloc.kind, reloc.addend, reloc.trailing, reloc.branch)?;
+        // clang stores addend minus the immediate width, so the content bias stays 4.
+        let bias = if spec.pcrel { 4 } else { 0 };
+        let field = reloc.offset as u64;
+        let field_addr = sections[ord].addr + field;
+        let width = 1usize << spec.width_log2;
+        let addend = reloc.addend + bias;
+
+        let target = match symbol_by_name.get(reloc.symbol.as_str()) {
+            Some(sym) if sym.section.as_str() == "*ABS*" => {
+                return Err(RasError::ObjectError(format!(
+                    "relocation against absolute symbol {} is not supported for Mach-O",
+                    sym.name
+                )));
+            }
+            Some(sym)
+                if macho_is_private(sym) && !sym.section.is_empty() && sym.section != "*COM*" =>
+            {
+                let sym_ord = *section_ord.get(sym.section.as_str()).ok_or_else(|| {
+                    RasError::ObjectError(format!("symbol {} has unknown section", sym.name))
+                })?;
+                let atom = atoms
+                    .iter()
+                    .filter(|(o, value, _)| *o == sym_ord && *value <= sym.value)
+                    .max_by_key(|(_, value, _)| *value);
+                match atom {
+                    Some(&(_, atom_value, atom_name)) => MachORef::Extern {
+                        index: index_of[atom_name],
+                        delta: (sym.value - atom_value) as i64,
+                    },
+                    None => MachORef::Section {
+                        ord: sym_ord,
+                        value: sym.value,
+                    },
+                }
+            }
+            Some(sym) if macho_is_private(sym) => {
+                return Err(RasError::ObjectError(format!(
+                    "private symbol {} is undefined",
+                    sym.name
+                )));
+            }
+            _ => MachORef::Extern {
+                index: index_of[reloc.symbol.as_str()],
+                delta: 0,
+            },
+        };
+
+        let (symbol_num, is_extern, content) = match target {
+            MachORef::Extern { index, delta } => (index, true, addend + delta),
+            MachORef::Section {
+                ord: target_ord,
+                value,
+            } => {
+                let target_addr = sections[target_ord].addr as i64 + value as i64 + addend;
+                let content = if spec.pcrel {
+                    target_addr - (field_addr as i64 + 4)
+                } else {
+                    target_addr
+                };
+                ((target_ord + 1) as u32, false, content)
+            }
+        };
+        write_field(&mut sections[ord].data, reloc.offset, width, content)?;
+        let info = (symbol_num & 0x00ff_ffff)
+            | (u32::from(spec.pcrel) << 24)
+            | (spec.width_log2 << 25)
+            | (u32::from(is_extern) << 27)
+            | (spec.r_type << 28);
+        let r_address = u32::try_from(reloc.offset)
+            .map_err(|_| RasError::ObjectError("relocation offset too large".into()))?;
+        sections[ord].relocs.push((r_address, info));
+    }
+
+    let mut strtab = vec![0u8];
+    let mut symtab = Vec::with_capacity(nlists.len() * 16);
+    for nlist in &nlists {
+        put_u32(&mut symtab, strtab.len() as u32);
+        strtab.extend_from_slice(nlist.name.as_bytes());
+        strtab.push(0);
+        symtab.push(nlist.n_type);
+        symtab.push(nlist.n_sect);
+        symtab.extend_from_slice(&nlist.n_desc.to_le_bytes());
+        symtab.extend_from_slice(&nlist.n_value.to_le_bytes());
+    }
+
+    let ncmds = 4u32;
+    let sizeofcmds = (72 + 80 * sections.len() as u32) + 24 + 24 + 80;
+    let max_align = sections.iter().map(|s| s.align).max().unwrap_or(1);
+    let data_start = align_up(32 + u64::from(sizeofcmds), max_align);
+    let data_end = data_start + sections_end;
+    let file_offsets: Vec<u64> = sections.iter().map(|s| data_start + s.addr).collect();
+    let mut cursor = data_end;
+    let mut reloc_offsets = vec![0u64; sections.len()];
+    for (i, sec) in sections.iter().enumerate() {
+        if sec.relocs.is_empty() {
+            continue;
+        }
+        cursor = align_up(cursor, 8);
+        reloc_offsets[i] = cursor;
+        cursor += 8 * sec.relocs.len() as u64;
+    }
+    let symoff = align_up(cursor, 8);
+    let stroff = symoff + symtab.len() as u64;
+    let strsize = strtab.len() as u64;
+
+    let mut out = Vec::with_capacity((stroff + strsize) as usize);
+    put_u32(&mut out, MH_MAGIC_64);
+    put_u32(&mut out, cputype);
+    put_u32(&mut out, cpusubtype);
+    put_u32(&mut out, MH_OBJECT);
+    put_u32(&mut out, ncmds);
+    put_u32(&mut out, sizeofcmds);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+
+    put_u32(&mut out, LC_SEGMENT_64);
+    put_u32(&mut out, 72 + 80 * sections.len() as u32);
+    put_name16(&mut out, "");
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&sections_end.to_le_bytes());
+    out.extend_from_slice(&data_start.to_le_bytes());
+    out.extend_from_slice(&sections_end.to_le_bytes());
+    put_u32(&mut out, 7);
+    put_u32(&mut out, 7);
+    put_u32(&mut out, sections.len() as u32);
+    put_u32(&mut out, 0);
+    for (i, sec) in sections.iter().enumerate() {
+        put_name16(&mut out, sec.name);
+        put_name16(&mut out, sec.segment);
+        out.extend_from_slice(&sec.addr.to_le_bytes());
+        out.extend_from_slice(&(sec.data.len() as u64).to_le_bytes());
+        put_u32(&mut out, file_offsets[i] as u32);
+        put_u32(&mut out, sec.align.trailing_zeros());
+        put_u32(&mut out, reloc_offsets[i] as u32);
+        put_u32(&mut out, sec.relocs.len() as u32);
+        put_u32(&mut out, sec.flags);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+    }
+
+    put_u32(&mut out, LC_BUILD_VERSION);
+    put_u32(&mut out, 24);
+    put_u32(&mut out, PLATFORM_MACOS);
+    put_u32(&mut out, MACOS_MINOS);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+
+    put_u32(&mut out, LC_SYMTAB);
+    put_u32(&mut out, 24);
+    put_u32(&mut out, symoff as u32);
+    put_u32(&mut out, nlists.len() as u32);
+    put_u32(&mut out, stroff as u32);
+    put_u32(&mut out, strsize as u32);
+
+    put_u32(&mut out, LC_DYSYMTAB);
+    put_u32(&mut out, 80);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, n_local);
+    put_u32(&mut out, n_local);
+    put_u32(&mut out, n_extdef);
+    put_u32(&mut out, n_local + n_extdef);
+    put_u32(&mut out, n_undef);
+    for _ in 0..12 {
+        put_u32(&mut out, 0);
+    }
+
+    out.resize(data_start as usize, 0);
+    for (i, sec) in sections.iter().enumerate() {
+        if sec.is_zerofill() {
+            continue;
+        }
+        out.resize(file_offsets[i] as usize, 0);
+        out.extend_from_slice(&sec.data);
+    }
+    out.resize(data_end as usize, 0);
+    for sec in &sections {
+        if sec.relocs.is_empty() {
+            continue;
+        }
+        out.resize(align_up(out.len() as u64, 8) as usize, 0);
+        for &(r_address, info) in &sec.relocs {
+            put_u32(&mut out, r_address);
+            put_u32(&mut out, info);
+        }
+    }
+    out.resize(symoff as usize, 0);
+    out.extend_from_slice(&symtab);
+    out.extend_from_slice(&strtab);
+    Ok(out)
+}
+
 pub struct MachOWriter;
 
 impl Default for MachOWriter {
@@ -686,12 +1272,12 @@ impl MachOWriter {
 impl ObjectWriter for MachOWriter {
     fn write_object_file(
         &mut self,
-        _path: &std::path::Path,
-        _req: &ObjectWriteRequest<'_>,
+        path: &std::path::Path,
+        req: &ObjectWriteRequest<'_>,
     ) -> Result<(), RasError> {
-        Err(RasError::ObjectError(
-            "Mach-O object file generation not yet implemented".to_string(),
-        ))
+        let bytes = macho_object_bytes(req)?;
+        std::fs::write(path, bytes)
+            .map_err(|e| RasError::ObjectError(format!("Mach-O write: {}", e)))
     }
 }
 
