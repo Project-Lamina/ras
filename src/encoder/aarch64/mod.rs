@@ -56,6 +56,71 @@ fn add_sub_imm12(imm: i64, shift: Option<&str>) -> Result<(i64, u32), RasError> 
     }
 }
 
+fn gpr(reg: &str) -> Result<(u32, bool), RasError> {
+    let wide = match reg.as_bytes().first() {
+        Some(b'x' | b'w') => reg.starts_with('x'),
+        _ if matches!(reg, "sp" | "fp" | "lr") => true,
+        _ => return Err(error(format!("Expected a general purpose register: {reg}"))),
+    };
+    Ok((u32::from(register(reg)?), wide))
+}
+
+fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
+    let compare = op == "cmp";
+    let rn_index = usize::from(!compare);
+    let (min, max) = if compare { (2, 3) } else { (3, 4) };
+    if !(min..=max).contains(&p.len()) {
+        return Err(error(format!("Wrong operand count for {op}")));
+    }
+    let (lead, wide) = gpr(&p[0])?;
+    let rd = if compare { 31 } else { lead };
+    let (rn, rn_wide) = gpr(&p[rn_index])?;
+    if rn_wide != wide {
+        return Err(error(format!("Mismatched register widths for {op}")));
+    }
+    let sf = if wide { 0x8000_0000 } else { 0 };
+    let flags = match op {
+        "cmp" => 0x6000_0000,
+        "sub" => 0x4000_0000,
+        _ => 0,
+    };
+    let src = p[rn_index + 1].as_str();
+    let tail = p.get(rn_index + 2).map(|s| s.trim());
+    if src.starts_with('#') {
+        let (imm, shift) = add_sub_imm12(immediate(src)?, tail)?;
+        return Ok(0x1100_0000
+            | sf
+            | flags
+            | (shift << 22)
+            | ((imm as u32) << 10)
+            | (rn << 5)
+            | rd);
+    }
+    if is_stack_pointer(src) {
+        return Err(error(format!(
+            "{op} cannot take the stack pointer as an operand"
+        )));
+    }
+    let (rm, rm_wide) = gpr(src)?;
+    if rm_wide != wide {
+        return Err(error(format!("Mismatched register widths for {op}")));
+    }
+    if is_stack_pointer(&p[rn_index]) || (!compare && is_stack_pointer(&p[0])) {
+        let amount = extended_amount(tail)?;
+        let option = if wide { 0b011 } else { 0b010 };
+        return Ok(0x0b20_0000
+            | sf
+            | flags
+            | (rm << 16)
+            | (option << 13)
+            | (amount << 10)
+            | (rn << 5)
+            | rd);
+    }
+    let (kind, amount) = shifted_register(tail, wide)?;
+    Ok(0x0b00_0000 | sf | flags | (kind << 22) | (rm << 16) | (amount << 10) | (rn << 5) | rd)
+}
+
 fn is_stack_pointer(reg: &str) -> bool {
     matches!(reg, "sp" | "wsp")
 }
@@ -220,54 +285,7 @@ impl AArch64Encoder {
                     0x2a00_03e0 | sf | (r(1)? << 16) | dst
                 }
             }
-            "add" | "sub" | "cmp" => {
-                let compare = op == "cmp";
-                let rn = r(usize::from(!compare))?;
-                let rd = if compare { 31 } else { r(0)? };
-                let operand = arg(if compare { 1 } else { 2 })?;
-                let flags = if compare {
-                    0x6000_0000
-                } else if op == "sub" {
-                    0x4000_0000
-                } else {
-                    0
-                };
-                if operand.starts_with('#') {
-                    let (imm, shift) = add_sub_imm12(
-                        immediate(operand)?,
-                        p.get(if compare { 2 } else { 3 }).map(|s| s.trim()),
-                    )?;
-                    0x1100_0000 | sf | flags | (shift << 22) | ((imm as u32) << 10) | (rn << 5) | rd
-                } else {
-                    let shift = p.get(if compare { 2 } else { 3 }).map(|s| s.trim());
-                    let rn_text = arg(if compare { 0 } else { 1 })?;
-                    if is_stack_pointer(rn_text) || (!compare && is_stack_pointer(&p[0])) {
-                        let amount = extended_amount(shift)?;
-                        let option = if wide { 0b011 } else { 0b010 };
-                        let word = 0x0b20_0000
-                            | sf
-                            | flags
-                            | (u32::from(register(operand)?) << 16)
-                            | (option << 13)
-                            | (amount << 10)
-                            | (rn << 5)
-                            | rd;
-                        return Ok(word.to_le_bytes().to_vec());
-                    }
-                    let (kind, amount) = shifted_register(shift, wide)?;
-                    if op == "add" && wide && shift.is_none() {
-                        return Ok(encode_add_rrr(rd as u8, rn as u8, register(operand)?));
-                    }
-                    0x0b00_0000
-                        | sf
-                        | flags
-                        | (kind << 22)
-                        | (u32::from(register(operand)?) << 16)
-                        | (amount << 10)
-                        | (rn << 5)
-                        | rd
-                }
-            }
+            "add" | "sub" | "cmp" => encode_add_sub(op, p)?,
             "and" => {
                 return Ok(if wide {
                     encode_and_rrr(r(0)? as u8, r(1)? as u8, r(2)? as u8)
