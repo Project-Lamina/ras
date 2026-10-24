@@ -65,6 +65,26 @@ fn gpr(reg: &str) -> Result<(u32, bool), RasError> {
     Ok((u32::from(register(reg)?), wide))
 }
 
+/// Register numbers of the first `N` operands, all general purpose registers of one width.
+fn gpr_regs<const N: usize>(p: &[String]) -> Result<([u32; N], bool), RasError> {
+    let mut regs = [0; N];
+    let mut wide = false;
+    for (i, slot) in regs.iter_mut().enumerate() {
+        let reg = p.get(i).ok_or_else(|| error("Missing register operand"))?;
+        let (number, reg_wide) = gpr(reg)?;
+        if is_stack_pointer(reg) {
+            return Err(error(format!("Stack pointer not allowed here: {reg}")));
+        }
+        if i == 0 {
+            wide = reg_wide;
+        } else if reg_wide != wide {
+            return Err(error("Mismatched register widths"));
+        }
+        *slot = number;
+    }
+    Ok((regs, wide))
+}
+
 fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
     let compare = op == "cmp";
     let rn_index = usize::from(!compare);
@@ -200,11 +220,15 @@ impl AArch64Encoder {
         let r = |i| register(arg(i)?).map(u32::from);
         let wide = p.first().is_some_and(|s| s.starts_with('x') || s == "sp");
         let sf = if wide { 0x8000_0000 } else { 0 };
-        let rrr = |base: u32| -> Result<u32, RasError> {
-            Ok(base | sf | (r(2)? << 16) | (r(1)? << 5) | r(0)?)
-        };
         let word = match op {
-            "ret" => 0xd65f_0000 | (if p.is_empty() { 30 } else { r(0)? } << 5),
+            "ret" if p.is_empty() => 0xd65f_03c0,
+            "ret" => {
+                let ([rn], wide) = gpr_regs::<1>(p)?;
+                if !wide {
+                    return Err(error("ret takes a 64-bit register"));
+                }
+                0xd65f_0000 | (rn << 5)
+            }
             "nop" if p.is_empty() => 0xd503_201f,
             "yield" if p.is_empty() => 0xd503_203f,
             "wfe" if p.is_empty() => 0xd503_205f,
@@ -226,11 +250,12 @@ impl AArch64Encoder {
                 base | ((imm as u32) << 5)
             }
             "br" | "blr" => {
-                if matches!(arg(0)?, "sp" | "wsp") {
-                    return Err(error(format!("{op} cannot take the stack pointer")));
+                let ([rn], wide) = gpr_regs::<1>(p)?;
+                if !wide {
+                    return Err(error(format!("{op} takes a 64-bit register")));
                 }
                 let base = if op == "br" { 0xd61f_0000 } else { 0xd63f_0000 };
-                base | (r(0)? << 5)
+                base | (rn << 5)
             }
             "dmb" if arg(0)? == "sy" => 0xd503_3fbf,
             "movz" | "movk" => {
@@ -306,25 +331,55 @@ impl AArch64Encoder {
             }
             "add" | "sub" | "cmp" => encode_add_sub(op, p)?,
             "and" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
                 return Ok(if wide {
-                    encode_and_rrr(r(0)? as u8, r(1)? as u8, r(2)? as u8)
+                    encode_and_rrr(rd as u8, rn as u8, rm as u8)
                 } else {
-                    encode_and_w_rrr(r(0)? as u8, r(1)? as u8, r(2)? as u8)
+                    encode_and_w_rrr(rd as u8, rn as u8, rm as u8)
                 });
             }
-            "mul" => rrr(0x1b00_7c00)?,
+            "mul" | "sdiv" | "udiv" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
+                let base = match op {
+                    "mul" => 0x1b00_7c00,
+                    "sdiv" => 0x1ac0_0c00,
+                    _ => 0x1ac0_0800,
+                };
+                base | (if wide { 0x8000_0000 } else { 0 }) | (rm << 16) | (rn << 5) | rd
+            }
             "msub" => {
+                let ([rd, rn, rm, ra], wide) = gpr_regs::<4>(p)?;
                 return Ok(if wide {
-                    encode_msub(r(0)? as u8, r(1)? as u8, r(2)? as u8, r(3)? as u8)
+                    encode_msub(rd as u8, rn as u8, rm as u8, ra as u8)
                 } else {
-                    encode_msub_w(r(0)? as u8, r(1)? as u8, r(2)? as u8, r(3)? as u8)
+                    encode_msub_w(rd as u8, rn as u8, rm as u8, ra as u8)
                 });
             }
-            "sdiv" => rrr(0x1ac0_0c00)?,
-            "udiv" => rrr(0x1ac0_0800)?,
-            "cset" => 0x1a9f_07e0 | sf | ((condition(arg(1)?)? ^ 1) << 12) | r(0)?,
-            "csel" => rrr(0x1a80_0000)? | (condition(arg(3)?)? << 12),
-            "uxtb" => 0x5300_1c00 | (r(1)? << 5) | r(0)?,
+            "cset" => {
+                let ([rd], wide) = gpr_regs::<1>(p)?;
+                let cond = condition(arg(1)?)?;
+                if cond >= 14 {
+                    return Err(error(format!("Condition {} is invalid for cset", arg(1)?)));
+                }
+                0x1a9f_07e0 | (if wide { 0x8000_0000 } else { 0 }) | ((cond ^ 1) << 12) | rd
+            }
+            "csel" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
+                0x1a80_0000
+                    | (if wide { 0x8000_0000 } else { 0 })
+                    | (rm << 16)
+                    | (condition(arg(3)?)? << 12)
+                    | (rn << 5)
+                    | rd
+            }
+            "uxtb" => {
+                let (rd, _) = gpr(arg(0)?)?;
+                let (rn, source_wide) = gpr(arg(1)?)?;
+                if source_wide || is_stack_pointer(arg(1)?) {
+                    return Err(error("uxtb takes a 32-bit source register"));
+                }
+                0x5300_1c00 | (rn << 5) | rd
+            }
             "fmov" => {
                 let base = match (arg(0)?.chars().next(), arg(1)?.chars().next()) {
                     (Some('d'), Some('x')) => 0x9e67_0000,
