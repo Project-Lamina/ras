@@ -163,6 +163,13 @@ fn truncating_float_to_integer_conversions_match_gas() {
 }
 
 #[test]
+fn float_width_conversions_match_gas() {
+    let asm = ".text\ncvtsd2ss %xmm1, %xmm0\ncvtsd2ss %xmm9, %xmm10\ncvtsd2ss (%rsp), %xmm1\ncvtsd2ss 8(%r13), %xmm2\ncvtss2sd %xmm9, %xmm1\ncvtss2sd -4(%rbx), %xmm15\nret\n";
+    let (output, reference) = oracle(asm, "float_width");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn rip_addends_and_prefixed_fixups_match_gas() {
     let asm = ".text\n.globl entry\nentry: movq 120+external(%rip), %rax\nmovq external+120(%rip), %r9\ncmpw $3, -8+external(%rip)\nmovq 8+.Llocal(%rip), %rax\n.Llocal: ret\nleaq 4+entry(%rip), %r9\nlock addw $1, external(%rip)\nnotrack jmp *external(%rip)\npshufd $3, 16+external(%rip), %xmm9\nlock addw $1, %fs:8(%rax)\n";
     let (output, reference) = oracle(asm, "rip_addends");
