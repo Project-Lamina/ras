@@ -363,9 +363,13 @@ impl RasAssembler {
                 &global_symbols,
                 self.target_os == TargetOperatingSystem::MacOS,
             )?;
-            section.alignment = if self.target_arch == TargetArchitecture::Aarch64
-                && section.flags.exec
+            section.alignment = if (self.target_arch == TargetArchitecture::Aarch64
                 && self.target_os != TargetOperatingSystem::MacOS
+                || matches!(
+                    self.target_arch,
+                    TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+                ))
+                && section.flags.exec
             {
                 4
             } else {
@@ -539,7 +543,13 @@ impl RasAssembler {
 
     fn alignment(&self, value: usize, directive: &str) -> Result<usize, RasError> {
         let power = directive == ".p2align"
-            || directive == ".align" && self.target_arch == TargetArchitecture::Aarch64;
+            || directive == ".align"
+                && matches!(
+                    self.target_arch,
+                    TargetArchitecture::Aarch64
+                        | TargetArchitecture::Riscv32
+                        | TargetArchitecture::Riscv64
+                );
         let alignment = if power {
             1usize.checked_shl(u32::try_from(value).unwrap_or(u32::MAX))
         } else {
@@ -812,6 +822,17 @@ impl RasAssembler {
                         code.resize(code.len() + prefix, 0);
                         for _ in 0..padding / 4 {
                             code.extend_from_slice(&0xd503_201fu32.to_le_bytes());
+                        }
+                    } else if executable
+                        && matches!(
+                            self.target_arch,
+                            TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+                        )
+                    {
+                        let prefix = padding % 4;
+                        code.resize(code.len() + prefix, 0);
+                        for _ in 0..padding / 4 {
+                            code.extend_from_slice(&0x0000_0013u32.to_le_bytes());
                         }
                     } else if executable && self.target_arch == TargetArchitecture::X86_64 {
                         x86_nop_padding(&mut code, padding);
