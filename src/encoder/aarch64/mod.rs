@@ -348,7 +348,7 @@ pub(crate) fn condition(text: &str) -> Result<u32, RasError> {
 fn max_operands(op: &str) -> Option<usize> {
     Some(match op {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
-        "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" => 1,
+        "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
         "mov" | "uxtb" | "fmov" | "cset" => 2,
         "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" => 3,
         "csel" | "msub" => 4,
@@ -390,6 +390,13 @@ impl AArch64Encoder {
             "wfi" if p.is_empty() => 0xd503_207f,
             "sev" if p.is_empty() => 0xd503_209f,
             "sevl" if p.is_empty() => 0xd503_20bf,
+            "udf" => {
+                let imm = immediate(arg(0)?)?;
+                if !(0..=0xffff).contains(&imm) {
+                    return Err(error(format!("udf immediate out of range: {imm}")));
+                }
+                imm as u32
+            }
             "svc" | "hvc" | "smc" | "brk" | "hlt" => {
                 let imm = immediate(arg(0)?)?;
                 if !(0..=0xffff).contains(&imm) {
