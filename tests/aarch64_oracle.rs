@@ -350,3 +350,33 @@ fn w_register_mov_immediates_must_fit_in_32_bits() {
         [0x52b0_0000]
     );
 }
+
+#[test]
+fn data_processing_registers_must_share_one_width_and_avoid_sp() {
+    for asm in [
+        ".text\nmul x0, w1, x2\n",
+        ".text\nmul w0, x1, x2\n",
+        ".text\nsdiv x0, x1, w2\n",
+        ".text\nudiv w0, x1, x2\n",
+        ".text\nmsub w0, w1, w2, x3\n",
+        ".text\ncsel w0, x1, x2, eq\n",
+        ".text\nand w0, x1, x2\n",
+        ".text\nmul sp, x1, x2\n",
+        ".text\ncsel sp, x1, x2, eq\n",
+        ".text\ncset w0, al\n",
+        ".text\ncset w0, nv\n",
+        ".text\nuxtb w0, x1\n",
+        ".text\nret w0\n",
+        ".text\nret wzr\n",
+        ".text\nbr w0\n",
+        ".text\nblr w0\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+    assert_eq!(assemble_words(".text\nret\n").unwrap(), [0xd65f_03c0]);
+    assert_eq!(assemble_words(".text\nret xzr\n").unwrap(), [0xd65f_03e0]);
+    assert_eq!(
+        assemble_words(".text\ncset w0, hs\n").unwrap(),
+        [0x1a9f_37e0]
+    );
+}
