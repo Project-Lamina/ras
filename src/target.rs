@@ -50,10 +50,7 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
         ),
         // The COFF writer rejects anything but x86_64, see object.rs.
         Some(ObjectFormat::Coff) => arch == TargetArchitecture::X86_64,
-        // MachOWriter::write_object_file is a stub that always errors. Saying macOS is
-        // supported here just moves the failure to the end of a compile, with a message
-        // that does not explain it.
-        Some(ObjectFormat::MachO) => false,
+        Some(ObjectFormat::MachO) => arch == TargetArchitecture::X86_64,
         None => false,
     }
 }
@@ -156,8 +153,15 @@ mod tests {
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Linux
         ));
-        // macOS reports unsupported because MachOWriter::write_object_file is a stub that always errors.
+        assert!(is_object_file_supported(
+            TargetArchitecture::X86_64,
+            TargetOperatingSystem::MacOS
+        ));
         assert!(!is_object_file_supported(
+            TargetArchitecture::Aarch64,
+            TargetOperatingSystem::MacOS
+        ));
+        assert!(is_object_file_supported(
             TargetArchitecture::X86_64,
             TargetOperatingSystem::MacOS
         ));
@@ -182,7 +186,7 @@ mod tests {
     #[test]
     fn unsupported_object_target_says_why() {
         let macos =
-            unsupported_target_hint(TargetArchitecture::X86_64, TargetOperatingSystem::MacOS);
+            unsupported_target_hint(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS);
         assert!(macos.contains("Mach-O"), "unhelpful hint: {macos}");
 
         let win_arm =
