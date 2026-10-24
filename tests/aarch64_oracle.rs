@@ -175,3 +175,58 @@ fn branches_to_global_same_section_labels_are_relocated() {
     std::fs::remove_file(output).unwrap();
     assert_eq!(words[..2], [0x1400_0000, 0x5400_0000]);
 }
+
+fn assemble_words(asm: &str) -> Result<Vec<u32>, String> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let output = std::env::temp_dir().join(format!(
+        "ras_aarch64_words_{}_{}.o",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(asm, &output)
+        .map_err(|e| e.to_string());
+    let words = result.and_then(|()| {
+        let bytes = std::fs::read(&output).map_err(|e| e.to_string())?;
+        Ok(text(&bytes)
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    });
+    let _ = std::fs::remove_file(&output);
+    words
+}
+
+#[test]
+fn add_sub_and_cmp_immediates_encode_the_lsl_12_form() {
+    assert_eq!(
+        assemble_words(".text\nadd x0, x1, #4, lsl #12\n").unwrap(),
+        [0x9140_1020]
+    );
+    assert_eq!(
+        assemble_words(".text\nadd x0, x1, #4096\n").unwrap(),
+        [0x9140_0420]
+    );
+    assert_eq!(
+        assemble_words(".text\nsub w0, w1, #1, lsl #12\n").unwrap(),
+        [0x5140_0420]
+    );
+    assert_eq!(
+        assemble_words(".text\ncmp x0, #1, lsl #12\n").unwrap(),
+        [0xf140_041f]
+    );
+}
+
+#[test]
+fn add_sub_and_cmp_immediates_reject_unrepresentable_shifts() {
+    for asm in [
+        ".text\nadd x0, x1, #1, lsl #24\n",
+        ".text\nadd x0, x1, #1, lsr #12\n",
+        ".text\nadd x0, x1, #4097\n",
+        ".text\nadd x0, x1, #16781312\n",
+        ".text\nadd x0, x1, #4096, lsl #12\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
