@@ -767,6 +767,40 @@ mod tests {
         assert!(asm.instructions.is_empty());
     }
 
+    fn align_directives(parsed: &ParsedAssembly) -> Vec<&str> {
+        parsed
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Align { directive, .. } => Some(directive.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn darwin_reads_comm_and_align_operands_as_exponents() {
+        let src = ".comm x,8,8\n.comm y,8,3\n.comm z,8\n.align 4\n.balign 4\n";
+        let darwin = AssemblyParser::new()
+            .with_darwin_directives(true)
+            .parse(src)
+            .expect("parse");
+        assert_eq!(darwin.attributes["x"].common, Some((8, 256)));
+        assert_eq!(darwin.attributes["y"].common, Some((8, 8)));
+        assert_eq!(darwin.attributes["z"].common, Some((8, 1)));
+        assert_eq!(align_directives(&darwin), [".p2align", ".balign"]);
+    }
+
+    #[test]
+    fn elf_reads_comm_and_align_operands_as_byte_counts() {
+        let src = ".comm x,8,8\n.comm z,8\n.align 4\n.balign 4\n";
+        let elf = parse(src);
+        assert_eq!(elf.attributes["x"].common, Some((8, 8)));
+        assert_eq!(elf.attributes["z"].common, Some((8, 8)));
+        assert_eq!(align_directives(&elf), [".align", ".balign"]);
+        assert!(AssemblyParser::new().parse(".comm y,8,3\n").is_err());
+    }
+
     #[test]
     fn comments_and_blank_lines_are_skipped() {
         let asm = parse("# this is a comment\n// also a comment\n\n");
