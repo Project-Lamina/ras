@@ -89,6 +89,8 @@ pub struct AssemblyParser {
     attributes: HashMap<String, SymbolAttributes>,
     pending_globals: HashSet<String>,
     symbol_names: HashSet<String>,
+    /// Darwin reads the third `.comm` operand and `.align` as log2 exponents.
+    darwin: bool,
 }
 
 impl Default for AssemblyParser {
@@ -111,7 +113,13 @@ impl AssemblyParser {
             attributes: HashMap::new(),
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
+            darwin: false,
         }
+    }
+
+    pub fn with_darwin_directives(mut self, darwin: bool) -> Self {
+        self.darwin = darwin;
+        self
     }
 
     pub fn parse(mut self, text: &str) -> Result<ParsedAssembly, RasError> {
@@ -324,11 +332,22 @@ impl AssemblyParser {
                 }
                 let size = u64::try_from(parse_integer(fields[1])?)
                     .map_err(|_| RasError::ParseError("Invalid common size".into()))?;
-                let alignment = if let Some(value) = fields.get(2) {
-                    u64::try_from(parse_integer(value)?)
-                        .map_err(|_| RasError::ParseError("Invalid common alignment".into()))?
-                } else {
-                    size.next_power_of_two().min(16)
+                let alignment = match fields.get(2) {
+                    Some(value) => {
+                        let operand = u64::try_from(parse_integer(value)?)
+                            .map_err(|_| RasError::ParseError("Invalid common alignment".into()))?;
+                        if self.darwin {
+                            u32::try_from(operand)
+                                .ok()
+                                .and_then(|exponent| 1u64.checked_shl(exponent))
+                                .ok_or_else(|| {
+                                    RasError::ParseError("Invalid common alignment".into())
+                                })?
+                        } else {
+                            operand
+                        }
+                    }
+                    None => size.next_power_of_two().min(16),
                 };
                 if !alignment.is_power_of_two() {
                     return Err(RasError::ParseError("Invalid common alignment".into()));
@@ -455,9 +474,14 @@ impl AssemblyParser {
                         })
                     })
                     .transpose()?;
+                let directive = if self.darwin && parts[0] == ".align" {
+                    ".p2align"
+                } else {
+                    parts[0]
+                };
                 self.lines.push(Line::Align {
                     value,
-                    directive: parts[0].into(),
+                    directive: directive.into(),
                     fill,
                     max_skip,
                 });

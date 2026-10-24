@@ -229,6 +229,7 @@ impl RasAssembler {
     ) -> Result<(), RasError> {
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
         let parsed = AssemblyParser::new()
+            .with_darwin_directives(self.target_os == TargetOperatingSystem::MacOS)
             .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
 
