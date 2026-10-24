@@ -2041,6 +2041,26 @@ mod tests {
     }
 
     #[test]
+    fn macho_arm64_rejects_relocation_kinds_without_equivalent() {
+        for kind in [280, 260, 261] {
+            let reloc = ExternalReloc {
+                offset: 0,
+                symbol: "_f".into(),
+                section: ".text".into(),
+                kind,
+                addend: 0,
+                trailing: 0,
+                branch: false,
+            };
+            let sections = [arm64_section(".text", true, vec![0; 8])];
+            let symbols = [arm64_symbol("_f", true, ".text", 0)];
+            let err = macho_arm64_object(&sections, &symbols, &[reloc])
+                .expect_err("kind without a Mach-O equivalent");
+            assert!(err.to_string().contains(&format!("kind {kind}")), "{err}");
+        }
+    }
+
+    #[test]
     fn test_coff_amd64_write() {
         let mut w = CoffWriter::new();
         let code = [0xc3u8];
