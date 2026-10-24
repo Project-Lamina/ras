@@ -1623,6 +1623,132 @@ mod tests {
         );
     }
 
+    fn macho_text_section(data: Vec<u8>) -> Section {
+        Section {
+            group: None,
+            name: ".text".into(),
+            flags: SectionFlags {
+                alloc: true,
+                exec: true,
+                write: false,
+            },
+            data,
+            alignment: 16,
+        }
+    }
+
+    fn macho_object(
+        sections: &[Section],
+        symbols: &[ObjectSymbol],
+        relocations: &[ExternalReloc],
+    ) -> Result<Vec<u8>, RasError> {
+        let opts = ObjectWriteOptions::default();
+        macho_object_bytes(&ObjectWriteRequest {
+            code: &[],
+            sections,
+            symbols,
+            relocations,
+            target_arch: TargetArchitecture::X86_64,
+            target_os: TargetOperatingSystem::MacOS,
+            opts: &opts,
+        })
+    }
+
+    fn le32(buf: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn macho_x86_64_header_declares_relocatable_object() {
+        let sections = [macho_text_section(vec![0x31, 0xc0, 0xc3])];
+        let symbols = [ObjectSymbol {
+            attributes: Default::default(),
+            name: "_leaf".into(),
+            global: true,
+            section: ".text".into(),
+            value: 0,
+        }];
+        let buf = macho_object(&sections, &symbols, &[]).expect("write");
+        assert_eq!(le32(&buf, 0), 0xfeed_facf);
+        assert_eq!(le32(&buf, 4), 0x0100_0007);
+        assert_eq!(le32(&buf, 12), 1, "MH_OBJECT");
+        assert_eq!(
+            le32(&buf, 16),
+            4,
+            "segment, build version, symtab, dysymtab"
+        );
+    }
+
+    #[test]
+    fn macho_call_to_undefined_symbol_is_extern_branch() {
+        let sections = [macho_text_section(vec![0xe8, 0, 0, 0, 0, 0xc3])];
+        let symbols = [ObjectSymbol {
+            attributes: Default::default(),
+            name: "_caller".into(),
+            global: true,
+            section: ".text".into(),
+            value: 0,
+        }];
+        let relocations = [ExternalReloc {
+            offset: 1,
+            symbol: "_puts".into(),
+            section: ".text".into(),
+            kind: 4,
+            addend: -4,
+            trailing: 0,
+            branch: true,
+        }];
+        let buf = macho_object(&sections, &symbols, &relocations).expect("write");
+        let text_reloc = le32(&buf, 32 + 72 + 56) as usize;
+        let info = le32(&buf, text_reloc + 4);
+        assert_eq!(le32(&buf, text_reloc), 1, "r_address is the field offset");
+        assert_eq!(info & 0x00ff_ffff, 1, "undefined _puts follows _caller");
+        assert_eq!(info >> 24 & 1, 1, "pc-relative");
+        assert_eq!(info >> 27 & 1, 1, "extern");
+        assert_eq!(info >> 28, X86_64_RELOC_BRANCH);
+        assert!(
+            buf.windows(5).any(|w| w == b"_puts"),
+            "name written verbatim"
+        );
+    }
+
+    #[test]
+    fn macho_rejects_sections_and_relocations_it_cannot_express() {
+        let debug = Section {
+            name: ".debug_info".into(),
+            ..macho_text_section(vec![0])
+        };
+        let err = macho_object(&[debug], &[], &[]).expect_err("unmapped section");
+        assert!(
+            err.to_string().contains("no section for .debug_info"),
+            "{err}"
+        );
+
+        let bss = Section {
+            name: ".bss".into(),
+            flags: SectionFlags {
+                alloc: true,
+                exec: false,
+                write: true,
+            },
+            ..macho_text_section(vec![1, 0])
+        };
+        let err = macho_object(&[macho_text_section(vec![]), bss], &[], &[]).expect_err("bss");
+        assert!(err.to_string().contains("zero-fill"), "{err}");
+
+        let pc64 = ExternalReloc {
+            offset: 0,
+            symbol: "_f".into(),
+            section: ".text".into(),
+            kind: 24,
+            addend: 0,
+            trailing: 0,
+            branch: false,
+        };
+        let err = macho_object(&[macho_text_section(vec![0; 8])], &[], &[pc64]).expect_err("pc64");
+        assert!(err.to_string().contains("kind 24"), "{err}");
+    }
+
     #[test]
     fn test_coff_amd64_write() {
         let mut w = CoffWriter::new();
