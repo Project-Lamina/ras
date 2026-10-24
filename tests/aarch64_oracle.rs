@@ -380,3 +380,50 @@ fn data_processing_registers_must_share_one_width_and_avoid_sp() {
         [0x1a9f_37e0]
     );
 }
+
+#[test]
+fn fp_scalar_and_pair_loads_and_stores_encode_their_register_size() {
+    assert_eq!(
+        assemble_words(".text\nldr d0, [x1]\n").unwrap(),
+        [0xfd40_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\nstr s0, [sp, #4]\n").unwrap(),
+        [0xbd00_07e0]
+    );
+    assert_eq!(
+        assemble_words(".text\nldp d0, d1, [sp]\n").unwrap(),
+        [0x6d40_07e0]
+    );
+    assert_eq!(
+        assemble_words(".text\nldp d0, d1, [sp, #8]\n").unwrap(),
+        [0x6d40_87e0]
+    );
+    assert_eq!(
+        assemble_words(".text\nldp d0, d1, [x0], #32\n").unwrap(),
+        [0x6cc2_0400]
+    );
+}
+
+#[test]
+fn loads_and_stores_reject_bad_base_and_data_registers() {
+    for asm in [
+        ".text\nldr x0, [w1]\n",
+        ".text\nldr x0, [xzr, #8]\n",
+        ".text\nldr x0, [wsp]\n",
+        ".text\nldrb x9, [sp]\n",
+        ".text\nstrh x9, [sp]\n",
+        ".text\nldr sp, [x0]\n",
+        ".text\nldr wsp, [x0]\n",
+        ".text\nldr w9, [x0, #8, lsl #3]\n",
+        ".text\nldp x0, w1, [sp]\n",
+        ".text\nldp d0, s1, [sp]\n",
+        ".text\nldp d0, d1, [sp, #4]\n",
+        ".text\nldp x0, x1, [x0], #32\n",
+        ".text\nstp x0, x1, [x0, #-16]!\n",
+        ".text\nstp x0\n",
+        ".text\nldr\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
