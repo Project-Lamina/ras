@@ -649,6 +649,9 @@ impl AArch64Encoder {
                     None => fields.get(1).map_or(Ok(0), |s| immediate(s))?,
                 };
                 let writeback = pre || post;
+                if writeback && op.contains("ur") {
+                    return Err(error(format!("{op} has no writeback form")));
+                }
                 if writeback && matches!(kind, DataKind::W | DataKind::X) && rn == rt && rn != 31 {
                     return Err(error(format!("Unpredictable writeback for {op}")));
                 }
