@@ -77,6 +77,33 @@ impl AArch64Encoder {
         };
         let word = match op {
             "ret" => 0xd65f_0000 | (if p.is_empty() { 30 } else { r(0)? } << 5),
+            "nop" if p.is_empty() => 0xd503_201f,
+            "yield" if p.is_empty() => 0xd503_203f,
+            "wfe" if p.is_empty() => 0xd503_205f,
+            "wfi" if p.is_empty() => 0xd503_207f,
+            "sev" if p.is_empty() => 0xd503_209f,
+            "sevl" if p.is_empty() => 0xd503_20bf,
+            "svc" | "hvc" | "smc" | "brk" | "hlt" => {
+                let imm = immediate(arg(0)?)?;
+                if !(0..=0xffff).contains(&imm) {
+                    return Err(error(format!("{op} immediate out of range: {imm}")));
+                }
+                let base = match op {
+                    "svc" => 0xd400_0001,
+                    "hvc" => 0xd400_0002,
+                    "smc" => 0xd400_0003,
+                    "brk" => 0xd420_0000,
+                    _ => 0xd440_0000,
+                };
+                base | ((imm as u32) << 5)
+            }
+            "br" | "blr" => {
+                if matches!(arg(0)?, "sp" | "wsp") {
+                    return Err(error(format!("{op} cannot take the stack pointer")));
+                }
+                let base = if op == "br" { 0xd61f_0000 } else { 0xd63f_0000 };
+                base | (r(0)? << 5)
+            }
             "dmb" if arg(0)? == "sy" => 0xd503_3fbf,
             "movz" | "movk" => {
                 let imm = immediate(arg(1)?)?;
