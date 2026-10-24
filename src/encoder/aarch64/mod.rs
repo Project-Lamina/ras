@@ -170,6 +170,17 @@ pub(crate) fn condition(text: &str) -> Result<u32, RasError> {
     .ok_or_else(|| error(format!("Invalid condition: {text}")))
 }
 
+fn max_operands(op: &str) -> Option<usize> {
+    Some(match op {
+        "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
+        "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" => 1,
+        "mov" | "uxtb" | "fmov" | "cset" => 2,
+        "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" => 3,
+        "csel" | "msub" => 4,
+        _ => return None,
+    })
+}
+
 impl AArch64Encoder {
     pub fn new() -> Self {
         Self::default()
@@ -178,6 +189,9 @@ impl AArch64Encoder {
     fn encode(&self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         let op = inst.opcode.as_str();
         let p = &inst.operands;
+        if max_operands(op).is_some_and(|max| p.len() > max) {
+            return Err(error(format!("Too many operands for {op}")));
+        }
         let arg = |i: usize| {
             p.get(i)
                 .map(String::as_str)
@@ -373,6 +387,9 @@ impl AArch64Encoder {
                     .and_then(|s| s.strip_suffix(']'))
                     .ok_or_else(|| error("Expected base and immediate address"))?;
                 let fields: Vec<_> = inside.split(',').map(str::trim).collect();
+                if fields.len() > 2 {
+                    return Err(error(format!("Too many address operands for {op}")));
+                }
                 let rn = register(fields[0])?;
                 let offset = fields.get(1).map_or(Ok(0), |s| immediate(s))?;
                 let size = if op.ends_with('b') {

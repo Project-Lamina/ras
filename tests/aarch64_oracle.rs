@@ -310,3 +310,27 @@ fn add_sub_and_cmp_reject_mixed_register_widths_and_fp_operands() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn extra_operands_on_fixed_arity_instructions_are_rejected() {
+    for asm in [
+        ".text\nret x0, x1\n",
+        ".text\nbr x0, x1\n",
+        ".text\nsvc #0, #1\n",
+        ".text\ndmb sy, sy\n",
+        ".text\nmul x0, x1, x2, x3\n",
+        ".text\nmsub x0, x1, x2, x3, x4\n",
+        ".text\ncsel x0, x1, x2, eq, junk\n",
+        ".text\ncset x0, eq, x1\n",
+        ".text\nuxtb w0, w1, w2\n",
+        ".text\nmov x0, x1, lsl #3\n",
+        ".text\nmov x0, #1, lsl #16\n",
+        ".text\nmovz x0, #1, lsl #16, extra\n",
+        ".text\nmovk x0, #1, lsl #16, extra\n",
+        ".text\nfmul d0, d1, d2, d3\n",
+        ".text\nldr x9, [sp, #8, lsl #3]\n",
+        ".text\nldr w9, [sp, #8, lsl #3]\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
