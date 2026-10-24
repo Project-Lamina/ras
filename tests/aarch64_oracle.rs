@@ -773,3 +773,30 @@ fn post_indexed_loads_and_stores_reject_an_inner_offset() {
     }
     assert!(assemble_words(".text\nldr x9, [sp], #8\n").is_ok());
 }
+
+#[test]
+fn register_mov_requires_matching_widths_and_general_registers() {
+    assert_eq!(
+        assemble_words(".text\nmov x0, sp\n").unwrap(),
+        [0x9100_03e0]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov x0, x1\n").unwrap(),
+        [0xaa01_03e0]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov wsp, w1\n").unwrap(),
+        [0x1100_003f]
+    );
+    for asm in [
+        ".text\nmov sp, w0\n",
+        ".text\nmov w0, sp\n",
+        ".text\nmov x0, wsp\n",
+        ".text\nmov x0, wzr\n",
+        ".text\nmov w0, xzr\n",
+        ".text\nmov x0, d1\n",
+        ".text\nmov w0, s1\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}

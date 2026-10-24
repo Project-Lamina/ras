@@ -463,7 +463,6 @@ impl AArch64Encoder {
                     | r(0)?
             }
             "mov" => {
-                let dst = r(0)?;
                 let src = arg(1)?;
                 if src.starts_with('#') {
                     let raw = immediate(src)?;
@@ -476,10 +475,17 @@ impl AArch64Encoder {
                     let value = raw as u64 & if wide { u64::MAX } else { u32::MAX as u64 };
                     let words = mov_immediate_words(value, wide, dst);
                     return Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect());
-                } else if arg(0)? == "sp" || src == "sp" || arg(0)? == "wsp" || src == "wsp" {
-                    0x1100_0000 | sf | (r(1)? << 5) | dst
                 } else {
-                    0x2a00_03e0 | sf | (r(1)? << 16) | dst
+                    let (dst, dst_wide) = gpr(arg(0)?)?;
+                    let (source, source_wide) = gpr(src)?;
+                    if dst_wide != source_wide {
+                        return Err(error("Mismatched register widths for mov"));
+                    }
+                    if is_stack_pointer(arg(0)?) || is_stack_pointer(src) {
+                        0x1100_0000 | sf | (source << 5) | dst
+                    } else {
+                        0x2a00_03e0 | sf | (source << 16) | dst
+                    }
                 }
             }
             "add" | "sub" | "cmp" => encode_add_sub(op, p)?,
