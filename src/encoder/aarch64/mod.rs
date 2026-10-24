@@ -164,6 +164,100 @@ fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
     Ok(0x0b00_0000 | sf | flags | (kind << 22) | (rm << 16) | (amount << 10) | (rn << 5) | rd)
 }
 
+/// Logical-immediate fields `(N, immr, imms)` for a bitmask of `size` bits, or `None` when the
+/// value is not a repeated rotated run of ones.
+fn logical_immediate(value: u64, wide: bool) -> Option<(u32, u32, u32)> {
+    let size = if wide { 64 } else { 32 };
+    let mask = if size == 64 {
+        u64::MAX
+    } else {
+        (1 << size) - 1
+    };
+    let v = value & mask;
+    if v == 0 || v == mask {
+        return None;
+    }
+    let mut element = size;
+    while element > 2 {
+        let half = element / 2;
+        let low_mask = (1u64 << half) - 1;
+        if v & low_mask != (v >> half) & low_mask {
+            break;
+        }
+        element = half;
+    }
+    let element_mask = if element == 64 {
+        u64::MAX
+    } else {
+        (1u64 << element) - 1
+    };
+    let pattern = v & element_mask;
+    let ones = pattern.count_ones();
+    let rotate = |x: u64, r: u32| ((x >> r) | (x << (element - r))) & element_mask;
+    let immr = (0..element).find(|&r| rotate((1u64 << ones) - 1, r) == pattern)?;
+    let n = u32::from(element == 64);
+    let imms = ((!(2 * element - 1)) & 0x3f) | (ones - 1);
+    Some((n, immr, imms))
+}
+
+fn encode_logical(op: &str, p: &[String]) -> Result<u32, RasError> {
+    let flag_setting = op == "ands" || op == "tst";
+    let rn_index = usize::from(op != "tst");
+    let (min, max) = if op == "tst" { (2, 2) } else { (3, 3) };
+    if !(min..=max).contains(&p.len()) {
+        return Err(error(format!("Wrong operand count for {op}")));
+    }
+    let (lead, wide) = gpr(&p[0])?;
+    let rd = if flag_setting && op == "tst" {
+        31
+    } else {
+        lead
+    };
+    let (rn, rn_wide) = gpr(&p[rn_index])?;
+    if rn_wide != wide || is_stack_pointer(&p[rn_index]) {
+        return Err(error(format!("Invalid register operand for {op}")));
+    }
+    let src = p[rn_index + 1].as_str();
+    let (base_imm, base_reg) = match op {
+        "and" | "ands" | "tst" => (0x1200_0000u32, 0x0a00_0000u32),
+        "orr" => (0x3200_0000, 0x2a00_0000),
+        _ => (0x5200_0000, 0x4a00_0000),
+    };
+    let base_imm = if wide {
+        base_imm | 0x8000_0000
+    } else {
+        base_imm
+    };
+    let base_reg = if wide {
+        base_reg | 0x8000_0000
+    } else {
+        base_reg
+    };
+    let flags_imm = if flag_setting { 0x6000_0000 } else { 0 };
+    let flags_reg = if flag_setting { 0x6000_0000 } else { 0 };
+    if src.starts_with('#') {
+        let value = immediate(src)?;
+        if !wide && !(-(1 << 31)..=u32::MAX as i64).contains(&value) {
+            return Err(error(format!(
+                "Immediate out of range for {op} on a w register: {src}"
+            )));
+        }
+        let (n, immr, imms) = logical_immediate(value as u64, wide)
+            .ok_or_else(|| error(format!("Immediate is not a valid logical immediate: {src}")))?;
+        return Ok(base_imm | flags_imm | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd);
+    }
+    let (rm, rm_wide) = gpr(src)?;
+    if rm_wide != wide || is_stack_pointer(src) {
+        return Err(error(format!("Invalid register operand for {op}")));
+    }
+    if p.get(rn_index + 2).is_some() {
+        return Err(error(format!(
+            "Shifted logical operands are not supported for {op}"
+        )));
+    }
+    Ok(base_reg | flags_reg | (rm << 16) | (rn << 5) | rd)
+}
+
 fn is_stack_pointer(reg: &str) -> bool {
     matches!(reg, "sp" | "wsp")
 }
@@ -353,14 +447,7 @@ impl AArch64Encoder {
                 }
             }
             "add" | "sub" | "cmp" => encode_add_sub(op, p)?,
-            "and" => {
-                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
-                return Ok(if wide {
-                    encode_and_rrr(rd as u8, rn as u8, rm as u8)
-                } else {
-                    encode_and_w_rrr(rd as u8, rn as u8, rm as u8)
-                });
-            }
+            "and" | "orr" | "eor" | "ands" | "tst" => encode_logical(op, p)?,
             "mul" | "sdiv" | "udiv" => {
                 let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
                 let base = match op {

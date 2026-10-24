@@ -564,3 +564,63 @@ fn compare_and_test_branches_reject_bad_operands() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn logical_immediates_encode_as_bitmask_fields() {
+    assert_eq!(
+        assemble_words(".text\nand x0, x1, #0xff\n").unwrap(),
+        [0x9240_1c20]
+    );
+    assert_eq!(
+        assemble_words(".text\norr w0, w1, #0x80000000\n").unwrap(),
+        [0x3201_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\neor x0, x1, #0x5555555555555555\n").unwrap(),
+        [0xd200_f020]
+    );
+    assert_eq!(
+        assemble_words(".text\nands w0, w1, #0x1\n").unwrap(),
+        [0x7200_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\ntst x0, #0xff\n").unwrap(),
+        [0xf240_1c1f]
+    );
+}
+
+#[test]
+fn logical_register_forms_encode_orr_eor_ands_and_tst() {
+    assert_eq!(
+        assemble_words(".text\norr x0, x1, x2\n").unwrap(),
+        [0xaa02_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\neor w0, w1, w2\n").unwrap(),
+        [0x4a02_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\nands x0, x1, x2\n").unwrap(),
+        [0xea02_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\ntst w0, w1\n").unwrap(),
+        [0x6a01_001f]
+    );
+}
+
+#[test]
+fn logical_immediates_reject_values_that_cannot_be_encoded() {
+    for asm in [
+        ".text\nand x0, x1, #0\n",
+        ".text\nand x0, x1, #-1\n",
+        ".text\nand w0, w1, #0x100000000\n",
+        ".text\nand w0, w1, #0x101\n",
+        ".text\norr x0, x1, #0x12345\n",
+        ".text\nand x0, sp, #1\n",
+        ".text\nand x0, x1, w2\n",
+        ".text\ntst x0, #0\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
