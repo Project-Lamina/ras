@@ -351,7 +351,8 @@ fn max_operands(op: &str) -> Option<usize> {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
         "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
         "mov" | "uxtb" | "sxtw" | "fmov" | "cset" => 2,
-        "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" => 3,
+        "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" | "lsl" | "lsr" | "asr" | "ror" | "lslv" | "lsrv"
+        | "asrv" | "rorv" => 3,
         "csel" | "msub" | "sbfx" | "ubfx" => 4,
         _ => return None,
     })
@@ -547,6 +548,53 @@ impl AArch64Encoder {
                     return Err(error("sxtw takes a 64-bit destination register"));
                 }
                 0x9340_7c00 | (rn << 5) | rd
+            }
+            "lsl" | "lsr" | "asr" | "ror" if arg(2)?.starts_with('#') => {
+                let ([rd, rn], wide) = gpr_regs::<2>(p)?;
+                let size = if wide { 64 } else { 32 };
+                let amount = immediate(arg(2)?)?;
+                if !(0..size).contains(&amount) {
+                    return Err(error(format!(
+                        "Shift amount out of range for {op}: {amount}"
+                    )));
+                }
+                let sf = if wide { 0x8000_0000u32 } else { 0 };
+                let n = if wide { 0x0040_0000 } else { 0 };
+                let amount = amount as u32;
+                match op {
+                    "ror" => {
+                        let base = if wide { 0x93c0_0000u32 } else { 0x1380_0000 };
+                        base | (rn << 16) | (amount << 10) | (rn << 5) | rd
+                    }
+                    "lsl" => {
+                        let immr = (size as u32 - amount) % size as u32;
+                        let imms = size as u32 - 1 - amount;
+                        0x5300_0000 | sf | n | (immr << 16) | (imms << 10) | (rn << 5) | rd
+                    }
+                    _ => {
+                        let base = if op == "asr" {
+                            0x1300_0000
+                        } else {
+                            0x5300_0000
+                        };
+                        base | sf | n | (amount << 16) | ((size as u32 - 1) << 10) | (rn << 5) | rd
+                    }
+                }
+            }
+            "lsl" | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
+                let kind = match op {
+                    "lslv" | "lsl" => 0,
+                    "lsrv" | "lsr" => 1,
+                    "asrv" | "asr" => 2,
+                    _ => 3,
+                };
+                0x1ac0_2000
+                    | (if wide { 0x8000_0000 } else { 0 })
+                    | (rm << 16)
+                    | (kind << 10)
+                    | (rn << 5)
+                    | rd
             }
             "sbfx" | "ubfx" => {
                 let (rd, rd_wide) = gpr(arg(0)?)?;

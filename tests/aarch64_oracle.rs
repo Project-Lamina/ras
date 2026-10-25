@@ -850,3 +850,18 @@ fn bitfield_extracts_cover_lsb_and_width() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn shifts_take_both_immediate_and_register_amounts() {
+    assert_eq!(
+        assemble_words(".text\nlsl x9, x11, #56\nasr x12, x10, #56\nlsr w2, w3, #31\n").unwrap(),
+        [0xd348_1d69, 0x9378_fd4c, 0x531f_7c62]
+    );
+    assert_eq!(
+        assemble_words(".text\nlsl x0, x1, x2\nasrv w3, w4, w5\nrorv x12, x13, x14\n").unwrap(),
+        [0x9ac2_2020, 0x1ac5_2883, 0x9ace_2dac]
+    );
+    for asm in [".text\nlsl x0, x1, #64\n", ".text\nasr w0, w1, #32\n"] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
