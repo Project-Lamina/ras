@@ -163,6 +163,13 @@ fn truncating_float_to_integer_conversions_match_gas() {
 }
 
 #[test]
+fn scalar_float_comparisons_match_gas() {
+    let asm = ".text\nucomiss %xmm0, %xmm1\nucomiss %xmm15, %xmm3\ncomiss %xmm2, %xmm7\nucomiss (%rax), %xmm0\ncomiss 8(%rbp,%rcx,4), %xmm9\nucomisd %xmm0, %xmm1\ncomisd %xmm4, %xmm5\nret\n";
+    let (output, reference) = oracle(asm, "scalar_cmp");
+    assert_eq!(text(&output), text(&reference));
+}
+
+#[test]
 fn float_width_conversions_match_gas() {
     let asm = ".text\ncvtsd2ss %xmm1, %xmm0\ncvtsd2ss %xmm9, %xmm10\ncvtsd2ss (%rsp), %xmm1\ncvtsd2ss 8(%r13), %xmm2\ncvtss2sd %xmm9, %xmm1\ncvtss2sd -4(%rbx), %xmm15\nret\n";
     let (output, reference) = oracle(asm, "float_width");
