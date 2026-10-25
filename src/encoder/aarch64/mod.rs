@@ -111,7 +111,7 @@ fn gpr_regs<const N: usize>(p: &[String]) -> Result<([u32; N], bool), RasError> 
 }
 
 fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
-    let compare = op == "cmp";
+    let compare = op == "cmp" || op == "cmn";
     let rn_index = usize::from(!compare);
     let (min, max) = if compare { (2, 3) } else { (3, 4) };
     if !(min..=max).contains(&p.len()) {
@@ -127,6 +127,7 @@ fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
     let flags = match op {
         "cmp" => 0x6000_0000,
         "sub" => 0x4000_0000,
+        "cmn" => 0x2000_0000,
         _ => 0,
     };
     let src = p[rn_index + 1].as_str();
@@ -495,7 +496,7 @@ impl AArch64Encoder {
                     }
                 }
             }
-            "add" | "sub" | "cmp" => encode_add_sub(op, p)?,
+            "add" | "sub" | "cmp" | "cmn" => encode_add_sub(op, p)?,
             "and" | "orr" | "eor" | "ands" | "tst" => encode_logical(op, p)?,
             "mul" | "sdiv" | "udiv" => {
                 let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;

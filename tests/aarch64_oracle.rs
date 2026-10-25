@@ -823,3 +823,14 @@ fn udf_encodes_bare_immediate() {
     assert!(assemble_words(".text\nudf\n").is_err());
     assert!(assemble_words(".text\nudf #0, #1\n").is_err());
 }
+
+#[test]
+fn compare_negative_encodes_as_flag_setting_add() {
+    assert_eq!(
+        assemble_words(".text\ncmn x0, x1\ncmn w2, w3\ncmn x4, #16\ncmn x7, x8, lsl #3\n").unwrap(),
+        [0xab01_001f, 0x2b03_005f, 0xb100_409f, 0xab08_0cff]
+    );
+    for asm in [".text\ncmn x0, w1\n", ".text\ncmn x0, #4097\n"] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
