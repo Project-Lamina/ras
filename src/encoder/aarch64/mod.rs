@@ -712,6 +712,9 @@ impl AArch64Encoder {
                 if kind != kind2 {
                     return Err(error(format!("Mismatched pair register types for {op}")));
                 }
+                if op == "ldp" && t1 == t2 {
+                    return Err(error("ldp needs two different transfer registers"));
+                }
                 let gpr_pair = matches!(kind, DataKind::W | DataKind::X);
                 if gpr_pair && (pre || post) && rn != 31 && (t1 == rn || t2 == rn) {
                     return Err(error(format!("Unpredictable writeback for {op}")));

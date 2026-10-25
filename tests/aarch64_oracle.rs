@@ -607,6 +607,26 @@ fn int_float_conversions_encode_every_width_pair() {
 }
 
 #[test]
+fn ldp_rejects_equal_transfer_registers() {
+    for asm in [
+        "ldp x0, x0, [sp]",
+        "ldp xzr, xzr, [sp]",
+        "ldp w0, w0, [sp]",
+        "ldp s0, s0, [sp, #8]",
+        "ldp d0, d0, [sp, #8]",
+    ] {
+        assert!(
+            assemble_words(&format!(".text\n{asm}\n")).is_err(),
+            "accepted {asm:?}"
+        );
+    }
+    assert_eq!(
+        assemble_words(".text\nstp x0, x0, [sp]\n").unwrap(),
+        [0xa900_03e0]
+    );
+}
+
+#[test]
 fn branch_targets_must_be_symbols() {
     for asm in [
         ".text\nbl x0\n",
