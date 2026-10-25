@@ -1047,8 +1047,7 @@ impl RasAssembler {
                                 offset: current_offset,
                                 target: symbol.to_string(),
                                 addend,
-                                word: 0x9000_0000
-                                    | u32::from(crate::encoder::aarch64::register(&operands[0])?),
+                                word: 0x9000_0000 | aarch64_adrp_destination(&operands[0])?,
                                 bits: 0,
                                 kind,
                                 relocate: true,
@@ -1860,6 +1859,15 @@ fn aarch64_compare_branch(
 }
 
 /// Splits a trailing decimal or hex `+N` or `-N` displacement off a symbol operand.
+fn aarch64_adrp_destination(reg: &str) -> Result<u32, RasError> {
+    match crate::encoder::aarch64::gpr(reg)? {
+        (rd, true) if reg != "sp" => Ok(rd),
+        _ => Err(RasError::EncodingError(format!(
+            "adrp takes a 64-bit general register: {reg}"
+        ))),
+    }
+}
+
 fn is_aarch64_branch_symbol(symbol: &str) -> bool {
     !symbol.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | ':'))
         && crate::encoder::aarch64::register(symbol).is_err()
