@@ -566,6 +566,26 @@ fn compare_and_test_branches_reject_bad_operands() {
 }
 
 #[test]
+fn branch_targets_must_be_symbols() {
+    for asm in [
+        ".text\nbl x0\n",
+        ".text\nb w0\n",
+        ".text\nb sp\n",
+        ".text\nb lr\n",
+        ".text\nbl xzr\n",
+        ".text\nbl 4\n",
+        ".text\nb 4\n",
+        ".text\nb :got:x\nx:\n",
+        ".text\nb.eq x0\nx:\n",
+        ".text\nbl sp, x\nx:\n",
+        ".text\nb x, x\nx:\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+    assert_eq!(assemble_words(".text\nbl x\nx:\n").unwrap(), [0x9400_0001]);
+}
+
+#[test]
 fn logical_immediates_encode_as_bitmask_fields() {
     assert_eq!(
         assemble_words(".text\nand x0, x1, #0xff\n").unwrap(),
