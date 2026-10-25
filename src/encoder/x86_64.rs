@@ -756,6 +756,11 @@ impl X86_64Encoder {
             ));
         };
         let src_bits = match (src_bits, src_gpr) {
+            (Some(bits), Some(gpr)) if gpr.width != bits => {
+                return Err(RasError::EncodingError(
+                    "movzx: source register width does not match mnemonic".into(),
+                ));
+            }
             (Some(bits), _) => bits,
             (None, Some(gpr)) => gpr.width,
             (None, None) => {
