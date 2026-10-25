@@ -155,11 +155,7 @@ impl X86_64Encoder {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("mov requires two operands".into()));
         }
-        let (src, dst) = if operands[1].starts_with('$') {
-            (&operands[1], &operands[0])
-        } else {
-            (&operands[0], &operands[1])
-        };
+        let (src, dst) = (&operands[0], &operands[1]);
         if let Some(imm_text) = src.trim().strip_prefix('$') {
             let imm = parse_imm(imm_text)?;
             let (rm, gpr) = self.parse_rm(dst, false)?;
