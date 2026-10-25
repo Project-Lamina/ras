@@ -426,6 +426,36 @@ impl RiscVEncoder {
     }
 
     /// Store: `mnemonic rs2, offset(rs1)`
+    /// `li rd, imm`: the shortest lui/addi(w)/slli/srli sequence for the value.
+    fn encode_li(&self, ops: &[String]) -> Result<Vec<u8>, RasError> {
+        if ops.len() != 2 {
+            return Err(RasError::EncodingError(
+                "LI requires 2 operands: rd, imm".to_string(),
+            ));
+        }
+        let rd = self.parse_register(&ops[0])?;
+        let value = parse_li_immediate(&ops[1])?;
+        if !self.rv64 && !fits_signed(value as i128, 32) {
+            return Err(RasError::EncodingError(format!(
+                "LI immediate {value} does not fit 32 bits on RV32"
+            )));
+        }
+        let mut bytes = Vec::new();
+        let mut source = 0u8;
+        for step in li_expansion(value, self.rv64) {
+            let word = match step {
+                LiStep::Lui(imm) => Self::u_type(imm, rd, 0x37),
+                LiStep::Addi(imm) => Self::i_type(imm, source, 0x0, rd, 0x13),
+                LiStep::Addiw(imm) => Self::i_type(imm, source, 0x0, rd, 0x1B),
+                LiStep::Slli(shamt) => Self::i_type(shamt as i32, source, 0x1, rd, 0x13),
+                LiStep::Srli(shamt) => Self::i_type(shamt as i32, source, 0x5, rd, 0x13),
+            };
+            bytes.extend(Self::emit(word));
+            source = rd;
+        }
+        Ok(bytes)
+    }
+
     fn encode_store(&self, ops: &[String], funct3: u8) -> Result<Vec<u8>, RasError> {
         if ops.len() != 2 {
             return Err(RasError::EncodingError(
@@ -463,6 +493,136 @@ fn expand_alu_pseudo(
         _ => return Ok(None),
     };
     Ok(Some((base, operands)))
+}
+
+/// One instruction of a `li` expansion, in emission order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiStep {
+    Lui(i32),
+    Addi(i32),
+    Addiw(i32),
+    Slli(u32),
+    Srli(u32),
+}
+
+fn sign_extend(value: u64, bits: u32) -> i64 {
+    let shift = 64 - bits;
+    ((value << shift) as i64) >> shift
+}
+
+fn fits_signed(value: i128, bits: u32) -> bool {
+    let half = 1i128 << (bits - 1);
+    (-half..half).contains(&value)
+}
+
+fn li_base(value: i64, rv64: bool) -> Vec<LiStep> {
+    if fits_signed(value as i128, 32) {
+        let hi20 = ((value + 0x800) >> 12) & 0xF_FFFF;
+        let lo12 = sign_extend(value as u64, 12);
+        let mut steps = Vec::new();
+        if hi20 != 0 {
+            steps.push(LiStep::Lui(hi20 as i32));
+        }
+        if lo12 != 0 || hi20 == 0 {
+            steps.push(if rv64 && hi20 != 0 {
+                LiStep::Addiw(lo12 as i32)
+            } else {
+                LiStep::Addi(lo12 as i32)
+            });
+        }
+        return steps;
+    }
+    let lo12 = sign_extend(value as u64, 12);
+    let hi52 = (value as u64).wrapping_add(0x800) >> 12;
+    let shift = 12 + hi52.trailing_zeros();
+    let hi = sign_extend(hi52 >> (shift - 12), 64 - shift);
+    let mut steps = li_base(hi, rv64);
+    steps.push(LiStep::Slli(shift));
+    if lo12 != 0 {
+        steps.push(LiStep::Addi(lo12 as i32));
+    }
+    steps
+}
+
+fn li_sequence(value: i64, rv64: bool) -> Vec<LiStep> {
+    let mut best = li_base(value, rv64);
+    if value > 0 && best.len() > 2 {
+        let lz = value.leading_zeros();
+        for fill in [(1u64 << lz) - 1, 0] {
+            let shifted = ((value as u64) << lz) | fill;
+            let mut cand = li_base(shifted as i64, rv64);
+            cand.push(LiStep::Srli(lz));
+            if cand.len() < best.len() {
+                best = cand;
+            }
+        }
+    }
+    if value != 0 {
+        let tz = value.trailing_zeros();
+        if tz > 0 {
+            let shifted = value >> tz;
+            let mut cand = li_sequence(shifted, rv64);
+            cand.push(LiStep::Slli(tz));
+            if cand.len() < best.len()
+                || (cand.len() == best.len() && fits_signed(shifted as i128, 6))
+            {
+                best = cand;
+            }
+        }
+    }
+    best
+}
+
+fn li_expansion(value: i64, rv64: bool) -> Vec<LiStep> {
+    let mut best = li_sequence(value, rv64);
+    if value <= 0 || fits_signed(value as i128, 32) {
+        return best;
+    }
+    let lo12 = sign_extend(value as u64, 12);
+    let rest = value as i128 - lo12 as i128;
+    if rest != 0 && rest.trailing_zeros() >= 12 {
+        let tz = rest.trailing_zeros();
+        let upper = rest >> tz;
+        if fits_signed(upper, 20) {
+            let mut cand = vec![LiStep::Lui(upper as i32)];
+            if tz > 12 {
+                cand.push(LiStep::Slli(tz - 12));
+            }
+            if lo12 != 0 {
+                cand.push(LiStep::Addi(lo12 as i32));
+            }
+            if cand.len() < best.len() {
+                best = cand;
+            }
+        }
+    }
+    best
+}
+
+/// Parses a `li` immediate: optional sign, decimal or 0x hex, up to the full
+/// 64-bit range (unsigned values wrap to their two's-complement bit pattern).
+fn parse_li_immediate(s: &str) -> Result<i64, RasError> {
+    let s = s.trim().trim_start_matches('#');
+    let (negative, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let magnitude = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => body.parse::<u64>(),
+    }
+    .map_err(|_| RasError::EncodingError(format!("Invalid immediate: {s}")))?;
+    let value = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    if value < i64::MIN as i128 {
+        return Err(RasError::EncodingError(format!(
+            "LI immediate {s} does not fit 64 bits"
+        )));
+    }
+    Ok(value as i64)
 }
 
 impl InstructionEncoder for RiscVEncoder {
@@ -631,23 +791,7 @@ impl InstructionEncoder for RiscVEncoder {
                 let rs = self.parse_register(&ops[1])?;
                 Self::emit(Self::i_type(0, rs, 0, rd, 0x13))
             }
-            // `li rd, imm` = addi rd, x0, imm  (small immediates only)
-            "li" => {
-                if ops.len() != 2 {
-                    return Err(RasError::EncodingError(
-                        "LI requires 2 operands: rd, imm".to_string(),
-                    ));
-                }
-                let rd = self.parse_register(&ops[0])?;
-                let imm = self.parse_imm(&ops[1])?;
-                if !(-2048..=2047).contains(&imm) {
-                    return Err(RasError::EncodingError(format!(
-                        "LI pseudo-instruction only supports 12-bit immediates ({} out of range)",
-                        imm
-                    )));
-                }
-                Self::emit(Self::i_type(imm as i32, 0, 0, rd, 0x13))
-            }
+            "li" => self.encode_li(ops)?,
             // `j offset` = jal x0, offset
             "j" => {
                 if ops.len() != 1 {
