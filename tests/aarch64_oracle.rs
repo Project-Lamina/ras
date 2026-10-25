@@ -566,6 +566,47 @@ fn compare_and_test_branches_reject_bad_operands() {
 }
 
 #[test]
+fn int_float_conversions_encode_every_width_pair() {
+    for (asm, word) in [
+        ("scvtf s0, w0", 0x1e22_0000u32),
+        ("scvtf s0, x0", 0x9e22_0000),
+        ("scvtf d0, w0", 0x1e62_0000),
+        ("scvtf d0, x0", 0x9e62_0000),
+        ("ucvtf s0, w0", 0x1e23_0000),
+        ("ucvtf s0, x0", 0x9e23_0000),
+        ("ucvtf d0, w0", 0x1e63_0000),
+        ("ucvtf d0, x0", 0x9e63_0000),
+        ("fcvtzs w0, s0", 0x1e38_0000),
+        ("fcvtzs x0, s0", 0x9e38_0000),
+        ("fcvtzs w0, d0", 0x1e78_0000),
+        ("fcvtzs x0, d0", 0x9e78_0000),
+        ("fcvtzu w0, s0", 0x1e39_0000),
+        ("fcvtzu x0, s0", 0x9e39_0000),
+        ("fcvtzu w0, d0", 0x1e79_0000),
+        ("fcvtzu x0, d0", 0x9e79_0000),
+    ] {
+        assert_eq!(
+            assemble_words(&format!(".text\n{asm}\n")).unwrap(),
+            [word],
+            "{asm}"
+        );
+    }
+    for asm in [
+        "scvtf x0, w0",
+        "fcvtzs w0, x0",
+        "scvtf s0, sp",
+        "scvtf s0",
+        "scvtf w0, w1",
+        "fcvtzs w0, w1",
+    ] {
+        assert!(
+            assemble_words(&format!(".text\n{asm}\n")).is_err(),
+            "accepted {asm:?}"
+        );
+    }
+}
+
+#[test]
 fn branch_targets_must_be_symbols() {
     for asm in [
         ".text\nbl x0\n",
