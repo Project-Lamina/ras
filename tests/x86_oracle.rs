@@ -251,6 +251,7 @@ fn invalid_compiler_operands_fail() {
     for asm in [
         "cmpw %eax, %ax",
         "movd %ax, %xmm0",
+        "mov %rax, $1",
         "movswl %al, %eax",
         "movsbl %ecx, %eax",
         "movzwq %r9d, %rax",
