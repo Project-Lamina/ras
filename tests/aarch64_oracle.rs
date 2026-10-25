@@ -645,6 +645,34 @@ fn adrp_takes_a_64_bit_general_register_but_not_sp() {
 }
 
 #[test]
+fn stack_pointer_destinations_of_mov_forms() {
+    for asm in [
+        "movz sp, #1",
+        "movk wsp, #1",
+        "movn sp, #1",
+        "mov sp, #0x12345678",
+        "mov wsp, #0",
+    ] {
+        assert!(
+            assemble_words(&format!(".text\n{asm}\n")).is_err(),
+            "accepted {asm:?}"
+        );
+    }
+    assert_eq!(
+        assemble_words(".text\nmov sp, #1\n").unwrap(),
+        [0xb240_03ff]
+    );
+    assert_eq!(
+        assemble_words(".text\nmov wsp, #1\n").unwrap(),
+        [0x3200_03ff]
+    );
+    assert_eq!(
+        assemble_words(".text\nmovz xzr, #1\n").unwrap(),
+        [0xd280_003f]
+    );
+}
+
+#[test]
 fn branch_targets_must_be_symbols() {
     for asm in [
         ".text\nbl x0\n",
