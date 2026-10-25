@@ -280,7 +280,7 @@ fn mov_immediate_words(value: u64, wide: bool, rd: u32) -> Vec<u32> {
         let (base, imm) = match (words.is_empty(), invert) {
             (true, false) => (0x5280_0000, c),
             (true, true) => (0x1280_0000, !c & 0xffff),
-            (false, _) => (0x7280_0000, if invert { !c & 0xffff } else { c }),
+            (false, _) => (0x7280_0000, c),
         };
         words.push(base | sf | (i << 21) | (imm << 5) | rd);
     }
