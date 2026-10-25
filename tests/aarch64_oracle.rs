@@ -880,3 +880,12 @@ fn signed_loads_pick_the_destination_width() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn scalar_float_arithmetic_covers_all_four_operations() {
+    assert_eq!(
+        assemble_words(".text\nfadd s0, s0, s1\nfsub d8, d9, d10\nfdiv s11, s12, s13\n").unwrap(),
+        [0x1e21_2800, 0x1e6a_3928, 0x1e2d_198b]
+    );
+    assert!(assemble_words(".text\nfadd s0, s1, d2\n").is_err());
+}
