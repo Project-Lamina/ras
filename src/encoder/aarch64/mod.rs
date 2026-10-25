@@ -351,8 +351,8 @@ fn max_operands(op: &str) -> Option<usize> {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
         "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
         "mov" | "uxtb" | "sxtw" | "fmov" | "cset" => 2,
-        "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" | "lsl" | "lsr" | "asr" | "ror" | "lslv" | "lsrv"
-        | "asrv" | "rorv" => 3,
+        "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" | "fdiv" | "fadd" | "fsub" | "lsl"
+        | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => 3,
         "csel" | "msub" | "sbfx" | "ubfx" => 4,
         _ => return None,
     })
@@ -632,18 +632,27 @@ impl AArch64Encoder {
                 };
                 base | (r(1)? << 5) | r(0)?
             }
-            "fmul" => {
+            "fmul" | "fdiv" | "fadd" | "fsub" => {
                 let (rd, kind) = data_reg(arg(0)?)?;
                 let (rn, kind_n) = data_reg(arg(1)?)?;
                 let (rm, kind_m) = data_reg(arg(2)?)?;
                 if !matches!(kind, DataKind::S | DataKind::D) || kind_n != kind || kind_m != kind {
-                    return Err(error("fmul takes three scalar registers of one size"));
+                    return Err(error(format!(
+                        "{op} takes three scalar registers of one size"
+                    )));
                 }
+                let operation = match op {
+                    "fmul" => 0x0800,
+                    "fdiv" => 0x1800,
+                    "fadd" => 0x2800,
+                    _ => 0x3800,
+                };
                 (if kind == DataKind::D {
-                    0x1e60_0800
+                    0x1e60_0000u32
                 } else {
-                    0x1e20_0800
-                }) | (rm << 16)
+                    0x1e20_0000
+                }) | operation
+                    | (rm << 16)
                     | (rn << 5)
                     | rd
             }
