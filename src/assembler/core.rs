@@ -154,6 +154,13 @@ enum PatchPoint {
         word: u32,
         jump: bool,
     },
+    RiscvPair {
+        offset: usize,
+        target: String,
+        first: u32,
+        second: u32,
+        call: bool,
+    },
     Arx64Jal {
         offset: usize,
         target: String,
@@ -902,6 +909,39 @@ impl RasAssembler {
                     if matches!(
                         self.target_arch,
                         TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+                    ) && let Some(pseudo) = riscv_symbolic_pseudo(&opcode, &inst.operands)
+                    {
+                        let mut words = [0u32; 2];
+                        for (word, (op, operands)) in
+                            words.iter_mut().zip([pseudo.first, pseudo.second])
+                        {
+                            let bytes = self
+                                .encoder
+                                .encode_instruction(&ParsedInstruction {
+                                    opcode: op.to_string(),
+                                    operands,
+                                })
+                                .map_err(|e| RasError::EncodingError(e.to_string()))?;
+                            *word =
+                                u32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
+                                    RasError::EncodingError("RISC-V encoding is not 4 bytes".into())
+                                })?);
+                            code.extend_from_slice(&bytes);
+                        }
+                        patch_points.push(PatchPoint::RiscvPair {
+                            offset: current_offset,
+                            target: pseudo.target,
+                            first: words[0],
+                            second: words[1],
+                            call: pseudo.call,
+                        });
+                        current_offset += 8;
+                        continue;
+                    }
+
+                    if matches!(
+                        self.target_arch,
+                        TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
                     ) && let Some((target, jump)) = riscv_label_jump(&opcode, &inst.operands)
                     {
                         let mut placeholder = inst.clone();
@@ -1213,6 +1253,7 @@ fn finish_layout(
         }
 
         let mut external_relocs: Vec<ExternalReloc> = Vec::new();
+        let mut pcrel_labels: Vec<ObjectSymbol> = Vec::new();
 
         for patch in &patch_points {
             if let PatchPoint::Data {
@@ -1340,12 +1381,76 @@ fn finish_layout(
             let target = match patch {
                 PatchPoint::Data { .. } => unreachable!(),
                 PatchPoint::Riscv { target, .. }
+                | PatchPoint::RiscvPair { target, .. }
                 | PatchPoint::AArch64 { target, .. }
                 | PatchPoint::X86Rel32 { target, .. }
                 | PatchPoint::X86RipRel32 { target, .. }
                 | PatchPoint::Arx64Jal { target, .. }
                 | PatchPoint::Arx64Branch { target, .. } => target,
             };
+            if let PatchPoint::RiscvPair {
+                offset,
+                target,
+                first,
+                second,
+                call,
+            } = patch
+            {
+                match symbol_offsets.get(target) {
+                    Some(&target_offset) if !global_symbols.contains(target.as_str()) => {
+                        let delta = target_offset as i64 - *offset as i64;
+                        let hi = (delta + 0x800) >> 12;
+                        if !(-(1 << 19)..(1 << 19)).contains(&hi) {
+                            return Err(RasError::EncodingError(
+                                "RISC-V pc-relative target out of range".into(),
+                            ));
+                        }
+                        let lo = delta - (hi << 12);
+                        let first = first | ((hi as u32 & 0xF_FFFF) << 12);
+                        let second = second | ((lo as u32 & 0xFFF) << 20);
+                        code[*offset..*offset + 4].copy_from_slice(&first.to_le_bytes());
+                        code[*offset + 4..*offset + 8].copy_from_slice(&second.to_le_bytes());
+                    }
+                    _ if *call => external_relocs.push(ExternalReloc {
+                        offset: *offset,
+                        symbol: target.clone(),
+                        section: String::new(),
+                        kind: 19,
+                        addend: 0,
+                        trailing: 0,
+                        branch: false,
+                    }),
+                    _ => {
+                        let label = format!("ras.pcrel_hi.{offset}");
+                        external_relocs.push(ExternalReloc {
+                            offset: *offset,
+                            symbol: target.clone(),
+                            section: String::new(),
+                            kind: 23,
+                            addend: 0,
+                            trailing: 0,
+                            branch: false,
+                        });
+                        external_relocs.push(ExternalReloc {
+                            offset: *offset + 4,
+                            symbol: label.clone(),
+                            section: String::new(),
+                            kind: 24,
+                            addend: 0,
+                            trailing: 0,
+                            branch: false,
+                        });
+                        pcrel_labels.push(ObjectSymbol {
+                            attributes: Default::default(),
+                            name: label,
+                            global: false,
+                            section: String::new(),
+                            value: *offset as u64,
+                        });
+                    }
+                }
+                continue;
+            }
             if let PatchPoint::AArch64 {
                 offset,
                 target,
@@ -1416,7 +1521,8 @@ fn finish_layout(
                 match patch {
                     PatchPoint::Data { .. }
                     | PatchPoint::AArch64 { .. }
-                    | PatchPoint::Riscv { .. } => unreachable!(),
+                    | PatchPoint::Riscv { .. }
+                    | PatchPoint::RiscvPair { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
@@ -1512,6 +1618,7 @@ fn finish_layout(
             })
             .collect();
 
+        symbols.extend(pcrel_labels);
         if !macho {
             symbols.extend(mapping_symbols);
         }
@@ -1772,6 +1879,50 @@ fn split_addend(target: &str) -> Result<(&str, i64), RasError> {
 
 fn reloc_symbol(target: &str) -> &str {
     target.split_once('@').map_or(target, |(name, _)| name)
+}
+
+struct RiscvSymbolicPseudo {
+    target: String,
+    first: (&'static str, Vec<String>),
+    second: (&'static str, Vec<String>),
+    call: bool,
+}
+
+fn riscv_symbolic_pseudo(opcode: &str, operands: &[String]) -> Option<RiscvSymbolicPseudo> {
+    let symbol = |operand: &str| {
+        let operand = operand.trim();
+        (operand.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '.' | '$'))
+            && operand
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')))
+        .then(|| operand.to_string())
+    };
+    match (opcode, operands) {
+        ("call" | "tail", [target]) => {
+            let target = symbol(target)?;
+            let (link, jump_rd, jump_rs) = if opcode == "call" {
+                ("ra", "ra", "0(ra)")
+            } else {
+                ("t1", "zero", "0(t1)")
+            };
+            Some(RiscvSymbolicPseudo {
+                target,
+                first: ("auipc", vec![link.into(), "0".into()]),
+                second: ("jalr", vec![jump_rd.into(), jump_rs.into()]),
+                call: true,
+            })
+        }
+        ("la", [rd, target]) => {
+            let target = symbol(target)?;
+            Some(RiscvSymbolicPseudo {
+                target,
+                first: ("auipc", vec![rd.clone(), "0".into()]),
+                second: ("addi", vec![rd.clone(), rd.clone(), "0".into()]),
+                call: false,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn riscv_label_jump(opcode: &str, operands: &[String]) -> Option<(String, bool)> {
