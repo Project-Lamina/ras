@@ -350,9 +350,9 @@ fn max_operands(op: &str) -> Option<usize> {
     Some(match op {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
         "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
-        "mov" | "uxtb" | "fmov" | "cset" => 2,
+        "mov" | "uxtb" | "sxtw" | "fmov" | "cset" => 2,
         "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" => 3,
-        "csel" | "msub" => 4,
+        "csel" | "msub" | "sbfx" | "ubfx" => 4,
         _ => return None,
     })
 }
@@ -539,6 +539,38 @@ impl AArch64Encoder {
                     return Err(error("uxtb takes a 32-bit source register"));
                 }
                 0x5300_1c00 | (rn << 5) | rd
+            }
+            "sxtw" => {
+                let (rd, rd_wide) = gpr(arg(0)?)?;
+                let (rn, _) = gpr(arg(1)?)?;
+                if !rd_wide || is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
+                    return Err(error("sxtw takes a 64-bit destination register"));
+                }
+                0x9340_7c00 | (rn << 5) | rd
+            }
+            "sbfx" | "ubfx" => {
+                let (rd, rd_wide) = gpr(arg(0)?)?;
+                let (rn, rn_wide) = gpr(arg(1)?)?;
+                if rd_wide != rn_wide || is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
+                    return Err(error(format!("Invalid register operand for {op}")));
+                }
+                let size = if rd_wide { 64 } else { 32 };
+                let lsb = immediate(arg(2)?)?;
+                let width = immediate(arg(3)?)?;
+                if lsb < 0 || width < 1 || lsb + width > size {
+                    return Err(error(format!("Bitfield out of range for {op}")));
+                }
+                let base = if op == "sbfx" {
+                    0x1300_0000
+                } else {
+                    0x5300_0000
+                };
+                let n = if rd_wide { 0x8040_0000u32 } else { 0 };
+                base | n
+                    | ((lsb as u32) << 16)
+                    | (((lsb + width - 1) as u32) << 10)
+                    | (rn << 5)
+                    | rd
             }
             "fmov" => {
                 let base = match (arg(0)?.chars().next(), arg(1)?.chars().next()) {
