@@ -705,7 +705,8 @@ impl AArch64Encoder {
                 }
             }
             "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldur" | "stur" | "ldurb"
-            | "sturb" | "ldurh" | "sturh" => {
+            | "sturb" | "ldurh" | "sturh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldursb" | "ldursh"
+            | "ldursw" => {
                 let mem = p.get(1..).unwrap_or_default().join(",");
                 let (inside, post_offset) = match mem.split_once("],") {
                     Some((address, offset)) => (format!("{address}]"), Some(offset.trim())),
@@ -727,16 +728,37 @@ impl AArch64Encoder {
                     return Err(error("Address base must be an x register or sp"));
                 }
                 let (rt, kind) = data_reg(arg(0)?)?;
-                let narrow = op.ends_with('b') || op.ends_with('h');
-                let (size, fp) = match (narrow, kind) {
-                    (true, DataKind::W) => (if op.ends_with('b') { 0 } else { 1 }, false),
-                    (true, _) => {
-                        return Err(error(format!("{op} takes a 32-bit register")));
+                let signed = matches!(
+                    op,
+                    "ldrsb" | "ldrsh" | "ldrsw" | "ldursb" | "ldursh" | "ldursw"
+                );
+                let narrow = !signed && (op.ends_with('b') || op.ends_with('h'));
+                let (size, fp) = if signed {
+                    let size = match op.as_bytes()[op.len() - 1] {
+                        b'b' => 0,
+                        b'h' => 1,
+                        _ => 2,
+                    };
+                    match kind {
+                        DataKind::X => (size, false),
+                        DataKind::W if size != 2 => (size, false),
+                        _ => {
+                            return Err(error(format!(
+                                "{op} takes a general purpose register of the right width"
+                            )));
+                        }
                     }
-                    (false, DataKind::W) => (2, false),
-                    (false, DataKind::X) => (3, false),
-                    (false, DataKind::S) => (2, true),
-                    (false, DataKind::D) => (3, true),
+                } else {
+                    match (narrow, kind) {
+                        (true, DataKind::W) => (if op.ends_with('b') { 0 } else { 1 }, false),
+                        (true, _) => {
+                            return Err(error(format!("{op} takes a 32-bit register")));
+                        }
+                        (false, DataKind::W) => (2, false),
+                        (false, DataKind::X) => (3, false),
+                        (false, DataKind::S) => (2, true),
+                        (false, DataKind::D) => (3, true),
+                    }
                 };
                 let offset = match post_offset {
                     Some(text) => immediate(text)?,
@@ -758,10 +780,17 @@ impl AArch64Encoder {
                     && offset >= 0
                     && offset % (1 << size) == 0
                     && offset / (1 << size) <= 4095;
+                let opc: u32 = if signed {
+                    if kind == DataKind::X { 2 } else { 3 }
+                } else if load {
+                    1
+                } else {
+                    0
+                };
                 let base = ((size as u32) << 30)
                     | if scaled { 0x3900_0000 } else { 0x3800_0000 }
                     | if fp { 0x0400_0000 } else { 0 }
-                    | if load { 1 << 22 } else { 0 }
+                    | (opc << 22)
                     | if pre {
                         0x0C00
                     } else if post {

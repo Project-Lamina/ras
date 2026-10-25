@@ -865,3 +865,18 @@ fn shifts_take_both_immediate_and_register_amounts() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn signed_loads_pick_the_destination_width() {
+    assert_eq!(
+        assemble_words(".text\nldrsb w0, [x1]\nldrsb x0, [x1]\nldrsw x0, [x1]\n").unwrap(),
+        [0x39c0_0020, 0x3980_0020, 0xb980_0020]
+    );
+    assert_eq!(
+        assemble_words(".text\nldursb x2, [x3, #-256]\nldursw x6, [x7, #-4]\n").unwrap(),
+        [0x3890_0062, 0xb89f_c0e6]
+    );
+    for asm in [".text\nldrsw w0, [x1]\n", ".text\nldrsb s0, [x1]\n"] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
