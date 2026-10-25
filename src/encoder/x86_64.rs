@@ -1123,6 +1123,14 @@ impl InstructionEncoder for X86_64Encoder {
                 };
                 code = self.emit(self.encode_sse_rm(&[0x66], &[0x0f, op], &inst.operands)?);
             }
+            "comiss" | "ucomiss" => {
+                let op = if opcode.as_str() == "comiss" {
+                    0x2f
+                } else {
+                    0x2e
+                };
+                code = self.emit(self.encode_sse_rm(&[], &[0x0f, op], &inst.operands)?);
+            }
             "pshufd" | "pshuflw" | "shufpd" => {
                 let [imm, src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError(
