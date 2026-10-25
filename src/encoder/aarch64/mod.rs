@@ -297,6 +297,10 @@ fn mov_immediate_words(value: u64, wide: bool, rd: u32) -> Vec<u32> {
     words
 }
 
+fn sf_of(wide: bool) -> u32 {
+    if wide { 0x8000_0000 } else { 0 }
+}
+
 fn is_stack_pointer(reg: &str) -> bool {
     matches!(reg, "sp" | "wsp")
 }
@@ -350,7 +354,7 @@ fn max_operands(op: &str) -> Option<usize> {
     Some(match op {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
         "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
-        "mov" | "uxtb" | "sxtw" | "fmov" | "cset" => 2,
+        "mov" | "uxtb" | "sxtw" | "fmov" | "cset" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => 2,
         "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" | "fdiv" | "fadd" | "fsub" | "lsl"
         | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => 3,
         "csel" | "msub" | "sbfx" | "ubfx" => 4,
@@ -655,6 +659,33 @@ impl AArch64Encoder {
                     | (rm << 16)
                     | (rn << 5)
                     | rd
+            }
+            "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => {
+                let to_float = op.starts_with("scvtf") || op.starts_with("ucvtf");
+                let (fp, gp) = if to_float {
+                    (arg(0)?, arg(1)?)
+                } else {
+                    (arg(1)?, arg(0)?)
+                };
+                let (fp_reg, fp_kind) = data_reg(fp)?;
+                let (gp_reg, gp_wide) = gpr(gp)?;
+                if is_stack_pointer(gp) || !matches!(fp_kind, DataKind::S | DataKind::D) {
+                    return Err(error(format!(
+                        "{op} takes a scalar float and a general register"
+                    )));
+                }
+                let double = if fp_kind == DataKind::D {
+                    0x0040_0000
+                } else {
+                    0
+                };
+                let (opcode, rn, rd) = match (op, to_float) {
+                    ("scvtf", _) => (0x0002_0000, gp_reg, fp_reg),
+                    ("ucvtf", _) => (0x0003_0000, gp_reg, fp_reg),
+                    ("fcvtzs", _) => (0x0018_0000, fp_reg, gp_reg),
+                    _ => (0x0019_0000, fp_reg, gp_reg),
+                };
+                0x1e20_0000 | sf_of(gp_wide) | double | opcode | (rn << 5) | rd
             }
             "stp" | "ldp" => {
                 if p.len() < 3 {
