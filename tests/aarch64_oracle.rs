@@ -673,6 +673,20 @@ fn stack_pointer_destinations_of_mov_forms() {
 }
 
 #[test]
+fn fmov_rejects_stack_pointer_operands() {
+    for asm in ["fmov s0, sp", "fmov sp, s0", "fmov s0, wsp", "fmov d0, sp"] {
+        assert!(
+            assemble_words(&format!(".text\n{asm}\n")).is_err(),
+            "accepted {asm:?}"
+        );
+    }
+    assert_eq!(
+        assemble_words(".text\nfmov s0, s1\n").unwrap(),
+        [0x1e20_4020]
+    );
+}
+
+#[test]
 fn branch_targets_must_be_symbols() {
     for asm in [
         ".text\nbl x0\n",

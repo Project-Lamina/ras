@@ -638,6 +638,9 @@ impl AArch64Encoder {
                     | rd
             }
             "fmov" => {
+                if is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
+                    return Err(error("fmov cannot take the stack pointer"));
+                }
                 let base = match (arg(0)?.chars().next(), arg(1)?.chars().next()) {
                     (Some('d'), Some('x')) => 0x9e67_0000,
                     (Some('x'), Some('d')) => 0x9e66_0000,
