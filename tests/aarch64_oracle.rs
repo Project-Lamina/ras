@@ -834,3 +834,19 @@ fn compare_negative_encodes_as_flag_setting_add() {
         assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
     }
 }
+
+#[test]
+fn bitfield_extracts_cover_lsb_and_width() {
+    assert_eq!(
+        assemble_words(".text\nsbfx x0, x1, #0, #8\nubfx w2, w3, #16, #16\nsxtw x0, w1\n").unwrap(),
+        [0x9340_1c20, 0x5310_7c62, 0x9340_7c20]
+    );
+    for asm in [
+        ".text\nsbfx x0, x1, #0, #0\n",
+        ".text\nsbfx x0, x1, #60, #8\n",
+        ".text\nubfx x0, x1, #-1, #8\n",
+        ".text\nsxtw w0, w1\n",
+    ] {
+        assert!(assemble_words(asm).is_err(), "accepted {asm:?}");
+    }
+}
