@@ -994,13 +994,18 @@ impl RasAssembler {
                             })
                         } else if matches!(opcode.as_str(), "b" | "bl") || opcode.starts_with("b.")
                         {
-                            let target = operands
-                                .first()
-                                .ok_or_else(|| {
-                                    RasError::EncodingError("Missing branch target".into())
-                                })?
-                                .clone();
+                            if operands.len() != 1 {
+                                return Err(RasError::EncodingError(format!(
+                                    "Wrong operand count for {opcode}"
+                                )));
+                            }
+                            let target = operands[0].clone();
                             let (symbol, addend) = split_addend(&target)?;
+                            if !is_aarch64_branch_symbol(symbol) {
+                                return Err(RasError::EncodingError(format!(
+                                    "Invalid branch target: {target}"
+                                )));
+                            }
                             let conditional = opcode.starts_with("b.");
                             let word = if conditional {
                                 0x5400_0000 | crate::encoder::aarch64::condition(&opcode[2..])?
@@ -1855,6 +1860,11 @@ fn aarch64_compare_branch(
 }
 
 /// Splits a trailing decimal or hex `+N` or `-N` displacement off a symbol operand.
+fn is_aarch64_branch_symbol(symbol: &str) -> bool {
+    !symbol.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | ':'))
+        && crate::encoder::aarch64::register(symbol).is_err()
+}
+
 fn split_addend(target: &str) -> Result<(&str, i64), RasError> {
     if target.is_empty() || target.starts_with(['+', '-']) {
         return Err(RasError::EncodingError(format!(
