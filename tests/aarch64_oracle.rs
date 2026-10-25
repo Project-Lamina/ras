@@ -652,6 +652,10 @@ fn wide_mov_immediates_lower_to_move_wide_chains() {
         [0xb200_3fe0]
     );
     assert_eq!(
+        assemble_words(".text\nmov x0, #0xffff1234ffff5678\n").unwrap(),
+        [0x9295_30e0, 0xf2c2_4680]
+    );
+    assert_eq!(
         assemble_words(".text\nmov w0, #74565\n").unwrap(),
         [0x5284_68a0, 0x72a0_0020]
     );
