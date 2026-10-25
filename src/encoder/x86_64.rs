@@ -877,6 +877,11 @@ impl InstructionEncoder for X86_64Encoder {
                 }
                 let a = &inst.operands[0];
                 let b = &inst.operands[1];
+                if opcode == "mov" && (parse_xmm(a).is_some() || parse_xmm(b).is_some()) {
+                    return Err(RasError::EncodingError(
+                        "mov: xmm operands require movq or movd".into(),
+                    ));
+                }
 
                 if parse_xmm(a).is_none() && parse_xmm(b).is_none() {
                     code = self.emit(self.encode_integer_move(

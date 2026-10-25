@@ -252,6 +252,8 @@ fn invalid_compiler_operands_fail() {
         "cmpw %eax, %ax",
         "movd %ax, %xmm0",
         "mov %rax, $1",
+        "mov %rax, %xmm0",
+        "mov (%rax), %xmm0",
         "movswl %al, %eax",
         "movsbl %ecx, %eax",
         "movzwq %r9d, %rax",
