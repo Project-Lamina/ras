@@ -627,6 +627,24 @@ fn ldp_rejects_equal_transfer_registers() {
 }
 
 #[test]
+fn adrp_takes_a_64_bit_general_register_but_not_sp() {
+    for asm in ["adrp w0, x", "adrp wzr, x", "adrp sp, x"] {
+        assert!(
+            assemble_words(&format!(".text\n{asm}\nx:\n")).is_err(),
+            "accepted {asm:?}"
+        );
+    }
+    assert_eq!(
+        assemble_words(".text\nadrp x0, x\nx:\n").unwrap(),
+        [0x9000_0000]
+    );
+    assert_eq!(
+        assemble_words(".text\nadrp xzr, x\nx:\n").unwrap(),
+        [0x9000_001f]
+    );
+}
+
+#[test]
 fn branch_targets_must_be_symbols() {
     for asm in [
         ".text\nbl x0\n",
