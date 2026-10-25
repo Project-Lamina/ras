@@ -450,6 +450,9 @@ impl AArch64Encoder {
             }
             "isb" if p.is_empty() || matches!(p.as_slice(), [sy] if sy == "sy") => 0xd503_3fdf,
             "movz" | "movk" | "movn" => {
+                if is_stack_pointer(arg(0)?) {
+                    return Err(error(format!("{op} cannot write the stack pointer")));
+                }
                 let imm = immediate(arg(1)?)?;
                 let shift = if p.len() > 2 {
                     immediate(
@@ -486,6 +489,16 @@ impl AArch64Encoder {
                     }
                     let (dst, _) = gpr(arg(0)?)?;
                     let value = raw as u64 & if wide { u64::MAX } else { u32::MAX as u64 };
+                    if is_stack_pointer(arg(0)?) {
+                        let (n, immr, imms) = logical_immediate(value, wide).ok_or_else(|| {
+                            error(format!(
+                                "mov to the stack pointer needs a logical immediate: {raw}"
+                            ))
+                        })?;
+                        let base = if wide { 0xb200_0000 } else { 0x3200_0000 };
+                        let word = base | (n << 22) | (immr << 16) | (imms << 10) | (31 << 5) | dst;
+                        return Ok(word.to_le_bytes().to_vec());
+                    }
                     let words = mov_immediate_words(value, wide, dst);
                     return Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect());
                 } else {
