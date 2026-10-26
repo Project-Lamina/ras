@@ -610,6 +610,20 @@ fn narrow_imm_i64(bits: u8, raw: i64, signed_style: bool) -> i64 {
 }
 
 #[cfg(feature = "encoder")]
+/// Widens the low `size` bytes of rax to the full register, the way the assembly
+/// backend's `extend_integer` does, so the two paths agree bit for bit.
+fn encode_extend_rax(size: usize, signed: bool) -> Vec<u8> {
+    match (size, signed) {
+        (1, true) => vec![0x48, 0x0F, 0xBE, 0xC0],
+        (2, true) => vec![0x48, 0x0F, 0xBF, 0xC0],
+        (4, true) => vec![0x48, 0x63, 0xC0],
+        (1, false) => vec![0x0F, 0xB6, 0xC0],
+        (2, false) => vec![0x0F, 0xB7, 0xC0],
+        (4, false) => vec![0x89, 0xC0],
+        _ => Vec::new(),
+    }
+}
+
 fn mov_imm64_reg_x86_64(reg: u8, imm: i64) -> Vec<u8> {
     let mut code = Vec::new();
     let rex = 0x48 | ((reg >> 3) & 1);
@@ -1115,6 +1129,39 @@ fn encode_mir_instruction_x86_64(
             )?);
             code.extend_from_slice(&[0x48, 0x85, 0xC9]);
             code.extend_from_slice(&[0x48, 0x0F, 0x45, 0xC2]);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::IntConvert {
+            from,
+            to,
+            signed,
+            dst,
+            src,
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for IntConvert not supported".into(),
+                ));
+            };
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            code.extend_from_slice(&encode_extend_rax(
+                from.size_bytes().min(to.size_bytes()),
+                *signed,
+            ));
+            if to.size_bytes() < 8 {
+                code.extend_from_slice(&encode_extend_rax(to.size_bytes(), true));
+            }
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::Copy { dst, src, .. } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for Copy not supported".into(),
+                ));
+            };
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
             code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
         }
