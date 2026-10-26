@@ -1751,7 +1751,10 @@ fn parse_imm(text: &str) -> Result<i64, RasError> {
         None => digits.parse::<i128>(),
     }
     .map_err(|_| RasError::EncodingError(format!("Invalid immediate: {}", text)))?;
-    i64::try_from(if negative { -magnitude } else { magnitude })
+    let value = if negative { -magnitude } else { magnitude };
+    // A bit pattern above i64::MAX, such as a sign mask, is written unsigned.
+    i64::try_from(value)
+        .or_else(|_| u64::try_from(value).map(|bits| bits as i64))
         .map_err(|_| RasError::EncodingError(format!("Immediate out of range: {}", text)))
 }
 
