@@ -1574,6 +1574,7 @@ mod aarch64_jit_tail_call_tests {
             addr: AddressMode::BaseOffset {
                 base: base_v.clone(),
                 offset: 1024,
+                address_space: Default::default(),
             },
             attrs: MemoryAttrs::default(),
         });
