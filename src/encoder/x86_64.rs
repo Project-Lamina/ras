@@ -1262,15 +1262,18 @@ impl InstructionEncoder for X86_64Encoder {
                 code = self.emit(enc);
             }
             "addsd" | "addss" | "subsd" | "subss" | "mulsd" | "mulss" | "divsd" | "divss"
-            | "paddd" => {
+            | "sqrtsd" | "sqrtss" | "minss" | "maxsd" | "maxss" | "paddd" => {
                 let legacy = match opcode.as_str() {
-                    "addss" | "subss" | "mulss" | "divss" => 0xf3,
+                    "addss" | "subss" | "mulss" | "divss" | "sqrtss" | "minss" | "maxss" => 0xf3,
                     "paddd" => 0x66,
                     _ => 0xf2,
                 };
                 let op = match opcode.as_str() {
                     "addsd" | "addss" => 0x58,
                     "mulsd" | "mulss" => 0x59,
+                    "sqrtsd" | "sqrtss" => 0x51,
+                    "minss" => 0x5d,
+                    "maxsd" | "maxss" => 0x5f,
                     "subsd" | "subss" => 0x5c,
                     "divsd" | "divss" => 0x5e,
                     _ => 0xfe,
