@@ -562,6 +562,16 @@ impl AssemblyParser {
                 };
                 self.attributes.entry(name.trim().into()).or_default().size = Some(expression);
             }
+            ".extern" => {
+                // Symbols are undefined until something defines them, so gas ignores
+                // this too; the name only has to be well formed.
+                for name in line[parts[0].len()..]
+                    .split([',', ' ', '\t'])
+                    .filter(|s| !s.is_empty())
+                {
+                    symbol_name(name)?;
+                }
+            }
             ".ident" | ".file" => {}
             _ => {
                 return Err(RasError::ParseError(format!(
