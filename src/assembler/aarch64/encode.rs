@@ -4,8 +4,8 @@ use super::operand::materialize_operand;
 use crate::assembler::core::RasAssembler;
 use crate::encoder::aarch64::fixed::{enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr};
 use crate::encoder::aarch64::ldst_imm64::{
-    AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar, encode_str_imm64,
-    encode_str_scalar,
+    AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
+    encode_str_imm64, encode_str_scalar,
 };
 use crate::error::RasError;
 use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
@@ -72,7 +72,9 @@ pub(super) fn encode_ldr(dst_reg: &str, base_reg: u8, offset: i32) -> Result<Vec
     encode_ldr_imm64(dst, base_reg, offset)
 }
 
-pub(super) fn mir_scalar_ld_kind(ty: &lamina_mir::MirType) -> Result<AArch64ScalarLdKind, RasError> {
+pub(super) fn mir_scalar_ld_kind(
+    ty: &lamina_mir::MirType,
+) -> Result<AArch64ScalarLdKind, RasError> {
     match ty {
         MirType::Scalar(ScalarType::I1) => Ok(AArch64ScalarLdKind::I8U),
         MirType::Scalar(ScalarType::I8) => Ok(AArch64ScalarLdKind::I8S),
@@ -89,7 +91,9 @@ pub(super) fn mir_scalar_ld_kind(ty: &lamina_mir::MirType) -> Result<AArch64Scal
     }
 }
 
-pub(super) fn mir_scalar_st_kind(ty: &lamina_mir::MirType) -> Result<AArch64ScalarStKind, RasError> {
+pub(super) fn mir_scalar_st_kind(
+    ty: &lamina_mir::MirType,
+) -> Result<AArch64ScalarStKind, RasError> {
     match ty {
         MirType::Scalar(ScalarType::I1 | ScalarType::I8) => Ok(AArch64ScalarStKind::I8),
         MirType::Scalar(ScalarType::I16) => Ok(AArch64ScalarStKind::I16),

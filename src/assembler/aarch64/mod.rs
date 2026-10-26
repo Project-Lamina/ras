@@ -777,21 +777,14 @@ fn encode_mir_instruction_with_context(
                         let mask_str = reg_alloc.alloc_scratch().unwrap_or("x13");
                         let mask_reg = parse_register(mask_str)?;
                         code.extend_from_slice(&mov_imm_to_w(mask_reg, 1));
-                        code.extend_from_slice(&encode_and_w_rrr(
-                            dst_reg, dst_reg, mask_reg,
-                        ));
+                        code.extend_from_slice(&encode_and_w_rrr(dst_reg, dst_reg, mask_reg));
                         reg_alloc.free_scratch(mask_str);
                     }
 
                     if let Register::Virtual(vreg) = dst
                         && let Some(offset) = stack_slots.get(vreg)
                     {
-                        code.extend_from_slice(&encode_str_typed(
-                            dst_reg_str,
-                            29,
-                            *offset,
-                            ty,
-                        )?);
+                        code.extend_from_slice(&encode_str_typed(dst_reg_str, 29, *offset, ty)?);
                     }
                 }
                 MirType::Scalar(ScalarType::F32 | ScalarType::F64) => {
@@ -1247,11 +1240,7 @@ fn encode_mir_instruction_with_context(
                         stack_size,
                     )?;
 
-                    code.extend_from_slice(&encode_str(
-                        scratch_str,
-                        31,
-                        offset as i32,
-                    )?);
+                    code.extend_from_slice(&encode_str(scratch_str, 31, offset as i32)?);
                     reg_alloc.free_scratch(scratch_str);
                 }
             }
@@ -1386,10 +1375,7 @@ fn encode_mir_instruction_with_context(
                     && let Register::Virtual(vreg) = dst
                     && let Some(offset) = stack_slots.get(vreg)
                 {
-                    code.extend_from_slice(&encode_str(
-                        "x0", 29,
-                        *offset,
-                    )?);
+                    code.extend_from_slice(&encode_str("x0", 29, *offset)?);
                 }
             }
         }

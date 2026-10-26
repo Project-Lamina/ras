@@ -67,12 +67,8 @@ pub(super) fn materialize_scalar_operand_int_binary(
             };
             let v: i32 = match ty {
                 MirType::Scalar(ScalarType::I32) => raw as i32,
-                MirType::Scalar(ScalarType::I16) => {
-                    narrow_imm_i64(16, raw, signed_style) as i32
-                }
-                MirType::Scalar(ScalarType::I8) => {
-                    narrow_imm_i64(8, raw, signed_style) as i32
-                }
+                MirType::Scalar(ScalarType::I16) => narrow_imm_i64(16, raw, signed_style) as i32,
+                MirType::Scalar(ScalarType::I8) => narrow_imm_i64(8, raw, signed_style) as i32,
                 MirType::Scalar(ScalarType::I1) => (raw & 1) as i32,
                 _ => {
                     return Err(RasError::EncodingError(
@@ -212,11 +208,7 @@ pub(super) fn materialize_operand(
             // FrameMap stack slots are FP-relative offsets (negative for locals).
             if let Some(offset) = stack_slots.get(vreg) {
                 let dst_reg_str = format!("x{}", dst_reg);
-                code.extend_from_slice(&encode_ldr(
-                    &dst_reg_str,
-                    29,
-                    *offset,
-                )?);
+                code.extend_from_slice(&encode_ldr(&dst_reg_str, 29, *offset)?);
             } else {
                 return Err(RasError::EncodingError(format!(
                     "No stack slot for virtual register: {:?}",

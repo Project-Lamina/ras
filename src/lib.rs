@@ -3,9 +3,8 @@
 //! Assembly source (.s) to relocatable object files (.o).
 //! Supported: x86_64 and AArch64; ELF on Linux/BSD/Redox.
 
-
-mod cfi;
 pub mod assembler;
+mod cfi;
 pub mod encoder;
 pub mod error;
 pub mod object;
