@@ -749,8 +749,10 @@ pub fn compile_mir_riscv_function(
     function_name: Option<&str>,
     rv64: bool,
 ) -> Result<(Vec<u8>, HashMap<String, usize>), RasError> {
-    use lamina_codegen::riscv::RiscVFrame;
+    use lamina_codegen::riscv::{RiscVFrame, RiscVTarget, Xlen};
     use lamina_mir::Register;
+
+    let target = RiscVTarget::general(if rv64 { Xlen::Rv64 } else { Xlen::Rv32 });
 
     let _ = assembler; // not needed for register allocation here
 
@@ -822,13 +824,13 @@ pub fn compile_mir_riscv_function(
         for vreg in &def_regs {
             if !stack_slots.contains_key(vreg) {
                 let idx = stack_slots.len();
-                stack_slots.insert(*vreg, RiscVFrame::calculate_stack_offset(idx));
+                stack_slots.insert(*vreg, RiscVFrame::calculate_stack_offset(idx, target));
             }
         }
         for vreg in &used_regs {
             if !def_regs.contains(vreg) && !stack_slots.contains_key(vreg) {
                 let idx = stack_slots.len();
-                stack_slots.insert(*vreg, RiscVFrame::calculate_stack_offset(idx));
+                stack_slots.insert(*vreg, RiscVFrame::calculate_stack_offset(idx, target));
             }
         }
 
