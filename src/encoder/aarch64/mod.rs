@@ -196,7 +196,13 @@ fn logical_immediate(value: u64, wide: bool) -> Option<(u32, u32, u32)> {
     };
     let pattern = v & element_mask;
     let ones = pattern.count_ones();
-    let rotate = |x: u64, r: u32| ((x >> r) | (x << (element - r))) & element_mask;
+    let rotate = |x: u64, r: u32| {
+        if r == 0 {
+            x & element_mask
+        } else {
+            ((x >> r) | (x << (element - r))) & element_mask
+        }
+    };
     let immr = (0..element).find(|&r| rotate((1u64 << ones) - 1, r) == pattern)?;
     let n = u32::from(element == 64);
     let imms = ((!(2 * element - 1)) & 0x3f) | (ones - 1);
