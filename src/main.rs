@@ -55,8 +55,11 @@ fn print_usage() {
     eprintln!();
     eprintln!("GCC driver (ras as assembler, weld as linker):");
     eprintln!("  mkdir -p toolchain-prefix && ln -sf \"$(command -v ras)\" toolchain-prefix/as");
-    eprintln!("  gcc -B\"$PWD/toolchain-prefix\" -fuse-ld=weld -o prog main.c ...");
-    eprintln!("  (install `weld` on PATH; symlink argv0 `as` enables GNU-style flags from gcc.)");
+    eprintln!("  ln -sf \"$(command -v weld)\" toolchain-prefix/ld");
+    eprintln!("  gcc -B\"$PWD/toolchain-prefix/\" -o prog main.c ...");
+    eprintln!(
+        "  (argv0 `as` enables GNU-style flags from gcc; clang also needs -fno-integrated-as.)"
+    );
 }
 
 fn program_name_is_gnu_as(arg0: &str) -> bool {
