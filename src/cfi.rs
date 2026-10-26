@@ -358,7 +358,11 @@ pub(crate) fn lower(
         return Err(RasError::ParseError("Unterminated CFI procedure".into()));
     }
     if !frames.is_empty() {
-        writeln!(output, ".section .eh_frame,\"a\",@progbits\n.balign 8\n{frames}").unwrap();
+        writeln!(
+            output,
+            ".section .eh_frame,\"a\",@progbits\n.balign 8\n{frames}"
+        )
+        .unwrap();
     }
     Ok((output, Some(prefix)))
 }

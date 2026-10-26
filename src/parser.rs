@@ -180,7 +180,10 @@ impl AssemblyParser {
         self.resolve_numeric_labels()?;
         for symbol in &self.symbols {
             if self.merge_sections.contains(&symbol.section) {
-                self.attributes.entry(symbol.name.clone()).or_default().retain = true;
+                self.attributes
+                    .entry(symbol.name.clone())
+                    .or_default()
+                    .retain = true;
             }
         }
         for line in &mut self.lines {
@@ -245,14 +248,19 @@ impl AssemblyParser {
                 }
                 Line::Instruction(inst) => {
                     for operand in &mut inst.operands {
-                        if let Cow::Owned(text) = resolve_numeric_references(operand, index, &definitions)? {
+                        if let Cow::Owned(text) =
+                            resolve_numeric_references(operand, index, &definitions)?
+                        {
                             *operand = text;
                         }
                     }
                 }
-                Line::DataExpression { expression, .. } | Line::Leb128 { expression, .. }
+                Line::DataExpression { expression, .. }
+                | Line::Leb128 { expression, .. }
                 | Line::CfiAdvance(expression) => {
-                    if let Cow::Owned(text) = resolve_numeric_references(expression, index, &definitions)? {
+                    if let Cow::Owned(text) =
+                        resolve_numeric_references(expression, index, &definitions)?
+                    {
                         *expression = text;
                     }
                 }
@@ -290,7 +298,11 @@ impl AssemblyParser {
                 } else {
                     parts[0]
                 };
-                if line.split('"').nth(1).is_some_and(|flags| flags.contains('M')) {
+                if line
+                    .split('"')
+                    .nth(1)
+                    .is_some_and(|flags| flags.contains('M'))
+                {
                     self.merge_sections.insert(name.to_string());
                 }
                 self.current_section = name.to_string();
@@ -453,8 +465,8 @@ impl AssemblyParser {
                     self.lines.push(Line::Data(bytes));
                 }
             }
-            ".byte" | ".short" | ".hword" | ".value" | ".int" | ".long" | ".quad"
-            | ".xword" | ".word" | ".half" | ".dword" | ".2byte" | ".4byte" | ".8byte" => {
+            ".byte" | ".short" | ".hword" | ".value" | ".int" | ".long" | ".quad" | ".xword"
+            | ".word" | ".half" | ".dword" | ".2byte" | ".4byte" | ".8byte" => {
                 let width = match parts[0] {
                     ".byte" => 1,
                     ".short" | ".hword" | ".value" | ".half" | ".2byte" => 2,
@@ -546,7 +558,10 @@ impl AssemblyParser {
                 let expression = match parse_data_expression(expression.trim())? {
                     DataExpression::Difference(left, right) if left == "." || right == "." => {
                         let location = format!("{}_{}", self.generated_prefix, self.lines.len());
-                        self.attributes.entry(location.clone()).or_default().internal = true;
+                        self.attributes
+                            .entry(location.clone())
+                            .or_default()
+                            .internal = true;
                         self.lines.push(Line::Label(Symbol {
                             name: location.clone(),
                             global: false,
@@ -703,8 +718,7 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
 }
 
 pub(crate) fn parse_integer(text: &str) -> Result<i128, RasError> {
-    parse_integer_opt(text)
-        .ok_or_else(|| RasError::ParseError(format!("Invalid integer: {text}")))
+    parse_integer_opt(text).ok_or_else(|| RasError::ParseError(format!("Invalid integer: {text}")))
 }
 
 fn parse_integer_opt(text: &str) -> Option<i128> {
@@ -893,7 +907,10 @@ mod tests {
             ".ascii \"\\x\"\n",
             ".asciz \"a\" junk\n",
         ] {
-            assert!(AssemblyParser::new().parse(src).is_err(), "{src:?} was accepted");
+            assert!(
+                AssemblyParser::new().parse(src).is_err(),
+                "{src:?} was accepted"
+            );
         }
     }
 
