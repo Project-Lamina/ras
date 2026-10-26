@@ -213,3 +213,28 @@ fn undefined_numeric_labels_and_cross_section_differences_fail() {
     }
     assert!(!path.exists());
 }
+
+#[test]
+fn section_name_may_be_quoted() {
+    let dir = std::env::temp_dir().join(format!("ras_quoted_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = ".text\n.globl f\nf: ret\n";
+    let assemble = |source: &str, name: &str| {
+        let path = dir.join(name);
+        Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .unwrap()
+            .assemble(source, &path)
+            .unwrap();
+        std::fs::read(&path).unwrap()
+    };
+    let quoted = assemble(
+        &format!("{body}.section \".note.GNU-stack\",\"\",@progbits\n"),
+        "quoted.o",
+    );
+    let bare = assemble(
+        &format!("{body}.section .note.GNU-stack,\"\",@progbits\n"),
+        "bare.o",
+    );
+    assert_eq!(quoted, bare);
+    std::fs::remove_dir_all(dir).unwrap();
+}

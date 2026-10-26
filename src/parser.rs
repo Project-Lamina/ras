@@ -288,36 +288,43 @@ impl AssemblyParser {
 
         match parts[0] {
             ".text" | ".data" | ".bss" | ".section" => {
+                let fields = if parts[0] == ".section" {
+                    let operand = line
+                        .trim_start()
+                        .strip_prefix(".section")
+                        .unwrap_or_default()
+                        .trim();
+                    split_operands(operand)
+                } else {
+                    Vec::new()
+                };
                 let name = if parts[0] == ".section" {
-                    parts
-                        .get(1)
+                    fields
+                        .first()
+                        .map(|field| field.trim_matches('"'))
+                        .filter(|field| !field.is_empty())
                         .ok_or_else(|| RasError::ParseError(".section requires a name".into()))?
-                        .split(',')
-                        .next()
-                        .unwrap()
                 } else {
                     parts[0]
                 };
-                if line
-                    .split('"')
-                    .nth(1)
-                    .is_some_and(|flags| flags.contains('M'))
-                {
+                let explicit = fields
+                    .get(1)
+                    .filter(|field| field.starts_with('"'))
+                    .map(|field| field.trim_matches('"'));
+                if explicit.is_some_and(|flags| flags.contains('M')) {
                     self.merge_sections.insert(name.to_string());
                 }
                 self.current_section = name.to_string();
                 self.lines.push(Line::Section(name.to_string()));
                 if !self.sections.iter().any(|s| s.name == name) {
-                    let explicit = line.split('"').nth(1);
                     self.sections.push(Section {
                         group: if explicit.is_some_and(|f| f.contains('G')) {
-                            let fields: Vec<_> = line.split(',').map(str::trim).collect();
                             if fields.len() != 5 || fields[4] != "comdat" || fields[3].is_empty() {
                                 return Err(RasError::ParseError(
                                     "Unsupported section group".into(),
                                 ));
                             }
-                            Some(fields[3].into())
+                            Some(fields[3].as_str().into())
                         } else {
                             None
                         },
