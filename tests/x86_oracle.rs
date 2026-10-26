@@ -22,6 +22,72 @@ fn text(bytes: &[u8]) -> &[u8] {
     panic!("Missing .text")
 }
 
+/// Length of the nop starting at `bytes`, covering the `66` and `cs` prefixed
+/// forms GNU as pads with, or `None` when it does not start with one.
+fn nop_length(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while bytes.get(at) == Some(&0x66) {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&0x2e) {
+        at += 1;
+    }
+    match bytes.get(at)? {
+        0x90 => Some(at + 1),
+        0x0f if bytes.get(at + 1) == Some(&0x1f) => {
+            let modrm = *bytes.get(at + 2)?;
+            if (modrm >> 3) & 7 != 0 {
+                return None;
+            }
+            let (mode, rm) = (modrm >> 6, modrm & 7);
+            let mut length = at + 3 + usize::from(mode != 3 && rm == 4);
+            length += match mode {
+                1 => 1,
+                2 => 4,
+                0 if rm == 5 => 4,
+                _ => 0,
+            };
+            (length <= bytes.len()).then_some(length)
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite every nop as that many one-byte nops. Which forms an assembler pads
+/// with, and in what order, differs between binutils releases; where the
+/// padding starts and ends does not, and that is what these comparisons are
+/// about.
+fn flatten_nops(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        match nop_length(&text[at..]) {
+            Some(length) => {
+                out.resize(out.len() + length, 0x90);
+                at += length;
+            }
+            None => {
+                out.push(text[at]);
+                at += 1;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn padding_comparison_ignores_nop_form() {
+    let long_first = [
+        0xc3, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0, 0x0f, 0x1f, 0x40, 0x00, 0xc3,
+    ];
+    let short_first = [
+        0xc3, 0x0f, 0x1f, 0x40, 0x00, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0, 0xc3,
+    ];
+    assert_eq!(flatten_nops(&long_first), flatten_nops(&short_first));
+    let shorter = [0xc3, 0x0f, 0x1f, 0x40, 0x00, 0xc3];
+    assert_ne!(flatten_nops(&long_first), flatten_nops(&shorter));
+}
+
 #[test]
 fn move_widths_extensions_and_scalar_operations_match_gas() {
     let dir = std::env::temp_dir().join(format!("ras_x86_oracle_{}", std::process::id()));
@@ -64,8 +130,8 @@ fn move_widths_extensions_and_scalar_operations_match_gas() {
         .assemble(&asm, &output)
         .unwrap();
     assert_eq!(
-        text(&std::fs::read(&output).unwrap()),
-        text(&std::fs::read(&reference).unwrap())
+        flatten_nops(text(&std::fs::read(&output).unwrap())),
+        flatten_nops(text(&std::fs::read(&reference).unwrap()))
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -236,7 +302,7 @@ fn alignment_sensitive_branches_match_gas() {
         asm.push_str(&format!(".p2align 4\n.Lstart{i}: je .Lend{i}\n.space {i}, 0x90\njne .Lstart{i}\n.p2align 4,,10\n.p2align 3\njmp .Lend{i}\n.space 8, 0x90\n.Lend{i}: ret\n"));
     }
     let (output, reference) = oracle(&asm, "branch_alignment");
-    assert_eq!(text(&output), text(&reference));
+    assert_eq!(flatten_nops(text(&output)), flatten_nops(text(&reference)));
 }
 
 #[test]
