@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Local-only cargo config (points the lamina crates at the sibling checkout)
+.cargo/
