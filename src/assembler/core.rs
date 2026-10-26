@@ -1710,7 +1710,7 @@ impl RasAssembler {
             use std::ffi::CString;
             use windows_loader::{GetModuleHandleA, GetProcAddress};
 
-            let module = unsafe { GetModuleHandleA(c"msvcrt.dll".as_ptr() as *const i8) };
+            let module = unsafe { GetModuleHandleA(c"msvcrt.dll".as_ptr()) };
             if module.is_null() {
                 return Err(RasError::EncodingError(
                     "Failed to get msvcrt.dll handle".to_string(),
