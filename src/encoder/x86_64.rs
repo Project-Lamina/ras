@@ -322,6 +322,7 @@ impl X86_64Encoder {
                 reg: digit,
                 rm: dst_rm,
                 imm: &imm_field,
+                ..Op::default()
             });
         }
         let (src_rm, src_gpr) = self.parse_rm(src, false)?;
@@ -399,6 +400,7 @@ impl X86_64Encoder {
             reg: digit,
             rm,
             imm: &imm,
+            ..Op::default()
         })
     }
 
@@ -522,6 +524,181 @@ impl X86_64Encoder {
             opcode,
             reg,
             rm,
+            ..Op::default()
+        })
+    }
+
+    /// Parse a vector operand, reporting whether a register operand was 256-bit.
+    fn parse_vector_rm(&self, op: &str) -> Result<(Rm, bool), RasError> {
+        let op = op.trim();
+        if self.is_memory(op) {
+            return Ok((Rm::Mem(self.parse_mem(op)?), false));
+        }
+        parse_vector(op)
+            .map(|(number, len256)| (Rm::Reg(number), len256))
+            .ok_or_else(|| {
+                RasError::EncodingError(format!("Expected vector or memory operand: {}", op))
+            })
+    }
+
+    /// A VEX move between a vector register and memory or another register.
+    /// `load` names the direction that writes the register.
+    fn encode_vex_move(
+        &self,
+        pp: u8,
+        load: u8,
+        store: u8,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError(
+                "VEX move requires 2 operands".into(),
+            ));
+        }
+        let (src, src_wide) = self.parse_vector_rm(&operands[0])?;
+        let (dst, dst_wide) = self.parse_vector_rm(&operands[1])?;
+        let (opcode, reg, rm) = match (src, dst) {
+            (Rm::Reg(src_reg), Rm::Mem(mem)) => (store, src_reg, Rm::Mem(mem)),
+            // Only the high register needs an extension bit, and the two-byte
+            // prefix carries one for the reg field alone, so between two
+            // registers put whichever is high there and pick the direction to
+            // match.
+            (Rm::Reg(src_reg), Rm::Reg(dst_reg)) if src_reg >= 8 && dst_reg < 8 => {
+                (store, src_reg, Rm::Reg(dst_reg))
+            }
+            (src, Rm::Reg(dst_reg)) => (load, dst_reg, src),
+            (Rm::Mem(_), Rm::Mem(_)) => {
+                return Err(RasError::EncodingError(
+                    "VEX move: memory to memory is not encodable".into(),
+                ));
+            }
+        };
+        encode_op(Op {
+            opcode: &[opcode],
+            reg,
+            rm,
+            vex: Some(Vex {
+                pp,
+                len256: src_wide || dst_wide,
+                ..Vex::default()
+            }),
+            ..Op::default()
+        })
+    }
+
+    /// A three-operand VEX arithmetic instruction, written `op src2, src1, dst`.
+    fn encode_vex_rrm(&self, pp: u8, opcode: u8, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 3 {
+            return Err(RasError::EncodingError(
+                "VEX arithmetic requires 3 operands".into(),
+            ));
+        }
+        let (rm, rm_wide) = self.parse_vector_rm(&operands[0])?;
+        let (first, first_wide) = parse_vector(operands[1].trim()).ok_or_else(|| {
+            RasError::EncodingError("VEX arithmetic: first source must be a vector register".into())
+        })?;
+        let (reg, reg_wide) = parse_vector(operands[2].trim()).ok_or_else(|| {
+            RasError::EncodingError("VEX arithmetic: destination must be a vector register".into())
+        })?;
+        encode_op(Op {
+            opcode: &[opcode],
+            reg,
+            rm,
+            vex: Some(Vex {
+                pp,
+                len256: rm_wide || first_wide || reg_wide,
+                vvvv: first,
+                ..Vex::default()
+            }),
+            ..Op::default()
+        })
+    }
+
+    /// A VEX shift by an immediate, written `op $count, src, dst`, which keeps
+    /// the shifted register in the r/m field and the destination in `vvvv`.
+    /// `vmovd` between a general register or memory and the low lane of a
+    /// vector register. `6e` writes the vector, `7e` reads it.
+    fn encode_vmovd(&self, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 2 {
+            return Err(RasError::EncodingError("vmovd requires 2 operands".into()));
+        }
+        let src = operands[0].trim();
+        let dst = operands[1].trim();
+        let (opcode, reg, rm) = match (parse_vector(src), parse_vector(dst)) {
+            (None, Some((reg, _))) => (0x6e, reg, self.parse_rm(src, false)?.0),
+            (Some((reg, _)), None) => (0x7e, reg, self.parse_rm(dst, false)?.0),
+            _ => {
+                return Err(RasError::EncodingError(
+                    "vmovd moves between a vector register and a general register or memory".into(),
+                ));
+            }
+        };
+        encode_op(Op {
+            opcode: &[opcode],
+            reg,
+            rm,
+            vex: Some(Vex {
+                pp: 1,
+                ..Vex::default()
+            }),
+            ..Op::default()
+        })
+    }
+
+    /// `vextracti128 $lane, src, dst` takes the 128-bit half named by the
+    /// immediate out of a 256-bit source.
+    fn encode_vextracti128(&self, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 3 {
+            return Err(RasError::EncodingError(
+                "vextracti128 requires 3 operands".into(),
+            ));
+        }
+        let lane = immediate_byte(&operands[0])?;
+        let reg = parse_vector(operands[1].trim())
+            .map(|(number, _)| number)
+            .ok_or_else(|| {
+                RasError::EncodingError("vextracti128: source must be a vector register".into())
+            })?;
+        let (rm, _) = self.parse_vector_rm(&operands[2])?;
+        encode_op(Op {
+            opcode: &[0x39],
+            reg,
+            rm,
+            imm: &[lane],
+            vex: Some(Vex {
+                map: 3,
+                pp: 1,
+                len256: true,
+                ..Vex::default()
+            }),
+            ..Op::default()
+        })
+    }
+
+    fn encode_vex_shift(&self, digit: u8, operands: &[String]) -> Result<Encoded, RasError> {
+        if operands.len() != 3 {
+            return Err(RasError::EncodingError(
+                "VEX shift requires 3 operands".into(),
+            ));
+        }
+        let count = immediate_byte(&operands[0])?;
+        let (rm, rm_wide) = parse_vector(operands[1].trim()).ok_or_else(|| {
+            RasError::EncodingError("VEX shift: source must be a vector register".into())
+        })?;
+        let (dst, dst_wide) = parse_vector(operands[2].trim()).ok_or_else(|| {
+            RasError::EncodingError("VEX shift: destination must be a vector register".into())
+        })?;
+        encode_op(Op {
+            opcode: &[0x73],
+            reg: digit,
+            rm: Rm::Reg(rm),
+            imm: &[count],
+            vex: Some(Vex {
+                pp: 1,
+                len256: rm_wide || dst_wide,
+                vvvv: dst,
+                ..Vex::default()
+            }),
             ..Op::default()
         })
     }
@@ -1485,6 +1662,42 @@ impl InstructionEncoder for X86_64Encoder {
                 };
                 code.push(base + u8::from(!opcode.ends_with('b')));
             }
+            "vmovdqa" => {
+                let enc = self.encode_vex_move(1, 0x6f, 0x7f, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vmovdqu" => {
+                let enc = self.encode_vex_move(2, 0x6f, 0x7f, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vmovd" => {
+                let enc = self.encode_vmovd(&inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vpaddd" => {
+                let enc = self.encode_vex_rrm(1, 0xfe, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vpxor" => {
+                let enc = self.encode_vex_rrm(1, 0xef, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vpsrldq" => {
+                let enc = self.encode_vex_shift(3, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vextracti128" => {
+                let enc = self.encode_vextracti128(&inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vzeroupper" => {
+                if !inst.operands.is_empty() {
+                    return Err(RasError::EncodingError(
+                        "vzeroupper takes no operands".into(),
+                    ));
+                }
+                code.extend_from_slice(&[0xc5, 0xf8, 0x77]);
+            }
             "nop" => {
                 if !inst.operands.is_empty() {
                     return Err(RasError::EncodingError("nop takes no operands".to_string()));
@@ -1652,6 +1865,51 @@ struct Op<'a> {
     reg: u8,
     rm: Rm,
     imm: &'a [u8],
+    vex: Option<Vex>,
+}
+
+/// The parts of a VEX prefix that vary between instructions.
+///
+/// `map` selects the opcode map the escape bytes would otherwise name: 1 for
+/// `0f`, 2 for `0f 38`, 3 for `0f 3a`. `pp` carries the legacy prefix in the
+/// same way: 0 for none, 1 for `66`, 2 for `f3`, 3 for `f2`. `vvvv` names the
+/// extra source operand by its plain register number; the prefix carries it
+/// inverted, so an instruction without one leaves it at zero.
+#[derive(Clone, Copy)]
+struct Vex {
+    map: u8,
+    pp: u8,
+    len256: bool,
+    wide: bool,
+    vvvv: u8,
+}
+
+impl Default for Vex {
+    fn default() -> Self {
+        Self {
+            map: 1,
+            pp: 0,
+            len256: false,
+            wide: false,
+            vvvv: 0,
+        }
+    }
+}
+
+impl Vex {
+    /// Two-byte form when the fields it cannot express are all at their
+    /// defaults, otherwise the three-byte form.
+    fn emit(self, rex_r: u8, rex_x: u8, rex_b: u8, bytes: &mut Vec<u8>) {
+        let tail = ((!self.vvvv & 15) << 3) | (u8::from(self.len256) << 2) | self.pp;
+        if self.map == 1 && !self.wide && rex_x == 0 && rex_b == 0 {
+            bytes.push(0xc5);
+            bytes.push(((1 - rex_r) << 7) | tail);
+            return;
+        }
+        bytes.push(0xc4);
+        bytes.push(((1 - rex_r) << 7) | ((1 - rex_x) << 6) | ((1 - rex_b) << 5) | self.map);
+        bytes.push((u8::from(self.wide) << 7) | tail);
+    }
 }
 
 fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
@@ -1708,20 +1966,24 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
             }
         }
     }
-    let rex = 0x40 | (u8::from(op.wide) << 3) | ((op.reg >> 3) << 2) | (rex_x << 1) | rex_b;
-    let needs_rex = rex != 0x40 || op.byte_rex;
-    if op.high && needs_rex {
-        return Err(RasError::EncodingError(
-            "High byte registers cannot use REX".into(),
-        ));
-    }
     let mut bytes = Vec::new();
     if seg {
         bytes.push(0x64);
     }
-    bytes.extend_from_slice(op.legacy);
-    if needs_rex {
-        bytes.push(rex);
+    if let Some(vex) = op.vex {
+        vex.emit(op.reg >> 3, rex_x, rex_b, &mut bytes);
+    } else {
+        let rex = 0x40 | (u8::from(op.wide) << 3) | ((op.reg >> 3) << 2) | (rex_x << 1) | rex_b;
+        let needs_rex = rex != 0x40 || op.byte_rex;
+        if op.high && needs_rex {
+            return Err(RasError::EncodingError(
+                "High byte registers cannot use REX".into(),
+            ));
+        }
+        bytes.extend_from_slice(op.legacy);
+        if needs_rex {
+            bytes.push(rex);
+        }
     }
     bytes.extend_from_slice(op.opcode);
     let tail_start = bytes.len();
@@ -1732,6 +1994,17 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     });
     bytes.extend_from_slice(op.imm);
     Ok(Encoded { bytes, rip })
+}
+
+/// An `$imm` operand narrowed to the single byte the encoding carries.
+fn immediate_byte(operand: &str) -> Result<u8, RasError> {
+    let value = operand
+        .trim()
+        .strip_prefix('$')
+        .map(parse_imm)
+        .ok_or_else(|| RasError::EncodingError("Expected an immediate operand".into()))??;
+    u8::try_from(value)
+        .map_err(|_| RasError::EncodingError(format!("Immediate out of range: {}", value)))
 }
 
 fn disp32(value: i64) -> Result<[u8; 4], RasError> {
@@ -1968,6 +2241,17 @@ fn parse_xmm(s: &str) -> Option<u8> {
     if n < 16 { Some(n) } else { None }
 }
 
+/// A vector register of either width, as its number and whether it is 256-bit.
+fn parse_vector(s: &str) -> Option<(u8, bool)> {
+    let s = s.trim_start_matches('%');
+    let (rest, len256) = match s.strip_prefix("ymm") {
+        Some(rest) => (rest, true),
+        None => (s.strip_prefix("xmm")?, false),
+    };
+    let n: u8 = rest.parse().ok()?;
+    if n < 16 { Some((n, len256)) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2013,6 +2297,91 @@ mod tests {
             encode_one("movabsq", &["$4294967296", "%r9"]),
             vec![0x49, 0xb9, 0, 0, 0, 0, 1, 0, 0, 0]
         );
+    }
+
+    /// Expected bytes come from GNU as.
+    #[test]
+    fn avx_encodings_match_gnu_as() {
+        let cases: &[(&str, &[&str], &[u8])] = &[
+            ("vmovdqa", &["%xmm0", "%xmm1"], &[0xc5, 0xf9, 0x6f, 0xc8]),
+            ("vmovdqa", &["%xmm9", "%xmm2"], &[0xc5, 0x79, 0x7f, 0xca]),
+            ("vmovdqa", &["%xmm3", "%xmm11"], &[0xc5, 0x79, 0x6f, 0xdb]),
+            ("vmovdqa", &["%ymm0", "%ymm1"], &[0xc5, 0xfd, 0x6f, 0xc8]),
+            (
+                "vmovdqa",
+                &["%ymm12", "%ymm13"],
+                &[0xc4, 0x41, 0x7d, 0x6f, 0xec],
+            ),
+            (
+                "vmovdqa",
+                &["16(%rsp)", "%xmm0"],
+                &[0xc5, 0xf9, 0x6f, 0x44, 0x24, 0x10],
+            ),
+            (
+                "vmovdqa",
+                &["%ymm15", "128(%r13)"],
+                &[0xc4, 0x41, 0x7d, 0x7f, 0xbd, 0x80, 0x00, 0x00, 0x00],
+            ),
+            (
+                "vmovdqu",
+                &["%ymm8", "%ymm9"],
+                &[0xc4, 0x41, 0x7e, 0x6f, 0xc8],
+            ),
+            (
+                "vmovdqu",
+                &["%ymm3", "100(%rax,%rbx,4)"],
+                &[0xc5, 0xfe, 0x7f, 0x5c, 0x98, 0x64],
+            ),
+            ("vmovd", &["%eax", "%xmm0"], &[0xc5, 0xf9, 0x6e, 0xc0]),
+            (
+                "vmovd",
+                &["%xmm8", "%r12d"],
+                &[0xc4, 0x41, 0x79, 0x7e, 0xc4],
+            ),
+            (
+                "vpaddd",
+                &["%xmm1", "%xmm2", "%xmm3"],
+                &[0xc5, 0xe9, 0xfe, 0xd9],
+            ),
+            (
+                "vpaddd",
+                &["%ymm9", "%ymm10", "%ymm11"],
+                &[0xc4, 0x41, 0x2d, 0xfe, 0xd9],
+            ),
+            (
+                "vpxor",
+                &["%ymm7", "%ymm8", "%ymm9"],
+                &[0xc5, 0x3d, 0xef, 0xcf],
+            ),
+            (
+                "vpsrldq",
+                &["$8", "%xmm0", "%xmm1"],
+                &[0xc5, 0xf1, 0x73, 0xd8, 0x08],
+            ),
+            (
+                "vpsrldq",
+                &["$4", "%xmm12", "%xmm13"],
+                &[0xc4, 0xc1, 0x11, 0x73, 0xdc, 0x04],
+            ),
+            (
+                "vextracti128",
+                &["$1", "%ymm0", "%xmm1"],
+                &[0xc4, 0xe3, 0x7d, 0x39, 0xc1, 0x01],
+            ),
+            (
+                "vextracti128",
+                &["$1", "%ymm2", "16(%rsp)"],
+                &[0xc4, 0xe3, 0x7d, 0x39, 0x54, 0x24, 0x10, 0x01],
+            ),
+            ("vzeroupper", &[], &[0xc5, 0xf8, 0x77]),
+        ];
+        for (opcode, operands, expected) in cases {
+            assert_eq!(
+                &encode_one(opcode, operands),
+                expected,
+                "{opcode} {operands:?}"
+            );
+        }
     }
 
     #[test]
