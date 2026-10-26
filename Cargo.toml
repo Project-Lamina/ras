@@ -25,6 +25,22 @@ lamina-codegen = "0.1.1"
 libc = "0.2"
 log = "0.4"
 
+[[test]]
+name = "aarch64_oracle"
+required-features = ["encoder"]
+
+[[test]]
+name = "riscv_oracle"
+required-features = ["encoder"]
+
+[[test]]
+name = "riscv_labels"
+required-features = ["encoder"]
+
+[[test]]
+name = "x86_oracle"
+required-features = ["encoder"]
+
 [features]
 default = []
 encoder = ["lamina-mir"]
