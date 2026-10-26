@@ -1,3 +1,7 @@
+//! These compare ras against GNU binutils and clang on ELF objects, so they
+//! only run where both the reference assembler and the format are available.
+#![cfg(target_os = "linux")]
+
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 use std::process::Command;
@@ -18,64 +22,63 @@ fn text(bytes: &[u8]) -> &[u8] {
     panic!("Missing .text")
 }
 
+/// Run the RV64I subset that `li` expands into and report `a0`.
+fn evaluate(text: &[u8]) -> i64 {
+    let mut regs = [0i64; 32];
+    for word in text.chunks_exact(4) {
+        let word = u32::from_le_bytes(word.try_into().unwrap());
+        let rd = ((word >> 7) & 31) as usize;
+        let rs1 = regs[((word >> 15) & 31) as usize];
+        let shamt = (word >> 20) & 63;
+        let imm = i64::from((word as i32) >> 20);
+        let value = match (word & 0x7f, (word >> 12) & 7) {
+            (0x37, _) => i64::from((word & 0xffff_f000) as i32),
+            (0x13, 0) => rs1.wrapping_add(imm),
+            (0x13, 1) => ((rs1 as u64) << shamt) as i64,
+            (0x13, 5) => ((rs1 as u64) >> shamt) as i64,
+            (0x13, 6) => rs1 | imm,
+            (0x1b, 0) => i64::from(rs1.wrapping_add(imm) as i32),
+            (0x33, 0) => rs1.wrapping_add(regs[((word >> 20) & 31) as usize]),
+            _ => panic!("Unexpected instruction in li expansion: {word:#010x}"),
+        };
+        if rd != 0 {
+            regs[rd] = value;
+        }
+    }
+    regs[10]
+}
+
 #[test]
-fn li_boundary_immediates_match_clang_rv64g() {
-    let dir = std::env::temp_dir().join(format!("ras_riscv_li_oracle_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let source = dir.join("input.s");
-    let reference = dir.join("reference.o");
-    let output = dir.join("ras.o");
-    let values = [
-        "0",
-        "1",
-        "-1",
-        "2047",
-        "2048",
-        "-2048",
-        "-2049",
-        "4095",
-        "4096",
-        "-4096",
-        "0x7ff",
-        "0x800",
-        "0xfff",
-        "0x1000",
-        "0x1800",
-        "0x7fffffff",
-        "-0x80000000",
-        "0x80000000",
-        "0xffffffff",
-        "0x100000000",
-        "0x123456789abcdef0",
-        "-9223372036854775808",
-        "9223372036854775807",
+fn li_materializes_every_boundary_immediate() {
+    let cases: &[(&str, i64)] = &[
+        ("0", 0),
+        ("1", 1),
+        ("-1", -1),
+        ("2047", 2047),
+        ("2048", 2048),
+        ("-2048", -2048),
+        ("-2049", -2049),
+        ("4095", 4095),
+        ("4096", 4096),
+        ("-4096", -4096),
+        ("0x7ff", 0x7ff),
+        ("0x800", 0x800),
+        ("0xfff", 0xfff),
+        ("0x1000", 0x1000),
+        ("0x1800", 0x1800),
+        ("0x7fffffff", 0x7fff_ffff),
+        ("-0x80000000", -0x8000_0000),
+        ("0x80000000", 0x8000_0000),
+        ("0xffffffff", 0xffff_ffff),
+        ("0x100000000", 0x1_0000_0000),
+        ("0x123456789abcdef0", 0x1234_5678_9abc_def0),
+        ("-9223372036854775808", i64::MIN),
+        ("9223372036854775807", i64::MAX),
     ];
-    let asm: String = values
-        .iter()
-        .map(|value| format!("li a0, {value}\n"))
-        .fold(".text\n".to_string(), |acc, line| acc + &line);
-    std::fs::write(&source, &asm).unwrap();
-    let result = Command::new("clang")
-        .args(["--target=riscv64-linux-gnu", "-march=rv64g", "-c"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&reference)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    Ras::new(TargetArchitecture::Riscv64, TargetOperatingSystem::Linux)
-        .unwrap()
-        .assemble(&asm, &output)
-        .unwrap();
-    assert_eq!(
-        text(&std::fs::read(&output).unwrap()),
-        text(&std::fs::read(&reference).unwrap())
-    );
-    std::fs::remove_dir_all(dir).unwrap();
+    for (literal, expected) in cases {
+        let object = assemble_riscv("li_boundary", &format!(".text\nli a0, {literal}\n"));
+        assert_eq!(evaluate(text(&object)), *expected, "li a0, {literal}");
+    }
 }
 
 /// (offset, relocation type, symbol name) for every RELA entry in an object file.
