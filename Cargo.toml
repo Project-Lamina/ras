@@ -1,6 +1,6 @@
 [package]
 name = "lamina-ras"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Eira <eira@nornity.com>"]
@@ -19,9 +19,9 @@ name = "ras"
 path = "src/lib.rs"
 
 [dependencies]
-lamina-platform = "0.1.2"
-lamina-mir = { version = "0.1.1", optional = true }
-lamina-codegen = "0.1.2"
+lamina-platform = "0.2.0"
+lamina-mir = { version = "0.2.0", optional = true }
+lamina-codegen = "0.2.0"
 libc = "0.2"
 log = "0.4"
 
@@ -44,3 +44,8 @@ required-features = ["encoder"]
 [features]
 default = []
 encoder = ["lamina-mir"]
+
+[patch.crates-io]
+lamina-platform = { path = "../lamina/lamina-platform" }
+lamina-mir = { path = "../lamina/lamina-mir" }
+lamina-codegen = { path = "../lamina/lamina-codegen" }
