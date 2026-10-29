@@ -90,6 +90,52 @@ fn data_reg(reg: &str) -> Result<(u32, DataKind), RasError> {
     Ok((u32::from(register(reg)?), kind))
 }
 
+fn exclusive_data(op: &str, reg: &str) -> Result<(u32, u32), RasError> {
+    let (rt, kind) = data_reg(reg)?;
+    if op.ends_with('b') || op.ends_with('h') {
+        if kind != DataKind::W {
+            return Err(error(format!("{op} requires a w register")));
+        }
+        let size = if op.ends_with('b') { 0 } else { 0x4000_0000 };
+        return Ok((rt, size));
+    }
+    match kind {
+        DataKind::W => Ok((rt, 0x8000_0000)),
+        DataKind::X => Ok((rt, 0xc000_0000)),
+        _ => Err(error(format!("{op} requires a general purpose register"))),
+    }
+}
+
+fn exclusive_base(address: &str) -> Result<u32, RasError> {
+    let inside = address
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| error(format!("Expected [base] address: {address}")))?;
+    let (rn, wide) = gpr(inside.trim())?;
+    if !wide {
+        return Err(error("Address base must be an x register or sp"));
+    }
+    Ok(rn)
+}
+
+fn vector_8b(reg: &str) -> Result<u32, RasError> {
+    let number = reg
+        .strip_prefix('v')
+        .and_then(|r| r.strip_suffix(".8b"))
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| *n < 32)
+        .ok_or_else(|| error(format!("Expected a v<n>.8b register: {reg}")))?;
+    Ok(number)
+}
+
+fn scalar_b(reg: &str) -> Result<u32, RasError> {
+    reg.strip_prefix('b')
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| *n < 32)
+        .ok_or_else(|| error(format!("Expected a b<n> register: {reg}")))
+}
+
 /// Register numbers of the first `N` operands, all general purpose registers of one width.
 fn gpr_regs<const N: usize>(p: &[String]) -> Result<([u32; N], bool), RasError> {
     let mut regs = [0; N];
@@ -873,6 +919,64 @@ impl AArch64Encoder {
                 };
                 base | imm | (rn << 5) | rt
             }
+            "ldxr" | "ldxrb" | "ldxrh" | "ldaxr" | "ldaxrb" | "ldaxrh" => {
+                let (rt, size) = exclusive_data(op, arg(0)?)?;
+                let base = if op.starts_with("ldax") {
+                    0x085f_fc00
+                } else {
+                    0x085f_7c00
+                };
+                base | size | (exclusive_base(arg(1)?)? << 5) | rt
+            }
+            "stxr" | "stxrb" | "stxrh" | "stlxr" | "stlxrb" | "stlxrh" => {
+                let (rs, status_wide) = gpr(arg(0)?)?;
+                if status_wide {
+                    return Err(error(format!("{op} status register must be a w register")));
+                }
+                let (rt, size) = exclusive_data(op, arg(1)?)?;
+                let base = if op.starts_with("stl") {
+                    0x0800_fc00
+                } else {
+                    0x0800_7c00
+                };
+                base | size | (rs << 16) | (exclusive_base(arg(2)?)? << 5) | rt
+            }
+            "ldar" | "ldarb" | "ldarh" => {
+                let (rt, size) = exclusive_data(op, arg(0)?)?;
+                0x08df_fc00 | size | (exclusive_base(arg(1)?)? << 5) | rt
+            }
+            "stlr" | "stlrb" | "stlrh" => {
+                let (rt, size) = exclusive_data(op, arg(0)?)?;
+                0x089f_fc00 | size | (exclusive_base(arg(1)?)? << 5) | rt
+            }
+            "rbit" | "rev" | "rev16" | "clz" => {
+                let ([rd, rn], wide) = gpr_regs::<2>(p)?;
+                let base = match (op, wide) {
+                    ("rbit", false) => 0x5ac0_0000,
+                    ("rbit", true) => 0xdac0_0000,
+                    ("rev16", false) => 0x5ac0_0400,
+                    ("rev16", true) => 0xdac0_0400,
+                    ("rev", false) => 0x5ac0_0800,
+                    ("rev", true) => 0xdac0_0c00,
+                    ("clz", false) => 0x5ac0_1000,
+                    _ => 0xdac0_1000,
+                };
+                base | (rn << 5) | rd
+            }
+            "neg" => {
+                let ([rd, rm], wide) = gpr_regs::<2>(p)?;
+                let base = if wide { 0xcb00_03e0 } else { 0x4b00_03e0 };
+                base | (rm << 16) | rd
+            }
+            "cnt" => {
+                let (rd, rn) = (vector_8b(arg(0)?)?, vector_8b(arg(1)?)?);
+                0x0e20_5800 | (rn << 5) | rd
+            }
+            "addv" => {
+                let rd = scalar_b(arg(0)?)?;
+                let rn = vector_8b(arg(1)?)?;
+                0x0e31_b800 | (rn << 5) | rd
+            }
             _ => return Err(error(format!("Unsupported instruction: {op}"))),
         };
         Ok(word.to_le_bytes().to_vec())
@@ -887,5 +991,39 @@ impl InstructionEncoder for AArch64Encoder {
     }
     fn current_position(&self) -> usize {
         self.position
+    }
+}
+
+#[cfg(test)]
+mod exclusive_tests {
+    use super::*;
+
+    fn word(op: &str, operands: &[&str]) -> u32 {
+        let inst = ParsedInstruction {
+            opcode: op.to_string(),
+            operands: operands.iter().map(|s| s.to_string()).collect(),
+        };
+        let bytes = AArch64Encoder::new().encode_instruction(&inst).unwrap();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    #[test]
+    fn exclusive_and_ordered_access_match_arm_arm() {
+        assert_eq!(word("ldxr", &["x0", "[x1]"]), 0xC85F_7C20);
+        assert_eq!(word("stlxr", &["w2", "x3", "[x4]"]), 0xC802_FC83);
+        assert_eq!(word("ldaxrb", &["w5", "[sp]"]), 0x085F_FFE5);
+        assert_eq!(word("ldarh", &["w0", "[x0]"]), 0x48DF_FC00);
+        assert_eq!(word("stlr", &["x1", "[x2]"]), 0xC89F_FC41);
+        assert_eq!(word("stxrb", &["w1", "w2", "[x3]"]), 0x0801_7C62);
+    }
+
+    #[test]
+    fn bit_count_and_reverse_match_arm_arm() {
+        assert_eq!(word("rbit", &["x0", "x1"]), 0xDAC0_0020);
+        assert_eq!(word("rev", &["w0", "w1"]), 0x5AC0_0820);
+        assert_eq!(word("clz", &["w2", "w3"]), 0x5AC0_1062);
+        assert_eq!(word("neg", &["x0", "x1"]), 0xCB01_03E0);
+        assert_eq!(word("cnt", &["v0.8b", "v1.8b"]), 0x0E20_5820);
+        assert_eq!(word("addv", &["b0", "v1.8b"]), 0x0E31_B820);
     }
 }

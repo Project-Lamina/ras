@@ -927,6 +927,49 @@ impl X86_64Encoder {
         })
     }
 
+    fn encode_exchange(&self, opcode: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let Some((stem, width)) = exchange_mnemonic(opcode) else {
+            return Err(RasError::EncodingError(format!(
+                "Unsupported instruction: {opcode}"
+            )));
+        };
+        let [src, dst] = operands else {
+            return Err(RasError::EncodingError(format!(
+                "{stem} requires 2 operands"
+            )));
+        };
+        let (src_rm, src_gpr) = self.parse_rm(src, false)?;
+        let (dst_rm, dst_gpr) = self.parse_rm(dst, false)?;
+        let Rm::Reg(reg) = src_rm else {
+            return Err(RasError::EncodingError(format!(
+                "{stem} requires a register source"
+            )));
+        };
+        let width = operand_width(Some(width), &[src_gpr, dst_gpr])?;
+        check_alu_width(width)?;
+        let (byte_rex, high) = byte_flags(&[src_gpr, dst_gpr]);
+        let (escape, byte_op, wide_op) = match stem {
+            "xchg" => (false, 0x86, 0x87),
+            "xadd" => (true, 0xc0, 0xc1),
+            _ => (true, 0xb0, 0xb1),
+        };
+        let mut bytes = Vec::new();
+        if escape {
+            bytes.push(0x0f);
+        }
+        bytes.push(if width == 8 { byte_op } else { wide_op });
+        encode_op(Op {
+            legacy: if width == 16 { &[0x66] } else { &[] },
+            wide: width == 64,
+            byte_rex,
+            high,
+            opcode: &bytes,
+            reg,
+            rm: dst_rm,
+            ..Op::default()
+        })
+    }
+
     fn encode_movzx(&self, opcode: &str, operands: &[String]) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError(
@@ -1065,6 +1108,8 @@ impl InstructionEncoder for X86_64Encoder {
                     | "cltd"
                     | "ud2"
                     | "syscall"
+                    | "mfence"
+                    | "rdtsc"
             )
         {
             return Err(RasError::EncodingError(format!(
@@ -1192,15 +1237,15 @@ impl InstructionEncoder for X86_64Encoder {
                 }
                 code.extend_from_slice(&[0x0f, 0xc8 | (reg.num & 7)]);
             }
-            "btl" | "btq" | "btsl" | "btsq" | "btrl" | "btrq" | "btcl" | "btcq" | "bsrl"
-            | "bsrq" => {
+            "btl" | "btq" | "btsl" | "btsq" | "btrl" | "btrq" | "btcl" | "btcq" | "bsfl"
+            | "bsfq" | "bsrl" | "bsrq" => {
                 let [src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError(
                         "bit operation requires 2 operands".into(),
                     ));
                 };
                 let width = if opcode.ends_with('q') { 64 } else { 32 };
-                let scan = opcode.starts_with("bsr");
+                let scan = opcode.starts_with("bs");
                 let (rm, rm_gpr) = self.parse_rm(if scan { src } else { dst }, false)?;
                 let digit = if opcode.starts_with("bts") {
                     5
@@ -1224,7 +1269,14 @@ impl InstructionEncoder for X86_64Encoder {
                             RasError::EncodingError("bit operation requires register".into())
                         })?;
                         operand_width(Some(width), &[rm_gpr, Some(reg)])?;
-                        (if scan { 0xbd } else { 0xa3 + (digit - 4) * 8 }, reg.num)
+                        let op = if opcode.starts_with("bsf") {
+                            0xbc
+                        } else if scan {
+                            0xbd
+                        } else {
+                            0xa3 + (digit - 4) * 8
+                        };
+                        (op, reg.num)
                     };
                 code = self.emit(encode_op(Op {
                     wide: width == 64,
@@ -1235,6 +1287,37 @@ impl InstructionEncoder for X86_64Encoder {
                     ..Op::default()
                 })?);
             }
+            "popcntw" | "popcntl" | "popcntq" => {
+                let [src, dst] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError("popcnt requires 2 operands".into()));
+                };
+                let width = if opcode.ends_with('q') {
+                    64
+                } else if opcode.ends_with('w') {
+                    16
+                } else {
+                    32
+                };
+                let (rm, rm_gpr) = self.parse_rm(src, false)?;
+                let reg = gpr(dst).ok_or_else(|| {
+                    RasError::EncodingError("popcnt requires register destination".into())
+                })?;
+                operand_width(Some(width), &[rm_gpr, Some(reg)])?;
+                code = self.emit(encode_op(Op {
+                    legacy: if width == 16 { &[0x66, 0xf3] } else { &[0xf3] },
+                    wide: width == 64,
+                    opcode: &[0x0f, 0xb8],
+                    reg: reg.num,
+                    rm,
+                    ..Op::default()
+                })?);
+            }
+            "xchgb" | "xchgw" | "xchgl" | "xchgq" | "xaddb" | "xaddw" | "xaddl" | "xaddq"
+            | "cmpxchgb" | "cmpxchgw" | "cmpxchgl" | "cmpxchgq" => {
+                code = self.emit(self.encode_exchange(&opcode, &inst.operands)?);
+            }
+            "mfence" => code.extend_from_slice(&[0x0f, 0xae, 0xf0]),
+            "rdtsc" => code.extend_from_slice(&[0x0f, 0x31]),
             "ret" => match inst.operands.as_slice() {
                 [] => code.push(0xC3),
                 [imm] => {
@@ -1621,10 +1704,11 @@ impl InstructionEncoder for X86_64Encoder {
                         "notrack requires indirect branch".into(),
                     ));
                 }
+                let lockable = exchange_mnemonic(&nested_opcode).is_some()
+                    || alu_mnemonic(&nested_opcode)
+                        .is_some_and(|(stem, _)| !matches!(stem, "cmp" | "test"));
                 if opcode == "lock"
-                    && (alu_mnemonic(&nested_opcode)
-                        .is_none_or(|(stem, _)| matches!(stem, "cmp" | "test"))
-                        || !operands.last().is_some_and(|op| self.is_memory(op)))
+                    && (!lockable || !operands.last().is_some_and(|op| self.is_memory(op)))
                 {
                     return Err(RasError::EncodingError(
                         "unsupported lock instruction".into(),
@@ -2246,6 +2330,12 @@ fn sized_stem(opcode: &str, stem: &str) -> Option<Option<u8>> {
     }
 }
 
+fn exchange_mnemonic(opcode: &str) -> Option<(&'static str, u8)> {
+    ["xchg", "xadd", "cmpxchg"]
+        .into_iter()
+        .find_map(|stem| sized_stem(opcode, stem)?.map(|width| (stem, width)))
+}
+
 fn shift_mnemonic(opcode: &str) -> Option<(u8, Option<u8>)> {
     [
         ("rol", 0),
@@ -2565,6 +2655,32 @@ mod tests {
             encode_one("movq", &["foo@GOTPCREL(%rip)", "%rax"]),
             vec![0x48, 0x8b, 0x05, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn exchange_popcnt_and_scan_match_sdm_bytes() {
+        assert_eq!(
+            encode_one("xchgq", &["%rax", "%rcx"]),
+            vec![0x48, 0x87, 0xc1]
+        );
+        assert_eq!(
+            encode_one("lock", &["cmpxchgq %r10", "(%r11)"]),
+            vec![0xf0, 0x4d, 0x0f, 0xb1, 0x13]
+        );
+        assert_eq!(
+            encode_one("lock", &["xaddb %al", "(%r10)"]),
+            vec![0xf0, 0x41, 0x0f, 0xc0, 0x02]
+        );
+        assert_eq!(
+            encode_one("popcntq", &["%rax", "%rax"]),
+            vec![0xf3, 0x48, 0x0f, 0xb8, 0xc0]
+        );
+        assert_eq!(
+            encode_one("bsfq", &["%rax", "%rax"]),
+            vec![0x48, 0x0f, 0xbc, 0xc0]
+        );
+        assert_eq!(encode_one("mfence", &[]), vec![0x0f, 0xae, 0xf0]);
+        assert_eq!(encode_one("rdtsc", &[]), vec![0x0f, 0x31]);
     }
 
     fn encode_with_fixup(opcode: &str, operands: &[&str]) -> (Vec<u8>, Option<RipFixup>) {

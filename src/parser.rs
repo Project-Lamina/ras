@@ -62,6 +62,8 @@ pub struct SymbolAttributes {
     pub weak: bool,
     pub global: bool,
     pub hidden: bool,
+    pub internal_visibility: bool,
+    pub protected: bool,
     pub local: bool,
     pub common: Option<(u64, u64)>,
     pub symbol_type: u8,
@@ -402,6 +404,23 @@ impl AssemblyParser {
                     }
                     symbol_name(name)?;
                     self.attributes.entry(name.into()).or_default().local = true;
+                }
+            }
+            ".internal" | ".protected" => {
+                for name in line[parts[0].len()..].split(',').map(str::trim) {
+                    if name.is_empty() {
+                        return Err(RasError::ParseError(format!(
+                            "{} requires symbol",
+                            parts[0]
+                        )));
+                    }
+                    symbol_name(name)?;
+                    let attributes = self.attributes.entry(name.into()).or_default();
+                    if parts[0] == ".internal" {
+                        attributes.internal_visibility = true;
+                    } else {
+                        attributes.protected = true;
+                    }
                 }
             }
             ".hidden" => {

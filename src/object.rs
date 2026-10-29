@@ -269,12 +269,24 @@ fn write_elf64_section_header_full<W: Write>(
     Ok(())
 }
 
+fn elf_visibility(attributes: &crate::parser::SymbolAttributes) -> u8 {
+    if attributes.internal_visibility {
+        1
+    } else if attributes.hidden {
+        2
+    } else if attributes.protected {
+        3
+    } else {
+        0
+    }
+}
+
 fn write_elf64_symbol<W: Write>(
     w: &mut W,
     name_offset: u32,
     bind: u8,
     sym_type: u8,
-    hidden: bool,
+    visibility: u8,
     section_index: u16,
     value: u64,
 ) -> Result<(), RasError> {
@@ -282,7 +294,7 @@ fn write_elf64_symbol<W: Write>(
     w.write_all(&name_offset.to_le_bytes()).map_err(map)?;
     w.write_all(&[(bind << 4) | (sym_type & 0xf)])
         .map_err(map)?;
-    w.write_all(&[if hidden { 2 } else { 0 }]).map_err(map)?;
+    w.write_all(&[visibility]).map_err(map)?;
     w.write_all(&section_index.to_le_bytes()).map_err(map)?;
     w.write_all(&value.to_le_bytes()).map_err(map)?;
     w.write_all(&0u64.to_le_bytes()).map_err(map)?; // st_size
@@ -441,7 +453,7 @@ impl ObjectWriter for ElfWriter {
                 + 1;
             let index = symtab.len() / ELF64_SYM_SIZE as usize;
             section_symbols.insert(symbol.section.as_str(), index as u32);
-            write_elf64_symbol(&mut symtab, 0, 0, 3, false, section as u16, 0)?;
+            write_elf64_symbol(&mut symtab, 0, 0, 3, 0, section as u16, 0)?;
         }
         let mut defined: Vec<_> = object_symbols
             .iter()
@@ -483,7 +495,7 @@ impl ObjectWriter for ElfWriter {
                     u8::from(sym.global)
                 },
                 sym.attributes.symbol_type,
-                sym.attributes.hidden,
+                elf_visibility(&sym.attributes),
                 section as u16,
                 sym.value,
             )?;
@@ -509,7 +521,7 @@ impl ObjectWriter for ElfWriter {
                 let name = strtab.len() as u32;
                 strtab.extend_from_slice(reloc.symbol.as_bytes());
                 strtab.push(0);
-                write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, false, 0, 0)?;
+                write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, 0, 0, 0)?;
             }
         }
         let mut groups: std::collections::BTreeMap<&str, Vec<u32>> =
@@ -877,6 +889,12 @@ fn write_field(data: &mut [u8], offset: usize, width: usize, value: i64) -> Resu
 }
 
 fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+    if let Some(sym) = req.symbols.iter().find(|s| s.attributes.protected) {
+        return Err(RasError::ObjectError(format!(
+            "protected visibility is not supported for Mach-O: {}",
+            sym.name
+        )));
+    }
     let arm64 = req.target_arch == TargetArchitecture::Aarch64;
     let (cputype, cpusubtype) = match req.target_arch {
         TargetArchitecture::X86_64 => (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL),
@@ -1035,7 +1053,7 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
                 let mut n_desc = 0;
                 if ext {
                     n_type |= N_EXT;
-                    if sym.attributes.hidden {
+                    if sym.attributes.hidden || sym.attributes.internal_visibility {
                         n_type |= N_PEXT;
                     }
                     if sym.attributes.weak {

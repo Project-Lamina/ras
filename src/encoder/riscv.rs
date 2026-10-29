@@ -382,6 +382,41 @@ impl RiscVEncoder {
 
     /// `fence` takes predecessor and successor sets, each a subset of `iorw`
     /// or a 4-bit number. With no operands it orders everything (`iorw, iorw`).
+    fn encode_atomic(&self, name: &str, ops: &[String]) -> Result<Vec<u8>, RasError> {
+        let Some((funct5, funct3, ordering)) = atomic_encoding(name) else {
+            return Err(RasError::EncodingError(format!(
+                "Unknown RISC-V instruction: {name}"
+            )));
+        };
+        let is_lr = funct5 == 0b00010;
+        let (rd, rs2, mem) = match (is_lr, ops) {
+            (true, [rd, mem]) => (rd, "zero", mem),
+            (false, [rd, rs2, mem]) => (rd, rs2.as_str(), mem),
+            _ => {
+                return Err(RasError::EncodingError(format!(
+                    "{name} takes {}",
+                    if is_lr { "rd, (rs1)" } else { "rd, rs2, (rs1)" }
+                )));
+            }
+        };
+        let (rs1, offset) = self.parse_mem_operand(mem)?;
+        if offset != 0 {
+            return Err(RasError::EncodingError(format!(
+                "{name} takes no address offset"
+            )));
+        }
+        let rd = self.parse_register(rd)?;
+        let rs2 = self.parse_register(rs2)?;
+        Ok(Self::emit(Self::r_type(
+            (funct5 << 2) | ordering,
+            rs2,
+            rs1,
+            funct3,
+            rd,
+            0x2F,
+        )))
+    }
+
     fn encode_fence(&self, ops: &[String]) -> Result<Vec<u8>, RasError> {
         let (pred, succ) = match ops {
             [] => (0xF, 0xF),
@@ -470,6 +505,34 @@ impl RiscVEncoder {
 
 /// Single-instruction ALU and jump pseudo-instructions, rewritten to the base
 /// mnemonic they stand for.
+fn atomic_encoding(name: &str) -> Option<(u8, u8, u8)> {
+    let (base, ordering) = [(".aqrl", 3), (".aq", 2), (".rl", 1)]
+        .into_iter()
+        .find_map(|(suffix, bits)| Some((name.strip_suffix(suffix)?, bits)))
+        .unwrap_or((name, 0));
+    let (op, width) = base.rsplit_once('.')?;
+    let funct3 = match width {
+        "w" => 0b010,
+        "d" => 0b011,
+        _ => return None,
+    };
+    let funct5 = match op {
+        "lr" => 0b00010,
+        "sc" => 0b00011,
+        "amoswap" => 0b00001,
+        "amoadd" => 0b00000,
+        "amoxor" => 0b00100,
+        "amoand" => 0b01100,
+        "amoor" => 0b01000,
+        "amomin" => 0b10000,
+        "amomax" => 0b10100,
+        "amominu" => 0b11000,
+        "amomaxu" => 0b11100,
+        _ => return None,
+    };
+    Some((funct5, funct3, ordering))
+}
+
 fn expand_alu_pseudo(
     opcode: &str,
     ops: &[String],
@@ -813,6 +876,7 @@ impl InstructionEncoder for RiscVEncoder {
                 Self::emit(Self::j_type(offset, 1, 0x6F))
             }
 
+            name if atomic_encoding(name).is_some() => self.encode_atomic(name, ops)?,
             _ => {
                 return Err(RasError::EncodingError(format!(
                     "Unknown RISC-V instruction: {}",
@@ -1015,5 +1079,16 @@ mod tests {
             .unwrap();
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!((word >> 25) & 0x7F, 1);
+    }
+
+    #[test]
+    fn atomic_encodings_match_unprivileged_spec() {
+        let word = |op: &str, ops: &[&str]| {
+            let bytes = enc().encode_instruction(&instr(op, ops)).unwrap();
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        };
+        assert_eq!(word("lr.w", &["a0", "(a1)"]), 0x1005_A52F);
+        assert_eq!(word("amoadd.d.aqrl", &["a0", "a2", "(a1)"]), 0x06C5_B52F);
+        assert_eq!(word("sc.w.rl", &["a3", "a4", "(a5)"]), 0x1AE7_A6AF);
     }
 }
