@@ -99,7 +99,6 @@ impl RiscVEncoder {
 
     fn parse_imm(&self, s: &str) -> Result<i64, RasError> {
         let s = s.trim();
-        // Strip optional '#' or leading '+'.
         let s = s.trim_start_matches('#');
         if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             i64::from_str_radix(hex, 16)
@@ -147,7 +146,6 @@ impl RiscVEncoder {
             let base = self.parse_register(reg_str)?;
             Ok((base, offset))
         } else {
-            // No offset: treat the whole string as a register with offset 0
             Ok((self.parse_register(s)?, 0))
         }
     }

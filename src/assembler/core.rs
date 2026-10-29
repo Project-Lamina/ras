@@ -123,8 +123,9 @@ pub struct RasAssembler {
     object_writer: Box<dyn ObjectWriter>,
     object_write_options: ObjectWriteOptions,
     pub(crate) function_pointers: HashMap<String, u64>,
+    /// Module being compiled, used to tell internal calls from external ones.
     #[cfg(feature = "encoder")]
-    pub(crate) current_module: Option<*const lamina_mir::Module>, // Current module being compiled (for internal call detection)
+    pub(crate) current_module: Option<*const lamina_mir::Module>,
 }
 
 enum PatchPoint {
@@ -1776,7 +1777,6 @@ impl RasAssembler {
                     }
                 }
             } else {
-                // Unresolved symbol → external relocation for the linker.
                 match patch {
                     PatchPoint::X86Rel32 { offset, .. } => {
                         external_relocs.push(ExternalReloc {
@@ -1876,12 +1876,10 @@ impl RasAssembler {
             let symbol = CString::new(name)
                 .map_err(|e| RasError::EncodingError(format!("Invalid function name: {}", e)))?;
 
-            // Try to resolve using RTLD_DEFAULT first (searches already loaded libraries)
-            // This is safer and doesn't require opening/closing handles
+            // RTLD_DEFAULT searches the already loaded libraries, with no handle to open or close.
             let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
 
             if ptr.is_null() {
-                // Fallback: try opening libc explicitly
                 unsafe {
                     libc::dlerror();
                 }

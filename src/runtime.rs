@@ -358,7 +358,6 @@ mod tests {
         };
         assert!(result.is_err(), "writing beyond capacity should fail");
     }
-
 }
 
 /// Run JIT output on the **host** CPU (x86_64 or aarch64 only). Skips when the host OS string

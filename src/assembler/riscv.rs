@@ -196,7 +196,7 @@ fn emit_sraw(rd: u8, rs1: u8, rs2: u8) -> [u8; 4] {
     r_type(0x20, rs2, rs1, 0x5, rd, 0x3B)
 }
 
-// SLT / SLTU: rd = (rs1 < rs2) ? 1 : 0
+/// SLT / SLTU: rd = (rs1 < rs2) ? 1 : 0
 #[inline]
 fn emit_slt(rd: u8, rs1: u8, rs2: u8) -> [u8; 4] {
     r_type(0x00, rs2, rs1, 0x2, rd, 0x33)
@@ -206,13 +206,13 @@ fn emit_sltu(rd: u8, rs1: u8, rs2: u8) -> [u8; 4] {
     r_type(0x00, rs2, rs1, 0x3, rd, 0x33)
 }
 
-// SLTIU rd, rs, 1  →  seqz rd, rs  (rd = (rs == 0))
+/// SLTIU rd, rs, 1  →  seqz rd, rs  (rd = (rs == 0))
 #[inline]
 fn emit_sltiu_1(rd: u8, rs: u8) -> [u8; 4] {
     i_type(1, rs, 0x3, rd, 0x13)
 }
 
-// XORI rd, rs, 1  →  flip LSB (toggle 0/1 bool result)
+/// XORI rd, rs, 1  →  flip LSB (toggle 0/1 bool result)
 #[inline]
 fn emit_xori_1(rd: u8, rs: u8) -> [u8; 4] {
     i_type(1, rs, 0x4, rd, 0x13)
@@ -236,7 +236,7 @@ fn emit_sw(rs2: u8, rs1: u8, offset: i32) -> [u8; 4] {
     s_type(offset, rs2, rs1, 0x2, 0x23)
 }
 
-// LUI: rd = imm20 << 12
+/// LUI: rd = imm20 << 12
 #[inline]
 fn emit_lui(rd: u8, imm20: i32) -> [u8; 4] {
     u_type(imm20, rd, 0x37)
@@ -248,19 +248,19 @@ fn emit_jalr(rd: u8, rs1: u8, offset: i32) -> [u8; 4] {
     i_type(offset, rs1, 0x0, rd, 0x67)
 }
 
-// RET = JALR x0, 0(x1)
+/// RET = JALR x0, 0(x1)
 #[inline]
 fn emit_ret() -> [u8; 4] {
     i_type(0, REG_RA, 0x0, REG_ZERO, 0x67)
 }
 
-// MV rd, rs  =  ADDI rd, rs, 0
+/// MV rd, rs  =  ADDI rd, rs, 0
 #[inline]
 fn emit_mv(rd: u8, rs: u8) -> [u8; 4] {
     emit_addi(rd, rs, 0)
 }
 
-// JAL x0, offset  (unconditional jump, discard return addr)
+/// JAL x0, offset  (unconditional jump, discard return addr)
 #[inline]
 fn emit_jal_zero(offset: i32) -> [u8; 4] {
     j_type(offset, REG_ZERO)
@@ -278,10 +278,8 @@ fn emit_bne(rs1: u8, rs2: u8, offset: i32) -> [u8; 4] {
 
 fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
     if (-2048..=2047).contains(&imm) {
-        // addi rd, x0, imm
         code.extend_from_slice(&emit_addi(rd, REG_ZERO, imm as i32));
     } else if (-0x8000_0000i64..=0x7FFF_FFFFi64).contains(&imm) {
-        // lui + addi (32-bit range)
         let lower = (imm as i32) & 0xFFF;
         let lower_sext = if lower >= 2048 { lower - 4096 } else { lower };
         let upper = ((imm as i32) - lower_sext + (1 << 11)) >> 12;
@@ -290,8 +288,6 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
             code.extend_from_slice(&emit_addi(rd, rd, lower_sext));
         }
     } else {
-        // Full 64-bit: LUI+ADDI for upper half, SLLI, LUI+ADDI for lower, OR
-        // Build lower 32 bits in rd, upper 32 bits in t2, then combine.
         let lo32 = imm as i32;
         let hi32 = (imm >> 32) as i32;
 
@@ -334,7 +330,7 @@ fn emit_li64(code: &mut Vec<u8>, rd: u8, imm: i64) {
     }
 }
 
-// Offsets are relative to FP (s0/x8)
+/// Offsets are relative to FP (s0/x8)
 fn emit_store_to_fp(code: &mut Vec<u8>, src: u8, offset: i32, rv64: bool) {
     if rv64 {
         code.extend_from_slice(&emit_sd(src, REG_FP, offset));
@@ -365,10 +361,8 @@ fn encode_prologue(frame_size: usize, rv64: bool) -> Result<Vec<u8>, RasError> {
 
     let mut code = Vec::with_capacity(16);
     code.extend_from_slice(&emit_addi(REG_SP, REG_SP, -(total as i32)));
-    // sd/sw ra, (total-8)(sp)
     if rv64 {
         code.extend_from_slice(&emit_sd(REG_RA, REG_SP, (total - 8) as i32));
-        // sd/sw fp, (total-16)(sp)
         code.extend_from_slice(&emit_sd(REG_FP, REG_SP, (total - 16) as i32));
     } else {
         code.extend_from_slice(&emit_sw(REG_RA, REG_SP, (total - 8) as i32));
@@ -708,7 +702,6 @@ fn encode_instruction(
                 }
                 materialize_operand(code, arg, ARG_REGS[i], stack_slots, rv64)?;
             }
-            // Emit epilogue then replace the trailing RET with a JAL to target.
             let epilogue = encode_epilogue(frame_size, rv64)?;
             code.extend_from_slice(&epilogue);
             // Truncate the 4-byte RET that encode_epilogue appends
@@ -736,10 +729,14 @@ fn encode_instruction(
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BranchFixupOp {
-    Jal,     // JAL x0, offset  (unconditional, offset in J-type)
-    JalRa,   // JAL ra, offset  (call, offset in J-type)
-    TailJal, // JAL x0, offset  (tail call, target is always a function)
-    Bne,     // BNE rs1, x0, offset  (rs1 already baked in the placeholder)
+    /// JAL x0, offset. Unconditional, offset in J-type.
+    Jal,
+    /// JAL ra, offset. Call, offset in J-type.
+    JalRa,
+    /// JAL x0, offset. Tail call, target is always a function.
+    TailJal,
+    /// BNE rs1, x0, offset. rs1 is already baked into the placeholder.
+    Bne,
 }
 
 #[cfg(feature = "encoder")]
@@ -789,7 +786,7 @@ pub fn compile_mir_riscv_function(
         .max(256);
     code.reserve(reserve);
 
-    // Cross-function fixups (for Call / TailCall between sibling functions)
+    /// A Call or TailCall to a sibling function, patched once every function has an offset.
     struct FnFixup {
         abs_offset: usize,
         target_name: String,
@@ -852,7 +849,6 @@ pub fn compile_mir_riscv_function(
         let mut block_offsets: HashMap<String, usize> = HashMap::new();
         let mut local_fixups: Vec<(usize, String, BranchFixupOp)> = Vec::new();
 
-        // We need a per-function local code buffer so absolute offsets work.
         for block in &func.blocks {
             block_offsets.insert(block.label.clone(), code.len());
 
@@ -892,7 +888,6 @@ pub fn compile_mir_riscv_function(
             {
                 patch_branch(&mut code, abs_off, target_off, op)?;
             } else {
-                // Maybe an inter-function call target — defer
                 cross_fn_fixups.push(FnFixup {
                     abs_offset: abs_off,
                     target_name: target,
@@ -951,7 +946,6 @@ fn patch_branch(
                     delta
                 )));
             }
-            // Re-encode BNE t0, x0, delta preserving original rs1/rs2
             let word = b_type(delta as i32, REG_ZERO, REG_T0, 0x1);
             code[patch_abs..patch_abs + 4].copy_from_slice(&word);
         }
@@ -983,10 +977,11 @@ mod tests {
     }
 
     #[test]
-    fn emit_li64_lui_addi() {
+    fn emit_li64_drops_the_addi_when_the_low_twelve_bits_are_zero() {
         let mut code = Vec::new();
-        emit_li64(&mut code, 10, 0x1000); // 4096 — needs LUI+ADDI
-        assert!(code.len() >= 4);
+        emit_li64(&mut code, 10, 0x1000);
+        // lui a0, 1
+        assert_eq!(code, [0x37, 0x15, 0x00, 0x00]);
     }
 
     #[test]

@@ -93,18 +93,14 @@ pub fn compile_mir_aarch64_function(
 
         let stack_size = frame.frame_size as usize;
 
-        // Ensure stack is 16-byte aligned (AAPCS64 requirement)
-        // The prologue saves x29, x30 (16 bytes), so we need to ensure
-        // the total stack frame is 16-byte aligned
+        // AAPCS64 wants the frame 16-byte aligned, and the prologue saves x29, x30 on top of it.
         let aligned_stack_size = (stack_size + 15) & !15;
 
         let prologue = encode_prologue(aligned_stack_size)?;
         code.extend_from_slice(&prologue);
 
-        // Handle function parameters: spill ABI arg registers to the FrameMap stack slots.
-        //
-        // Our JIT encoder currently materializes virtual registers by loading from their
-        // stack slot, so parameters must be stored to their slots up-front.
+        // The encoder materializes a virtual register by loading its stack slot, so the ABI
+        // argument registers have to be spilled to those slots first.
         if !func.sig.params.is_empty() {
             let arg_regs = AArch64ABI::ARG_REGISTERS;
 
@@ -197,7 +193,6 @@ pub fn compile_mir_aarch64_function(
             std::collections::HashMap::new();
         let mut branch_fixups: Vec<BranchFixup> = Vec::new();
 
-        // Compile blocks. Terminators are handled here (never silently dropped).
         for block in &func.blocks {
             block_offsets.insert(block.label.clone(), code.len());
 
@@ -1252,8 +1247,7 @@ fn encode_mir_instruction_with_context(
                         "print() intrinsic does not support stack-passed args".to_string(),
                     ));
                 }
-                // Resolve printf - try both "printf" and "_printf" on macOS
-                // The actual symbol name may vary, but dlsym usually finds "printf"
+                // macOS prefixes C symbols with an underscore, so "_printf" is the fallback name.
                 let printf_name = "printf";
                 let printf_name_alt = "_printf";
 
@@ -1263,7 +1257,6 @@ fn encode_mir_instruction_with_context(
                     *addr
                 } else {
                     if assembler.register_function(printf_name).is_err() {
-                        // Fallback to "_printf" on macOS
                         if assembler.target_os == lamina_platform::TargetOperatingSystem::MacOS {
                             if let Err(e) = assembler.register_function(printf_name_alt) {
                                 return Err(RasError::EncodingError(format!(
@@ -1501,10 +1494,18 @@ mod aarch64_jit_tail_call_tests {
             .expect("assembler");
         let module = fifteen_arg_tail_module();
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
-        assert!(
-            code.len() > 64,
-            "expected substantial machine code for 15-arg tail call, got {} bytes",
-            code.len()
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        let tail = words
+            .iter()
+            .position(|w| w >> 26 == 0b000101)
+            .expect("tail call branch");
+        assert_eq!(
+            words[tail - 1],
+            0xa8c1_7bfd,
+            "ldp x29, x30, [sp], #16 runs before the tail branch"
         );
     }
 
@@ -1551,10 +1552,23 @@ mod aarch64_jit_tail_call_tests {
         let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        let bl = words
+            .iter()
+            .position(|w| w >> 26 == 0b100101)
+            .expect("bl to the callee");
+        // 80 arguments, 8 of them in registers: the other 72 take 576 bytes of stack.
         assert!(
-            code.len() > 200,
-            "expected non-trivial encoding for 80-arg call, got {} bytes",
-            code.len()
+            words[..bl].contains(&0xd109_03ff),
+            "sub sp, sp, #576 before the call"
+        );
+        assert_eq!(
+            words[bl + 1],
+            0x9109_03ff,
+            "add sp, sp, #576 after the call"
         );
     }
 
@@ -1589,11 +1603,8 @@ mod aarch64_jit_tail_call_tests {
         let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
-        assert!(
-            code.len() > 32,
-            "expected prologue + scaled LDR + epilogue, got {} bytes",
-            code.len()
-        );
+        // ldr x9, [x10, #1024]: the unsigned-offset form scales imm12 by 8, so 1024 is 128.
+        assert!(subslice_present(&code, &0xf942_0149u32.to_le_bytes()));
     }
 
     #[test]
@@ -1622,11 +1633,8 @@ mod aarch64_jit_tail_call_tests {
         let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
-        assert!(
-            code.len() > 24,
-            "expected prologue + LEA path + epilogue, got {} bytes",
-            code.len()
-        );
+        // add x9, x9, #24
+        assert!(subslice_present(&code, &0x9100_6129u32.to_le_bytes()));
     }
 
     #[test]
@@ -1681,11 +1689,9 @@ mod aarch64_jit_tail_call_tests {
         let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
-        assert!(
-            code.len() > 32,
-            "expected prologue + select + epilogue, got {} bytes",
-            code.len()
-        );
+        // subs xzr, x11, xzr then csel x12, x9, x10, ne
+        assert!(subslice_present(&code, &0xeb1f_017fu32.to_le_bytes()));
+        assert!(subslice_present(&code, &0x9a8a_112cu32.to_le_bytes()));
     }
 
     #[test]
@@ -1720,11 +1726,6 @@ mod aarch64_jit_tail_call_tests {
         let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
-        assert!(
-            code.len() > 40,
-            "expected prologue + 32-bit subs/cset + epilogue, got {} bytes",
-            code.len()
-        );
         assert!(
             subslice_present(&code, &[0x3f, 0x01, 0x0a, 0x6b]),
             "subs wzr,w9,w10"
@@ -1767,11 +1768,6 @@ mod aarch64_jit_tail_call_tests {
         let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
-        assert!(
-            code.len() > 48,
-            "expected prologue + W-width add + typed STR + epilogue, got {} bytes",
-            code.len()
-        );
         assert!(code.ends_with(&[0xC0, 0x03, 0x5F, 0xD6]));
     }
 
