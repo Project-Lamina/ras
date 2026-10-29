@@ -201,6 +201,7 @@ get_fmt:
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
 
+    #[cfg(feature = "nightly")]
     #[test]
     fn test_assemble_arx64_label_resolution_to_elf() {
         let asm = r#"

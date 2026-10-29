@@ -1,6 +1,7 @@
 //! Binary instruction encoders for x86_64, AArch64, RISC-V, and PowerPC64.
 
 pub mod aarch64;
+#[cfg(feature = "nightly")]
 pub mod arx64;
 pub mod powerpc;
 pub mod riscv;

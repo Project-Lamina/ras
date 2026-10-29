@@ -93,6 +93,7 @@ const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
 const EM_PPC64: u16 = 21;
+#[cfg(feature = "nightly")]
 const EM_ARX64: u16 = 0xa064;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
@@ -109,6 +110,7 @@ fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
         TargetArchitecture::X86_64 => Some(EM_X86_64),
         TargetArchitecture::Aarch64 => Some(EM_AARCH64),
+        #[cfg(feature = "nightly")]
         TargetArchitecture::Arx64 => Some(EM_ARX64),
         TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64 => Some(EM_RISCV),
         TargetArchitecture::PowerPC64 => Some(EM_PPC64),

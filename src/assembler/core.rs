@@ -4,11 +4,12 @@
 //! that are architecture-independent. Uses two-pass assembly for jmp/call
 //! with label resolution.
 
+#[cfg(feature = "nightly")]
+use crate::encoder::arx64::Arx64Encoder;
 use crate::{
     dwarf::{self, LocRow},
     encoder::{
         aarch64::AArch64Encoder,
-        arx64::Arx64Encoder,
         powerpc::{PowerPcEncoder, branch_field_bits},
         riscv::RiscVEncoder,
         traits::{InstructionEncoder, ParsedInstruction, RipFixup, TlsModel},
@@ -176,11 +177,13 @@ enum PatchPoint {
         second: u32,
         call: bool,
     },
+    #[cfg(feature = "nightly")]
     Arx64Jal {
         offset: usize,
         target: String,
         rd: u8,
     },
+    #[cfg(feature = "nightly")]
     Arx64Branch {
         offset: usize,
         target: String,
@@ -225,6 +228,7 @@ impl RasAssembler {
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
             TargetArchitecture::X86_64 => Box::new(X86_64Encoder::new()),
             TargetArchitecture::Aarch64 => Box::new(AArch64Encoder::new()),
+            #[cfg(feature = "nightly")]
             TargetArchitecture::Arx64 => Box::new(Arx64Encoder::new()),
             TargetArchitecture::Riscv32 => Box::new(RiscVEncoder::new(false)),
             TargetArchitecture::Riscv64 => Box::new(RiscVEncoder::new(true)),
@@ -1090,6 +1094,7 @@ impl RasAssembler {
                         continue;
                     }
 
+                    #[cfg(feature = "nightly")]
                     if self.target_arch == TargetArchitecture::Arx64
                         && let Some(patch) =
                             arx64_label_patch(&opcode, &inst.operands, current_offset)?
@@ -1594,9 +1599,11 @@ impl RasAssembler {
                 | PatchPoint::AArch64 { target, .. }
                 | PatchPoint::X86Rel32 { target, .. }
                 | PatchPoint::X86RipRel32 { target, .. }
-                | PatchPoint::X86Tls { target, .. }
-                | PatchPoint::Arx64Jal { target, .. }
-                | PatchPoint::Arx64Branch { target, .. } => target,
+                | PatchPoint::X86Tls { target, .. } => target,
+                #[cfg(feature = "nightly")]
+                PatchPoint::Arx64Jal { target, .. } | PatchPoint::Arx64Branch { target, .. } => {
+                    target
+                }
             };
             if let PatchPoint::RiscvPair {
                 offset,
@@ -1758,11 +1765,13 @@ impl RasAssembler {
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
                         code[*offset..*offset + 4].copy_from_slice(&rel32_bytes);
                     }
+                    #[cfg(feature = "nightly")]
                     PatchPoint::Arx64Jal { offset, rd, .. } => {
                         let rel = (target_offset as i64) - (*offset as i64);
                         let word = arx64_j_type(RiscVEncoder::jump_offset(rel)?, *rd);
                         code[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
                     }
+                    #[cfg(feature = "nightly")]
                     PatchPoint::Arx64Branch {
                         offset,
                         rs1,
@@ -2261,6 +2270,7 @@ fn riscv_label_jump(opcode: &str, operands: &[String]) -> Option<(String, bool)>
         .then(|| (target.to_string(), jump))
 }
 
+#[cfg(feature = "nightly")]
 fn arx64_label_patch(
     opcode: &str,
     operands: &[String],
@@ -2309,6 +2319,7 @@ fn arx64_label_patch(
     }
 }
 
+#[cfg(feature = "nightly")]
 fn is_numeric(value: &str) -> bool {
     let value = value.trim();
     value.parse::<i64>().is_ok()
@@ -2318,6 +2329,7 @@ fn is_numeric(value: &str) -> bool {
             .is_some_and(|hex| i64::from_str_radix(hex, 16).is_ok())
 }
 
+#[cfg(feature = "nightly")]
 fn parse_arx64_reg(value: &str) -> Result<u8, RasError> {
     let value = value.trim().trim_start_matches('%');
     let raw = match value {
@@ -2341,6 +2353,7 @@ fn parse_arx64_reg(value: &str) -> Result<u8, RasError> {
     }
 }
 
+#[cfg(feature = "nightly")]
 fn arx64_j_type(offset: i32, rd: u8) -> u32 {
     let o = offset as u32;
     (((o >> 20) & 0x1) << 31)
@@ -2351,6 +2364,7 @@ fn arx64_j_type(offset: i32, rd: u8) -> u32 {
         | 0x6f
 }
 
+#[cfg(feature = "nightly")]
 fn arx64_b_type(offset: i32, rs2: u8, rs1: u8, funct3: u8) -> u32 {
     let o = offset as u32;
     (((o >> 12) & 0x1) << 31)

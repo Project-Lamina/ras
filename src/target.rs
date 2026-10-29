@@ -6,6 +6,7 @@ pub fn is_assembly_target_supported(arch: TargetArchitecture, os: TargetOperatin
     if !is_arch_encoded(arch) {
         return false;
     }
+    #[cfg(feature = "nightly")]
     if arch == TargetArchitecture::Arx64 {
         return matches!(
             os,
@@ -38,16 +39,23 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
     }
     match object_format_for_os(os) {
         // ELF is the complete writer and carries every encoded architecture.
-        Some(ObjectFormat::Elf) => !matches!(
-            (arch, os),
+        Some(ObjectFormat::Elf) => {
             // ARX64 and RISC-V exist on Linux and the BSDs only.
-            (
-                TargetArchitecture::Arx64
-                    | TargetArchitecture::Riscv32
-                    | TargetArchitecture::Riscv64,
-                TargetOperatingSystem::Orbis | TargetOperatingSystem::Prospero
+            #[cfg(feature = "nightly")]
+            if arch == TargetArchitecture::Arx64 {
+                return !matches!(
+                    os,
+                    TargetOperatingSystem::Orbis | TargetOperatingSystem::Prospero
+                );
+            }
+            !matches!(
+                (arch, os),
+                (
+                    TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64,
+                    TargetOperatingSystem::Orbis | TargetOperatingSystem::Prospero
+                )
             )
-        ),
+        }
         // The COFF writer rejects anything but x86_64, see object.rs.
         Some(ObjectFormat::Coff) => arch == TargetArchitecture::X86_64,
         Some(ObjectFormat::MachO) => {
@@ -92,11 +100,14 @@ pub fn is_jit_arch_supported(arch: TargetArchitecture) -> bool {
 }
 
 fn is_arch_encoded(arch: TargetArchitecture) -> bool {
+    #[cfg(feature = "nightly")]
+    if arch == TargetArchitecture::Arx64 {
+        return true;
+    }
     matches!(
         arch,
         TargetArchitecture::X86_64
             | TargetArchitecture::Aarch64
-            | TargetArchitecture::Arx64
             | TargetArchitecture::Riscv32
             | TargetArchitecture::Riscv64
             | TargetArchitecture::PowerPC64
@@ -110,6 +121,7 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
             arch
         )
     } else if !is_assembly_target_supported(arch, os) {
+        #[cfg(feature = "nightly")]
         if arch == TargetArchitecture::Arx64 {
             return format!(
                 "OS {:?} not supported for ARX64 ras output. Supported: Linux, FreeBSD, OpenBSD, NetBSD, DragonFly, Redox.",
