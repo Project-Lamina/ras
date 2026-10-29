@@ -400,3 +400,422 @@ fn cross_section_branch_relocation_kinds_match_gas() {
         [2, 2, 4]
     );
 }
+
+/// Every packed-SSE form the x86_64 backend can emit, against GNU as.
+#[test]
+fn packed_sse_forms_match_gas() {
+    const BINARY: &[&str] = &[
+        "paddb",
+        "paddw",
+        "paddd",
+        "paddq",
+        "psubb",
+        "psubw",
+        "psubd",
+        "psubq",
+        "pmullw",
+        "pmuludq",
+        "pmulld",
+        "pand",
+        "pandn",
+        "por",
+        "pxor",
+        "psllw",
+        "pslld",
+        "psllq",
+        "psrlw",
+        "psrld",
+        "psrlq",
+        "psraw",
+        "psrad",
+        "punpcklbw",
+        "punpcklwd",
+        "punpckldq",
+        "punpcklqdq",
+        "punpckhbw",
+        "punpckhwd",
+        "punpckhdq",
+        "punpckhqdq",
+        "pcmpeqb",
+        "pcmpeqw",
+        "pcmpeqd",
+        "pcmpgtb",
+        "pcmpgtw",
+        "pcmpgtd",
+        "addps",
+        "subps",
+        "mulps",
+        "divps",
+        "minps",
+        "maxps",
+        "sqrtps",
+        "andps",
+        "andnps",
+        "orps",
+        "xorps",
+        "unpcklps",
+        "unpckhps",
+        "addpd",
+        "subpd",
+        "mulpd",
+        "divpd",
+        "minpd",
+        "maxpd",
+        "sqrtpd",
+        "andpd",
+        "andnpd",
+        "orpd",
+        "xorpd",
+        "unpcklpd",
+        "unpckhpd",
+    ];
+    const SOURCES: &[&str] = &[
+        "%xmm0",
+        "%xmm7",
+        "%xmm8",
+        "%xmm15",
+        "(%rax)",
+        "(%r12)",
+        "(%r13)",
+        "(%rsp)",
+        "(%rbp)",
+        "1024(%rbx)",
+        "-128(%r14)",
+        "(%rax,%r9,8)",
+        "(%r12,%r13,2)",
+    ];
+    const DESTINATIONS: &[&str] = &["%xmm0", "%xmm6", "%xmm8", "%xmm14"];
+    let mut asm = String::from(".text\n");
+    for mnemonic in BINARY {
+        for source in SOURCES {
+            for destination in DESTINATIONS {
+                asm.push_str(&format!("{mnemonic} {source}, {destination}\n"));
+            }
+        }
+    }
+    for mnemonic in [
+        "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "pslldq", "psrldq",
+    ] {
+        for count in [0, 1, 31, 255] {
+            for destination in DESTINATIONS {
+                asm.push_str(&format!("{mnemonic} ${count}, {destination}\n"));
+            }
+        }
+    }
+    for mnemonic in ["pshufd", "pshuflw", "pshufhw", "shufps", "shufpd"] {
+        for source in SOURCES {
+            for destination in DESTINATIONS {
+                asm.push_str(&format!("{mnemonic} $27, {source}, {destination}\n"));
+            }
+        }
+    }
+    for mnemonic in ["movdqu", "movdqa", "movaps", "movapd", "movups"] {
+        for source in SOURCES {
+            for destination in DESTINATIONS {
+                asm.push_str(&format!("{mnemonic} {source}, {destination}\n"));
+                asm.push_str(&format!("{mnemonic} {destination}, {source}\n"));
+            }
+        }
+    }
+    let (output, reference) = oracle(&asm, "packed_sse");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// SSE4.1 lane transfers across both escape maps, register widths and REX.
+#[test]
+fn lane_transfer_forms_match_gas() {
+    const WORD: &[&str] = &[
+        "%eax", "%ecx", "%edi", "%esp", "%ebp", "%r8d", "%r13d", "%r15d",
+    ];
+    const QUAD: &[&str] = &[
+        "%rax", "%rcx", "%rdi", "%rsp", "%rbp", "%r8", "%r13", "%r15",
+    ];
+    const MEMORY: &[&str] = &["(%rax)", "(%r12,%r13,2)", "-9(%rbp)", "(%rsp)"];
+    const VECTORS: &[&str] = &["%xmm0", "%xmm7", "%xmm8", "%xmm15"];
+    let mut asm = String::from(".text\n");
+    for (suffix, registers, last) in [
+        ("b", WORD, 15),
+        ("w", WORD, 7),
+        ("d", WORD, 3),
+        ("q", QUAD, 1),
+    ] {
+        for vector in VECTORS {
+            for register in registers {
+                asm.push_str(&format!("pextr{suffix} $0, {vector}, {register}\n"));
+                asm.push_str(&format!("pinsr{suffix} ${last}, {register}, {vector}\n"));
+            }
+            if suffix == "w" {
+                continue;
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!("pextr{suffix} ${last}, {vector}, {memory}\n"));
+                asm.push_str(&format!("pinsr{suffix} $0, {memory}, {vector}\n"));
+            }
+        }
+    }
+    let (output, reference) = oracle(&asm, "lane_transfer");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// The encoded bytes of each packed form, pinned so a regression cannot hide
+/// behind a reference assembler that moved with it.
+#[test]
+fn packed_sse_encodings_are_pinned() {
+    const CASES: &[(&str, &str)] = &[
+        ("paddb %xmm1, %xmm2", "660ffcd1"),
+        ("paddb %xmm9, %xmm12", "66450ffce1"),
+        ("paddb 8(%rbp), %xmm3", "660ffc5d08"),
+        ("paddw %xmm1, %xmm2", "660ffdd1"),
+        ("paddw %xmm9, %xmm12", "66450ffde1"),
+        ("paddw 8(%rbp), %xmm3", "660ffd5d08"),
+        ("paddd %xmm1, %xmm2", "660ffed1"),
+        ("paddd %xmm9, %xmm12", "66450ffee1"),
+        ("paddd 8(%rbp), %xmm3", "660ffe5d08"),
+        ("paddq %xmm1, %xmm2", "660fd4d1"),
+        ("paddq %xmm9, %xmm12", "66450fd4e1"),
+        ("paddq 8(%rbp), %xmm3", "660fd45d08"),
+        ("psubb %xmm1, %xmm2", "660ff8d1"),
+        ("psubb %xmm9, %xmm12", "66450ff8e1"),
+        ("psubb 8(%rbp), %xmm3", "660ff85d08"),
+        ("psubw %xmm1, %xmm2", "660ff9d1"),
+        ("psubw %xmm9, %xmm12", "66450ff9e1"),
+        ("psubw 8(%rbp), %xmm3", "660ff95d08"),
+        ("psubd %xmm1, %xmm2", "660ffad1"),
+        ("psubd %xmm9, %xmm12", "66450ffae1"),
+        ("psubd 8(%rbp), %xmm3", "660ffa5d08"),
+        ("psubq %xmm1, %xmm2", "660ffbd1"),
+        ("psubq %xmm9, %xmm12", "66450ffbe1"),
+        ("psubq 8(%rbp), %xmm3", "660ffb5d08"),
+        ("pmullw %xmm1, %xmm2", "660fd5d1"),
+        ("pmullw %xmm9, %xmm12", "66450fd5e1"),
+        ("pmullw 8(%rbp), %xmm3", "660fd55d08"),
+        ("pmuludq %xmm1, %xmm2", "660ff4d1"),
+        ("pmuludq %xmm9, %xmm12", "66450ff4e1"),
+        ("pmuludq 8(%rbp), %xmm3", "660ff45d08"),
+        ("pmulld %xmm1, %xmm2", "660f3840d1"),
+        ("pmulld %xmm9, %xmm12", "66450f3840e1"),
+        ("pmulld 8(%rbp), %xmm3", "660f38405d08"),
+        ("pand %xmm1, %xmm2", "660fdbd1"),
+        ("pand %xmm9, %xmm12", "66450fdbe1"),
+        ("pand 8(%rbp), %xmm3", "660fdb5d08"),
+        ("pandn %xmm1, %xmm2", "660fdfd1"),
+        ("pandn %xmm9, %xmm12", "66450fdfe1"),
+        ("pandn 8(%rbp), %xmm3", "660fdf5d08"),
+        ("por %xmm1, %xmm2", "660febd1"),
+        ("por %xmm9, %xmm12", "66450febe1"),
+        ("por 8(%rbp), %xmm3", "660feb5d08"),
+        ("pxor %xmm1, %xmm2", "660fefd1"),
+        ("pxor %xmm9, %xmm12", "66450fefe1"),
+        ("pxor 8(%rbp), %xmm3", "660fef5d08"),
+        ("punpcklbw %xmm1, %xmm2", "660f60d1"),
+        ("punpcklbw %xmm9, %xmm12", "66450f60e1"),
+        ("punpcklbw 8(%rbp), %xmm3", "660f605d08"),
+        ("punpcklwd %xmm1, %xmm2", "660f61d1"),
+        ("punpcklwd %xmm9, %xmm12", "66450f61e1"),
+        ("punpcklwd 8(%rbp), %xmm3", "660f615d08"),
+        ("punpckldq %xmm1, %xmm2", "660f62d1"),
+        ("punpckldq %xmm9, %xmm12", "66450f62e1"),
+        ("punpckldq 8(%rbp), %xmm3", "660f625d08"),
+        ("punpcklqdq %xmm1, %xmm2", "660f6cd1"),
+        ("punpcklqdq %xmm9, %xmm12", "66450f6ce1"),
+        ("punpcklqdq 8(%rbp), %xmm3", "660f6c5d08"),
+        ("punpckhbw %xmm1, %xmm2", "660f68d1"),
+        ("punpckhbw %xmm9, %xmm12", "66450f68e1"),
+        ("punpckhbw 8(%rbp), %xmm3", "660f685d08"),
+        ("punpckhwd %xmm1, %xmm2", "660f69d1"),
+        ("punpckhwd %xmm9, %xmm12", "66450f69e1"),
+        ("punpckhwd 8(%rbp), %xmm3", "660f695d08"),
+        ("punpckhdq %xmm1, %xmm2", "660f6ad1"),
+        ("punpckhdq %xmm9, %xmm12", "66450f6ae1"),
+        ("punpckhdq 8(%rbp), %xmm3", "660f6a5d08"),
+        ("punpckhqdq %xmm1, %xmm2", "660f6dd1"),
+        ("punpckhqdq %xmm9, %xmm12", "66450f6de1"),
+        ("punpckhqdq 8(%rbp), %xmm3", "660f6d5d08"),
+        ("pcmpeqb %xmm1, %xmm2", "660f74d1"),
+        ("pcmpeqb %xmm9, %xmm12", "66450f74e1"),
+        ("pcmpeqb 8(%rbp), %xmm3", "660f745d08"),
+        ("pcmpeqw %xmm1, %xmm2", "660f75d1"),
+        ("pcmpeqw %xmm9, %xmm12", "66450f75e1"),
+        ("pcmpeqw 8(%rbp), %xmm3", "660f755d08"),
+        ("pcmpeqd %xmm1, %xmm2", "660f76d1"),
+        ("pcmpeqd %xmm9, %xmm12", "66450f76e1"),
+        ("pcmpeqd 8(%rbp), %xmm3", "660f765d08"),
+        ("pcmpgtb %xmm1, %xmm2", "660f64d1"),
+        ("pcmpgtb %xmm9, %xmm12", "66450f64e1"),
+        ("pcmpgtb 8(%rbp), %xmm3", "660f645d08"),
+        ("pcmpgtw %xmm1, %xmm2", "660f65d1"),
+        ("pcmpgtw %xmm9, %xmm12", "66450f65e1"),
+        ("pcmpgtw 8(%rbp), %xmm3", "660f655d08"),
+        ("pcmpgtd %xmm1, %xmm2", "660f66d1"),
+        ("pcmpgtd %xmm9, %xmm12", "66450f66e1"),
+        ("pcmpgtd 8(%rbp), %xmm3", "660f665d08"),
+        ("addps %xmm1, %xmm2", "0f58d1"),
+        ("addps %xmm9, %xmm12", "450f58e1"),
+        ("addps 8(%rbp), %xmm3", "0f585d08"),
+        ("subps %xmm1, %xmm2", "0f5cd1"),
+        ("subps %xmm9, %xmm12", "450f5ce1"),
+        ("subps 8(%rbp), %xmm3", "0f5c5d08"),
+        ("mulps %xmm1, %xmm2", "0f59d1"),
+        ("mulps %xmm9, %xmm12", "450f59e1"),
+        ("mulps 8(%rbp), %xmm3", "0f595d08"),
+        ("divps %xmm1, %xmm2", "0f5ed1"),
+        ("divps %xmm9, %xmm12", "450f5ee1"),
+        ("divps 8(%rbp), %xmm3", "0f5e5d08"),
+        ("minps %xmm1, %xmm2", "0f5dd1"),
+        ("minps %xmm9, %xmm12", "450f5de1"),
+        ("minps 8(%rbp), %xmm3", "0f5d5d08"),
+        ("maxps %xmm1, %xmm2", "0f5fd1"),
+        ("maxps %xmm9, %xmm12", "450f5fe1"),
+        ("maxps 8(%rbp), %xmm3", "0f5f5d08"),
+        ("sqrtps %xmm1, %xmm2", "0f51d1"),
+        ("sqrtps %xmm9, %xmm12", "450f51e1"),
+        ("sqrtps 8(%rbp), %xmm3", "0f515d08"),
+        ("andps %xmm1, %xmm2", "0f54d1"),
+        ("andps %xmm9, %xmm12", "450f54e1"),
+        ("andps 8(%rbp), %xmm3", "0f545d08"),
+        ("andnps %xmm1, %xmm2", "0f55d1"),
+        ("andnps %xmm9, %xmm12", "450f55e1"),
+        ("andnps 8(%rbp), %xmm3", "0f555d08"),
+        ("orps %xmm1, %xmm2", "0f56d1"),
+        ("orps %xmm9, %xmm12", "450f56e1"),
+        ("orps 8(%rbp), %xmm3", "0f565d08"),
+        ("xorps %xmm1, %xmm2", "0f57d1"),
+        ("xorps %xmm9, %xmm12", "450f57e1"),
+        ("xorps 8(%rbp), %xmm3", "0f575d08"),
+        ("unpcklps %xmm1, %xmm2", "0f14d1"),
+        ("unpcklps %xmm9, %xmm12", "450f14e1"),
+        ("unpcklps 8(%rbp), %xmm3", "0f145d08"),
+        ("unpckhps %xmm1, %xmm2", "0f15d1"),
+        ("unpckhps %xmm9, %xmm12", "450f15e1"),
+        ("unpckhps 8(%rbp), %xmm3", "0f155d08"),
+        ("addpd %xmm1, %xmm2", "660f58d1"),
+        ("addpd %xmm9, %xmm12", "66450f58e1"),
+        ("addpd 8(%rbp), %xmm3", "660f585d08"),
+        ("subpd %xmm1, %xmm2", "660f5cd1"),
+        ("subpd %xmm9, %xmm12", "66450f5ce1"),
+        ("subpd 8(%rbp), %xmm3", "660f5c5d08"),
+        ("mulpd %xmm1, %xmm2", "660f59d1"),
+        ("mulpd %xmm9, %xmm12", "66450f59e1"),
+        ("mulpd 8(%rbp), %xmm3", "660f595d08"),
+        ("divpd %xmm1, %xmm2", "660f5ed1"),
+        ("divpd %xmm9, %xmm12", "66450f5ee1"),
+        ("divpd 8(%rbp), %xmm3", "660f5e5d08"),
+        ("minpd %xmm1, %xmm2", "660f5dd1"),
+        ("minpd %xmm9, %xmm12", "66450f5de1"),
+        ("minpd 8(%rbp), %xmm3", "660f5d5d08"),
+        ("maxpd %xmm1, %xmm2", "660f5fd1"),
+        ("maxpd %xmm9, %xmm12", "66450f5fe1"),
+        ("maxpd 8(%rbp), %xmm3", "660f5f5d08"),
+        ("sqrtpd %xmm1, %xmm2", "660f51d1"),
+        ("sqrtpd %xmm9, %xmm12", "66450f51e1"),
+        ("sqrtpd 8(%rbp), %xmm3", "660f515d08"),
+        ("andpd %xmm1, %xmm2", "660f54d1"),
+        ("andpd %xmm9, %xmm12", "66450f54e1"),
+        ("andpd 8(%rbp), %xmm3", "660f545d08"),
+        ("andnpd %xmm1, %xmm2", "660f55d1"),
+        ("andnpd %xmm9, %xmm12", "66450f55e1"),
+        ("andnpd 8(%rbp), %xmm3", "660f555d08"),
+        ("orpd %xmm1, %xmm2", "660f56d1"),
+        ("orpd %xmm9, %xmm12", "66450f56e1"),
+        ("orpd 8(%rbp), %xmm3", "660f565d08"),
+        ("xorpd %xmm1, %xmm2", "660f57d1"),
+        ("xorpd %xmm9, %xmm12", "66450f57e1"),
+        ("xorpd 8(%rbp), %xmm3", "660f575d08"),
+        ("unpcklpd %xmm1, %xmm2", "660f14d1"),
+        ("unpcklpd %xmm9, %xmm12", "66450f14e1"),
+        ("unpcklpd 8(%rbp), %xmm3", "660f145d08"),
+        ("unpckhpd %xmm1, %xmm2", "660f15d1"),
+        ("unpckhpd %xmm9, %xmm12", "66450f15e1"),
+        ("unpckhpd 8(%rbp), %xmm3", "660f155d08"),
+        ("psllw %xmm1, %xmm2", "660ff1d1"),
+        ("psllw %xmm9, %xmm12", "66450ff1e1"),
+        ("psllw $5, %xmm2", "660f71f205"),
+        ("psllw $5, %xmm12", "66410f71f405"),
+        ("pslld %xmm1, %xmm2", "660ff2d1"),
+        ("pslld %xmm9, %xmm12", "66450ff2e1"),
+        ("pslld $5, %xmm2", "660f72f205"),
+        ("pslld $5, %xmm12", "66410f72f405"),
+        ("psllq %xmm1, %xmm2", "660ff3d1"),
+        ("psllq %xmm9, %xmm12", "66450ff3e1"),
+        ("psllq $5, %xmm2", "660f73f205"),
+        ("psllq $5, %xmm12", "66410f73f405"),
+        ("psrlw %xmm1, %xmm2", "660fd1d1"),
+        ("psrlw %xmm9, %xmm12", "66450fd1e1"),
+        ("psrlw $5, %xmm2", "660f71d205"),
+        ("psrlw $5, %xmm12", "66410f71d405"),
+        ("psrld %xmm1, %xmm2", "660fd2d1"),
+        ("psrld %xmm9, %xmm12", "66450fd2e1"),
+        ("psrld $5, %xmm2", "660f72d205"),
+        ("psrld $5, %xmm12", "66410f72d405"),
+        ("psrlq %xmm1, %xmm2", "660fd3d1"),
+        ("psrlq %xmm9, %xmm12", "66450fd3e1"),
+        ("psrlq $5, %xmm2", "660f73d205"),
+        ("psrlq $5, %xmm12", "66410f73d405"),
+        ("psraw %xmm1, %xmm2", "660fe1d1"),
+        ("psraw %xmm9, %xmm12", "66450fe1e1"),
+        ("psraw $5, %xmm2", "660f71e205"),
+        ("psraw $5, %xmm12", "66410f71e405"),
+        ("psrad %xmm1, %xmm2", "660fe2d1"),
+        ("psrad %xmm9, %xmm12", "66450fe2e1"),
+        ("psrad $5, %xmm2", "660f72e205"),
+        ("psrad $5, %xmm12", "66410f72e405"),
+        ("pslldq $5, %xmm2", "660f73fa05"),
+        ("pslldq $5, %xmm12", "66410f73fc05"),
+        ("psrldq $5, %xmm2", "660f73da05"),
+        ("psrldq $5, %xmm12", "66410f73dc05"),
+        ("shufps $27, %xmm1, %xmm2", "0fc6d11b"),
+        ("shufps $27, %xmm9, %xmm12", "450fc6e11b"),
+        ("pshufhw $27, %xmm1, %xmm2", "f30f70d11b"),
+        ("pextrb $1, %xmm2, %eax", "660f3a14d001"),
+        ("pextrb $1, %xmm12, %r9d", "66450f3a14e101"),
+        ("pextrb $1, %xmm12, 8(%rbp)", "66440f3a14650801"),
+        ("pinsrb $1, %eax, %xmm2", "660f3a20d001"),
+        ("pinsrb $1, %r9d, %xmm12", "66450f3a20e101"),
+        ("pinsrb $1, 8(%rbp), %xmm12", "66440f3a20650801"),
+        ("pextrd $1, %xmm2, %eax", "660f3a16d001"),
+        ("pextrd $1, %xmm12, %r9d", "66450f3a16e101"),
+        ("pextrd $1, %xmm12, 8(%rbp)", "66440f3a16650801"),
+        ("pinsrd $1, %eax, %xmm2", "660f3a22d001"),
+        ("pinsrd $1, %r9d, %xmm12", "66450f3a22e101"),
+        ("pinsrd $1, 8(%rbp), %xmm12", "66440f3a22650801"),
+        ("pextrq $1, %xmm2, %rax", "66480f3a16d001"),
+        ("pextrq $1, %xmm12, %r9", "664d0f3a16e101"),
+        ("pextrq $1, %xmm12, 8(%rbp)", "664c0f3a16650801"),
+        ("pinsrq $1, %rax, %xmm2", "66480f3a22d001"),
+        ("pinsrq $1, %r9, %xmm12", "664d0f3a22e101"),
+        ("pinsrq $1, 8(%rbp), %xmm12", "664c0f3a22650801"),
+    ];
+    for (asm, expected) in CASES {
+        let tmp = TempDir::new("pinned_sse");
+        let path = tmp.path().join("pinned.o");
+        Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .unwrap()
+            .assemble(&format!(".text\n{asm}\n"), &path)
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let encoded: String = text(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(&encoded, expected, "{asm}");
+    }
+}
+
+/// A lane transfer whose register width disagrees with the mnemonic is not
+/// silently encoded as the other width.
+#[test]
+fn lane_transfer_rejects_a_mismatched_register_width() {
+    for asm in [
+        "pextrd $0, %xmm0, %rax",
+        "pextrq $0, %xmm0, %eax",
+        "pinsrd $0, %rax, %xmm0",
+        "pinsrq $0, %eax, %xmm0",
+    ] {
+        let tmp = TempDir::new("lane_width");
+        let path = tmp.path().join("lane.o");
+        assert!(
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(&format!(".text\n{asm}\n"), &path)
+                .is_err(),
+            "{asm}"
+        );
+    }
+}

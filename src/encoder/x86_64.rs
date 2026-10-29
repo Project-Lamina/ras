@@ -814,7 +814,12 @@ impl X86_64Encoder {
         })
     }
 
-    fn encode_sse_shift(&self, digit: u8, operands: &[String]) -> Result<Encoded, RasError> {
+    fn encode_sse_shift(
+        &self,
+        group: u8,
+        digit: u8,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
         if operands.len() != 2 {
             return Err(RasError::EncodingError("shift requires 2 operands".into()));
         }
@@ -833,7 +838,7 @@ impl X86_64Encoder {
         }
         encode_op(Op {
             legacy: &[0x66],
-            opcode: &[0x0f, 0x73],
+            opcode: &[0x0f, group],
             reg: digit,
             rm: dst,
             imm: &[imm],
@@ -1473,6 +1478,53 @@ impl InstructionEncoder for X86_64Encoder {
                     ..Op::default()
                 })?);
             }
+            name if packed_sse(name).is_some() => {
+                let is_imm = inst
+                    .operands
+                    .first()
+                    .is_some_and(|op| op.trim().starts_with('$'));
+                let enc = match packed_shift_imm(name).filter(|_| is_imm) {
+                    Some((group, digit)) => self.encode_sse_shift(group, digit, &inst.operands)?,
+                    None => {
+                        let (prefix, map, op) = packed_sse(name).unwrap_or((false, 1, 0));
+                        let legacy: &[u8] = if prefix { &[0x66] } else { &[] };
+                        let opcode: &[u8] = if map == 2 {
+                            &[0x0f, 0x38, op]
+                        } else {
+                            &[0x0f, op]
+                        };
+                        self.encode_sse_rm(legacy, opcode, &inst.operands)?
+                    }
+                };
+                code = self.emit(enc);
+            }
+            name if lane_transfer(name).is_some() => {
+                let (op, wide, width) = lane_transfer(name).unwrap_or((0, false, 32));
+                let [imm, src, dst] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError(
+                        "lane transfer requires 3 operands".into(),
+                    ));
+                };
+                let imm = immediate_byte(imm)?;
+                let extract = name.starts_with("pextr");
+                let (xmm, other) = if extract { (src, dst) } else { (dst, src) };
+                let reg = parse_xmm(xmm).ok_or_else(|| {
+                    RasError::EncodingError(format!("{} requires an xmm operand", name))
+                })?;
+                let (rm, gpr) = self.parse_rm(other, false)?;
+                if gpr.is_some() {
+                    operand_width(Some(width), &[gpr])?;
+                }
+                code = self.emit(encode_op(Op {
+                    legacy: &[0x66],
+                    wide,
+                    opcode: &[0x0f, 0x3a, op],
+                    reg,
+                    rm,
+                    imm: &[imm],
+                    ..Op::default()
+                })?);
+            }
             "movdqu" => {
                 code = self.emit(self.encode_sse_move(
                     &[0xf3],
@@ -1496,18 +1548,11 @@ impl InstructionEncoder for X86_64Encoder {
                     &inst.operands,
                 )?);
             }
-            "punpcklqdq" | "punpckldq" | "pcmpeqd" | "comisd" | "ucomisd" | "paddb" | "paddw"
-            | "psubd" | "pand" => {
-                let op = match opcode.as_str() {
-                    "punpcklqdq" => 0x6c,
-                    "punpckldq" => 0x62,
-                    "pcmpeqd" => 0x76,
-                    "paddb" => 0xfc,
-                    "paddw" => 0xfd,
-                    "psubd" => 0xfa,
-                    "pand" => 0xdb,
-                    "comisd" => 0x2f,
-                    _ => 0x2e,
+            "comisd" | "ucomisd" => {
+                let op = if opcode.as_str() == "comisd" {
+                    0x2f
+                } else {
+                    0x2e
                 };
                 code = self.emit(self.encode_sse_rm(&[0x66], &[0x0f, op], &inst.operands)?);
             }
@@ -1519,7 +1564,7 @@ impl InstructionEncoder for X86_64Encoder {
                 };
                 code = self.emit(self.encode_sse_rm(&[], &[0x0f, op], &inst.operands)?);
             }
-            "pshufd" | "pshuflw" | "shufpd" => {
+            "pshufd" | "pshuflw" | "pshufhw" | "shufpd" | "shufps" => {
                 let [imm, src, dst] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError(
                         "shuffle requires 3 operands".into(),
@@ -1536,8 +1581,20 @@ impl InstructionEncoder for X86_64Encoder {
                     RasError::EncodingError("shuffle requires xmm destination".into())
                 })?;
                 code = self.emit(encode_op(Op {
-                    legacy: &[if opcode == "pshuflw" { 0xf2 } else { 0x66 }],
-                    opcode: &[0x0f, if opcode == "shufpd" { 0xc6 } else { 0x70 }],
+                    legacy: match opcode.as_str() {
+                        "pshuflw" => &[0xf2],
+                        "pshufhw" => &[0xf3],
+                        "shufps" => &[],
+                        _ => &[0x66],
+                    },
+                    opcode: &[
+                        0x0f,
+                        if matches!(opcode.as_str(), "shufpd" | "shufps") {
+                            0xc6
+                        } else {
+                            0x70
+                        },
+                    ],
                     reg,
                     rm,
                     imm: &[imm],
@@ -1640,20 +1697,15 @@ impl InstructionEncoder for X86_64Encoder {
                     self.encode_sse_move(&[], &[0x0f, 0x10], &[0x0f, 0x11], &inst.operands)?;
                 code = self.emit(enc);
             }
-            "pxor" => {
-                let enc = self.encode_sse_rm(&[0x66], &[0x0f, 0xef], &inst.operands)?;
-                code = self.emit(enc);
-            }
             "movdqa" => {
                 let enc =
                     self.encode_sse_move(&[0x66], &[0x0f, 0x6f], &[0x0f, 0x7f], &inst.operands)?;
                 code = self.emit(enc);
             }
             "addsd" | "addss" | "subsd" | "subss" | "mulsd" | "mulss" | "divsd" | "divss"
-            | "sqrtsd" | "sqrtss" | "minss" | "maxsd" | "maxss" | "paddd" => {
+            | "sqrtsd" | "sqrtss" | "minss" | "maxsd" | "maxss" => {
                 let legacy = match opcode.as_str() {
                     "addss" | "subss" | "mulss" | "divss" | "sqrtss" | "minss" | "maxss" => 0xf3,
-                    "paddd" => 0x66,
                     _ => 0xf2,
                 };
                 let op = match opcode.as_str() {
@@ -1663,14 +1715,15 @@ impl InstructionEncoder for X86_64Encoder {
                     "minss" => 0x5d,
                     "maxsd" | "maxss" => 0x5f,
                     "subsd" | "subss" => 0x5c,
-                    "divsd" | "divss" => 0x5e,
-                    _ => 0xfe,
+                    _ => 0x5e,
                 };
                 let enc = self.encode_sse_rm(&[legacy], &[0x0f, op], &inst.operands)?;
                 code = self.emit(enc);
             }
-            "psrldq" => {
-                let enc = self.encode_sse_shift(3, &inst.operands)?;
+            "pslldq" | "psrldq" => {
+                let (group, digit) = packed_shift_imm(opcode.as_str())
+                    .ok_or_else(|| RasError::EncodingError(format!("Unknown shift: {}", opcode)))?;
+                let enc = self.encode_sse_shift(group, digit, &inst.operands)?;
                 code = self.emit(enc);
             }
             "cwtl" => code.push(0x98),
@@ -2266,6 +2319,110 @@ fn immediate_byte(operand: &str) -> Result<u8, RasError> {
         .ok_or_else(|| RasError::EncodingError("Expected an immediate operand".into()))??;
     u8::try_from(value)
         .map_err(|_| RasError::EncodingError(format!("Immediate out of range: {}", value)))
+}
+
+/// Packed SSE operations of the form `op xmm/m128, xmm`, as
+/// `(66 prefix, opcode map, opcode byte)`; map 1 is `0f`, map 2 is `0f 38`.
+fn packed_sse(name: &str) -> Option<(bool, u8, u8)> {
+    let entry = match name {
+        "paddb" => (true, 1, 0xfc),
+        "paddw" => (true, 1, 0xfd),
+        "paddd" => (true, 1, 0xfe),
+        "paddq" => (true, 1, 0xd4),
+        "psubb" => (true, 1, 0xf8),
+        "psubw" => (true, 1, 0xf9),
+        "psubd" => (true, 1, 0xfa),
+        "psubq" => (true, 1, 0xfb),
+        "pmullw" => (true, 1, 0xd5),
+        "pmuludq" => (true, 1, 0xf4),
+        "pand" => (true, 1, 0xdb),
+        "pandn" => (true, 1, 0xdf),
+        "por" => (true, 1, 0xeb),
+        "pxor" => (true, 1, 0xef),
+        "psllw" => (true, 1, 0xf1),
+        "pslld" => (true, 1, 0xf2),
+        "psllq" => (true, 1, 0xf3),
+        "psrlw" => (true, 1, 0xd1),
+        "psrld" => (true, 1, 0xd2),
+        "psrlq" => (true, 1, 0xd3),
+        "psraw" => (true, 1, 0xe1),
+        "psrad" => (true, 1, 0xe2),
+        "punpcklbw" => (true, 1, 0x60),
+        "punpcklwd" => (true, 1, 0x61),
+        "punpckldq" => (true, 1, 0x62),
+        "punpcklqdq" => (true, 1, 0x6c),
+        "punpckhbw" => (true, 1, 0x68),
+        "punpckhwd" => (true, 1, 0x69),
+        "punpckhdq" => (true, 1, 0x6a),
+        "punpckhqdq" => (true, 1, 0x6d),
+        "pcmpeqb" => (true, 1, 0x74),
+        "pcmpeqw" => (true, 1, 0x75),
+        "pcmpeqd" => (true, 1, 0x76),
+        "pcmpgtb" => (true, 1, 0x64),
+        "pcmpgtw" => (true, 1, 0x65),
+        "pcmpgtd" => (true, 1, 0x66),
+        "addps" => (false, 1, 0x58),
+        "subps" => (false, 1, 0x5c),
+        "mulps" => (false, 1, 0x59),
+        "divps" => (false, 1, 0x5e),
+        "minps" => (false, 1, 0x5d),
+        "maxps" => (false, 1, 0x5f),
+        "sqrtps" => (false, 1, 0x51),
+        "andps" => (false, 1, 0x54),
+        "andnps" => (false, 1, 0x55),
+        "orps" => (false, 1, 0x56),
+        "xorps" => (false, 1, 0x57),
+        "unpcklps" => (false, 1, 0x14),
+        "unpckhps" => (false, 1, 0x15),
+        "addpd" => (true, 1, 0x58),
+        "subpd" => (true, 1, 0x5c),
+        "mulpd" => (true, 1, 0x59),
+        "divpd" => (true, 1, 0x5e),
+        "minpd" => (true, 1, 0x5d),
+        "maxpd" => (true, 1, 0x5f),
+        "sqrtpd" => (true, 1, 0x51),
+        "andpd" => (true, 1, 0x54),
+        "andnpd" => (true, 1, 0x55),
+        "orpd" => (true, 1, 0x56),
+        "xorpd" => (true, 1, 0x57),
+        "unpcklpd" => (true, 1, 0x14),
+        "unpckhpd" => (true, 1, 0x15),
+        "pmulld" => (true, 2, 0x40),
+        _ => return None,
+    };
+    Some(entry)
+}
+
+/// Shift-by-immediate forms, as `(group opcode, /digit)`.
+fn packed_shift_imm(name: &str) -> Option<(u8, u8)> {
+    let entry = match name {
+        "psrlw" => (0x71, 2),
+        "psraw" => (0x71, 4),
+        "psllw" => (0x71, 6),
+        "psrld" => (0x72, 2),
+        "psrad" => (0x72, 4),
+        "pslld" => (0x72, 6),
+        "psrlq" => (0x73, 2),
+        "psrldq" => (0x73, 3),
+        "psllq" => (0x73, 6),
+        "pslldq" => (0x73, 7),
+        _ => return None,
+    };
+    Some(entry)
+}
+
+/// SSE4.1 lane transfers, as `(opcode byte, REX.W, gpr width)`.
+fn lane_transfer(name: &str) -> Option<(u8, bool, u8)> {
+    let entry = match name {
+        "pextrb" => (0x14, false, 32),
+        "pextrd" => (0x16, false, 32),
+        "pextrq" => (0x16, true, 64),
+        "pinsrb" => (0x20, false, 32),
+        "pinsrd" => (0x22, false, 32),
+        "pinsrq" => (0x22, true, 64),
+        _ => return None,
+    };
+    Some(entry)
 }
 
 fn disp32(value: i64) -> Result<[u8; 4], RasError> {
