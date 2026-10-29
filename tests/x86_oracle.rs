@@ -819,3 +819,1330 @@ fn lane_transfer_rejects_a_mismatched_register_width() {
         );
     }
 }
+
+/// The SSE2, SSSE3, SSE4.1 and SSE4.2 forms GNU as accepts, across both
+/// escape maps, every register slot and the awkward addressing bases.
+#[test]
+fn extended_sse_forms_match_gas() {
+    const BINARY: &[&str] = &[
+        "pmaddwd",
+        "pshufb",
+        "packuswb",
+        "packsswb",
+        "packssdw",
+        "packusdw",
+        "pavgb",
+        "pavgw",
+        "psignb",
+        "psignw",
+        "psignd",
+        "pabsb",
+        "pabsw",
+        "pabsd",
+        "pminsb",
+        "pminsw",
+        "pminsd",
+        "pmaxsb",
+        "pmaxsw",
+        "pmaxsd",
+        "pminub",
+        "pminuw",
+        "pminud",
+        "pmaxub",
+        "pmaxuw",
+        "pmaxud",
+        "pcmpeqq",
+        "pcmpgtq",
+        "pmuldq",
+        "pmulhw",
+        "pmulhuw",
+        "pmulhrsw",
+        "pmaddubsw",
+        "psadbw",
+        "phaddw",
+        "phaddd",
+        "phaddsw",
+        "phsubw",
+        "phsubd",
+        "phsubsw",
+        "pmovsxbw",
+        "pmovsxbd",
+        "pmovsxbq",
+        "pmovsxwd",
+        "pmovsxwq",
+        "pmovsxdq",
+        "pmovzxbw",
+        "pmovzxbd",
+        "pmovzxbq",
+        "pmovzxwd",
+        "pmovzxwq",
+        "pmovzxdq",
+        "ptest",
+        "phminposuw",
+        "paddsb",
+        "paddsw",
+        "paddusb",
+        "paddusw",
+        "psubsb",
+        "psubsw",
+        "psubusb",
+        "psubusw",
+        "addsubps",
+        "addsubpd",
+        "haddps",
+        "haddpd",
+        "hsubps",
+        "hsubpd",
+        "movshdup",
+        "movsldup",
+        "movddup",
+        "rcpps",
+        "rsqrtps",
+        "cvtdq2ps",
+        "cvtps2dq",
+        "cvttps2dq",
+        "cvtdq2pd",
+        "cvtpd2ps",
+        "cvtps2pd",
+        "cvttpd2dq",
+        "cvtpd2dq",
+        "aesenc",
+        "aesenclast",
+        "aesdec",
+        "aesdeclast",
+        "aesimc",
+    ];
+    const SOURCES: &[&str] = &[
+        "%xmm0",
+        "%xmm7",
+        "%xmm8",
+        "%xmm15",
+        "(%rax)",
+        "(%r12)",
+        "(%r13)",
+        "(%rsp)",
+        "(%rbp)",
+        "(%r12,%r13,2)",
+        "(%rax,%r9,8)",
+        "1024(%rbx)",
+        "-128(%r14)",
+        "pinned(%rip)",
+        "8(%r13)",
+    ];
+    const DESTINATIONS: &[&str] = &["%xmm0", "%xmm7", "%xmm8", "%xmm15"];
+    let mut asm = String::from(".text\npinned: .quad 0\n");
+    for mnemonic in BINARY {
+        for source in SOURCES {
+            for destination in DESTINATIONS {
+                asm.push_str(&format!("{mnemonic} {source}, {destination}\n"));
+            }
+        }
+    }
+    for mnemonic in ["blendvps", "blendvpd", "pblendvb"] {
+        for source in SOURCES {
+            for destination in DESTINATIONS {
+                asm.push_str(&format!("{mnemonic} %xmm0, {source}, {destination}\n"));
+            }
+        }
+    }
+    for (mnemonic, counts) in [
+        ("pblendw", &[0, 1, 127, 128, 255][..]),
+        ("palignr", &[0, 1, 15, 16, 255]),
+        ("pclmulqdq", &[0, 1, 16, 17, 255]),
+        ("blendps", &[0, 15, 255]),
+        ("blendpd", &[0, 3, 255]),
+        ("insertps", &[0, 78, 255]),
+        ("dpps", &[0, 255]),
+        ("dppd", &[0, 51, 255]),
+        ("mpsadbw", &[0, 7, 255]),
+        ("roundps", &[0, 1, 11, 255]),
+        ("roundpd", &[0, 2, 255]),
+        ("roundss", &[0, 3, 255]),
+        ("roundsd", &[0, 4, 255]),
+        ("cmpps", &[0, 7, 31, 255]),
+        ("cmppd", &[0, 7, 255]),
+        ("aeskeygenassist", &[0, 255]),
+        ("pcmpistri", &[0, 255]),
+        ("pcmpistrm", &[0, 255]),
+        ("pcmpestri", &[0, 255]),
+        ("pcmpestrm", &[0, 255]),
+    ] {
+        for count in counts {
+            for source in SOURCES {
+                for destination in DESTINATIONS {
+                    asm.push_str(&format!("{mnemonic} ${count}, {source}, {destination}\n"));
+                }
+            }
+        }
+    }
+    for source in SOURCES.iter().filter(|source| source.contains('(')) {
+        for destination in DESTINATIONS {
+            for mnemonic in ["movntdq", "movntps", "movntpd"] {
+                asm.push_str(&format!("{mnemonic} {destination}, {source}\n"));
+            }
+            for mnemonic in ["lddqu", "movntdqa"] {
+                asm.push_str(&format!("{mnemonic} {source}, {destination}\n"));
+            }
+            for mnemonic in ["movlps", "movhps", "movlpd", "movhpd", "movupd"] {
+                asm.push_str(&format!("{mnemonic} {source}, {destination}\n"));
+                asm.push_str(&format!("{mnemonic} {destination}, {source}\n"));
+            }
+        }
+        asm.push_str(&format!("prefetchnta {source}\nprefetcht0 {source}\n"));
+        asm.push_str(&format!("prefetcht1 {source}\nprefetcht2 {source}\n"));
+        asm.push_str(&format!("ldmxcsr {source}\nstmxcsr {source}\n"));
+    }
+    for vector in DESTINATIONS {
+        for register in ["%eax", "%esp", "%ebp", "%r9d", "%r12d", "%r15d"] {
+            for mnemonic in ["pmovmskb", "movmskps", "movmskpd"] {
+                asm.push_str(&format!("{mnemonic} {vector}, {register}\n"));
+            }
+            asm.push_str(&format!("cvtss2si {vector}, {register}\n"));
+            asm.push_str(&format!("cvtsd2si {vector}, {register}\n"));
+            asm.push_str(&format!("cvttss2si {vector}, {register}\n"));
+        }
+        for other in DESTINATIONS {
+            asm.push_str(&format!("movlhps {vector}, {other}\n"));
+            asm.push_str(&format!("movhlps {vector}, {other}\n"));
+            asm.push_str(&format!("rcpss {vector}, {other}\n"));
+            asm.push_str(&format!("rsqrtss {vector}, {other}\n"));
+        }
+    }
+    asm.push_str("sfence\nlfence\nmfence\npause\n");
+    let (output, reference) = oracle(&asm, "extended_sse");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// `pextrw` picks its opcode map from the kind of its destination, and
+/// `extractps` shares the lane-transfer path.
+#[test]
+fn word_and_lane_extraction_forms_match_gas() {
+    const MEMORY: &[&str] = &[
+        "(%rax)",
+        "(%r12)",
+        "(%r13)",
+        "(%rsp)",
+        "(%rbp)",
+        "(%r12,%r13,2)",
+        "pinned(%rip)",
+        "-128(%r14)",
+        "1024(%rbx)",
+    ];
+    const VECTORS: &[&str] = &["%xmm0", "%xmm7", "%xmm8", "%xmm15"];
+    let mut asm = String::from(".text\npinned: .quad 0\n");
+    for lane in [0, 1, 7, 255] {
+        for vector in VECTORS {
+            for register in ["%eax", "%esp", "%ebp", "%r9d", "%r12d", "%r15d"] {
+                asm.push_str(&format!("pextrw ${lane}, {vector}, {register}\n"));
+                asm.push_str(&format!("pinsrw ${lane}, {register}, {vector}\n"));
+                asm.push_str(&format!("extractps ${lane}, {vector}, {register}\n"));
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!("pextrw ${lane}, {vector}, {memory}\n"));
+                asm.push_str(&format!("pinsrw ${lane}, {memory}, {vector}\n"));
+                asm.push_str(&format!("extractps ${lane}, {vector}, {memory}\n"));
+            }
+        }
+    }
+    let (output, reference) = oracle(&asm, "word_extraction");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// SSE4.2 CRC32 over every source width, including the byte registers that
+/// need a REX of their own.
+#[test]
+fn crc32_and_non_temporal_stores_match_gas() {
+    const MEMORY: &[&str] = &["(%rax)", "(%r12)", "(%r13)", "(%rsp)", "(%rbp)", "-9(%r14)"];
+    let mut asm = String::from(".text\n");
+    for (suffix, sources, destinations) in [
+        (
+            "b",
+            &[
+                "%al", "%cl", "%spl", "%bpl", "%sil", "%dil", "%r9b", "%r15b",
+            ][..],
+            &["%eax", "%ecx", "%esp", "%ebp", "%r9d", "%r15d"][..],
+        ),
+        (
+            "w",
+            &["%ax", "%cx", "%sp", "%bp", "%r9w", "%r15w"],
+            &["%eax", "%ecx", "%esp", "%ebp", "%r9d", "%r15d"],
+        ),
+        (
+            "l",
+            &["%eax", "%ecx", "%esp", "%ebp", "%r9d", "%r15d"],
+            &["%eax", "%ecx", "%esp", "%ebp", "%r9d", "%r15d"],
+        ),
+        (
+            "q",
+            &["%rax", "%rcx", "%rsp", "%rbp", "%r9", "%r15"],
+            &["%rax", "%rcx", "%rsp", "%rbp", "%r9", "%r15"],
+        ),
+    ] {
+        for destination in destinations {
+            for source in sources {
+                asm.push_str(&format!("crc32{suffix} {source}, {destination}\n"));
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!("crc32{suffix} {memory}, {destination}\n"));
+            }
+        }
+    }
+    for memory in MEMORY {
+        for register in ["%eax", "%ebp", "%r12d"] {
+            asm.push_str(&format!("movntil {register}, {memory}\n"));
+        }
+        for register in ["%rax", "%rbp", "%r12"] {
+            asm.push_str(&format!("movntiq {register}, {memory}\n"));
+        }
+    }
+    let (output, reference) = oracle(&asm, "crc32");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// The AVX2 per-lane shifts, which select the three-byte VEX form because
+/// they live in the `0f 38` map.
+#[test]
+fn variable_vector_shifts_match_gas() {
+    const MEMORY: &[&str] = &[
+        "(%rax)",
+        "(%r12)",
+        "(%r13)",
+        "(%rsp)",
+        "(%rbp)",
+        "(%r12,%r13,2)",
+        "pinned(%rip)",
+        "1024(%rbx)",
+    ];
+    let mut asm = String::from(".text\npinned: .quad 0\n");
+    for mnemonic in ["vpsllvd", "vpsrlvd", "vpsravd", "vpsllvq", "vpsrlvq"] {
+        for width in ["xmm", "ymm"] {
+            let registers = [0, 7, 8, 15].map(|n| format!("%{width}{n}"));
+            for count in &registers {
+                for source in &registers {
+                    for destination in &registers {
+                        asm.push_str(&format!("{mnemonic} {count}, {source}, {destination}\n"));
+                    }
+                }
+            }
+            for memory in MEMORY {
+                for source in &registers {
+                    asm.push_str(&format!("{mnemonic} {memory}, {source}, %{width}3\n"));
+                }
+            }
+        }
+    }
+    let (output, reference) = oracle(&asm, "variable_shifts");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// The VEX counterparts of the packed set, over both vector widths and the
+/// register numbers that force the three-byte prefix.
+#[test]
+fn avx_packed_forms_match_gas() {
+    const NDS: &[&str] = &[
+        "vpaddb",
+        "vpaddw",
+        "vpaddd",
+        "vpaddq",
+        "vpsubb",
+        "vpsubq",
+        "vpmullw",
+        "vpmuludq",
+        "vpmaddwd",
+        "vpsadbw",
+        "vpavgb",
+        "vpacksswb",
+        "vpackuswb",
+        "vpand",
+        "vpandn",
+        "vpor",
+        "vpxor",
+        "vpunpcklbw",
+        "vpunpckhqdq",
+        "vpcmpeqb",
+        "vpcmpgtd",
+        "vaddps",
+        "vmulpd",
+        "vdivps",
+        "vminpd",
+        "vmaxps",
+        "vandnpd",
+        "vunpcklps",
+        "vaddsubps",
+        "vhaddpd",
+        "vpshufb",
+        "vphaddw",
+        "vpmaddubsw",
+        "vpsignd",
+        "vpmulhrsw",
+        "vpmuldq",
+        "vpcmpeqq",
+        "vpackusdw",
+        "vpcmpgtq",
+        "vpminsb",
+        "vpmaxud",
+        "vpmulld",
+        "vaddss",
+        "vdivsd",
+        "vsqrtss",
+        "vcvtss2sd",
+        "vmovhlps",
+        "vmovlhps",
+    ];
+    const RM: &[&str] = &[
+        "vsqrtps",
+        "vsqrtpd",
+        "vrcpps",
+        "vmovshdup",
+        "vmovddup",
+        "vcvtdq2ps",
+        "vcvttps2dq",
+        "vptest",
+        "vpabsb",
+        "vpabsd",
+        "vpmovsxbw",
+        "vpmovzxdq",
+        "vucomiss",
+        "vcomisd",
+        "vbroadcastss",
+        "vpbroadcastb",
+        "vpbroadcastq",
+    ];
+    const MEMORY: &[&str] = &[
+        "(%rax)",
+        "(%r12)",
+        "(%r13)",
+        "(%rsp)",
+        "(%rbp)",
+        "(%r12,%r13,2)",
+        "pinned(%rip)",
+        "-128(%r14)",
+    ];
+    let scalar = |name: &str| {
+        name.ends_with("ss") || name.ends_with("sd") || matches!(name, "vmovhlps" | "vmovlhps")
+    };
+    let mut asm = String::from(".text\npinned: .quad 0\n");
+    for mnemonic in NDS {
+        for width in ["xmm", "ymm"] {
+            if width == "ymm" && scalar(mnemonic) {
+                continue;
+            }
+            let registers = [0, 7, 8, 15].map(|n| format!("%{width}{n}"));
+            for second in &registers {
+                for first in &registers {
+                    for destination in &registers {
+                        asm.push_str(&format!("{mnemonic} {second}, {first}, {destination}\n"));
+                    }
+                }
+            }
+            if matches!(*mnemonic, "vmovhlps" | "vmovlhps") {
+                continue;
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!("{mnemonic} {memory}, %{width}2, %{width}3\n"));
+            }
+        }
+    }
+    for mnemonic in RM {
+        for source in [0, 7, 8, 15].map(|n| format!("%xmm{n}")) {
+            for destination in [0, 7, 8, 15].map(|n| format!("%xmm{n}")) {
+                asm.push_str(&format!("{mnemonic} {source}, {destination}\n"));
+            }
+        }
+        for memory in MEMORY {
+            asm.push_str(&format!("{mnemonic} {memory}, %xmm3\n"));
+        }
+    }
+    for (mnemonic, count) in [
+        ("vpblendw", 255),
+        ("vpalignr", 15),
+        ("vblendps", 15),
+        ("vdpps", 255),
+        ("vmpsadbw", 7),
+        ("vcmpps", 7),
+        ("vshufps", 27),
+        ("vshufpd", 3),
+    ] {
+        for width in ["xmm", "ymm"] {
+            let registers = [0, 7, 8, 15].map(|n| format!("%{width}{n}"));
+            for second in &registers {
+                for destination in &registers {
+                    asm.push_str(&format!(
+                        "{mnemonic} ${count}, {second}, %{width}2, {destination}\n"
+                    ));
+                }
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!(
+                    "{mnemonic} ${count}, {memory}, %{width}2, %{width}3\n"
+                ));
+            }
+        }
+    }
+    for (mnemonic, count) in [
+        ("vpshufd", 27),
+        ("vpshufhw", 27),
+        ("vpshuflw", 27),
+        ("vroundps", 11),
+        ("vpermq", 27),
+        ("vpermilps", 27),
+    ] {
+        for width in ["xmm", "ymm"] {
+            if width == "xmm" && mnemonic == "vpermq" {
+                continue;
+            }
+            let registers = [0, 7, 8, 15].map(|n| format!("%{width}{n}"));
+            for source in &registers {
+                for destination in &registers {
+                    asm.push_str(&format!("{mnemonic} ${count}, {source}, {destination}\n"));
+                }
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!("{mnemonic} ${count}, {memory}, %{width}3\n"));
+            }
+        }
+    }
+    for mnemonic in ["vblendvps", "vblendvpd", "vpblendvb"] {
+        for width in ["xmm", "ymm"] {
+            let registers = [0, 7, 8, 15].map(|n| format!("%{width}{n}"));
+            for mask in &registers {
+                for second in &registers {
+                    asm.push_str(&format!(
+                        "{mnemonic} {mask}, {second}, %{width}2, %{width}3\n"
+                    ));
+                }
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!(
+                    "{mnemonic} %{width}4, {memory}, %{width}2, %{width}3\n"
+                ));
+            }
+        }
+    }
+    for mnemonic in [
+        "vpsllw", "vpslld", "vpsllq", "vpsrlw", "vpsrld", "vpsrlq", "vpsraw", "vpsrad", "vpslldq",
+        "vpsrldq",
+    ] {
+        for count in [0, 1, 31, 255] {
+            for width in ["xmm", "ymm"] {
+                for source in [0, 7, 8, 15].map(|n| format!("%{width}{n}")) {
+                    asm.push_str(&format!("{mnemonic} ${count}, {source}, %{width}3\n"));
+                }
+            }
+        }
+    }
+    for mnemonic in [
+        "vmovaps", "vmovapd", "vmovups", "vmovupd", "vmovdqa", "vmovdqu",
+    ] {
+        for width in ["xmm", "ymm"] {
+            for register in [0, 7, 8, 15].map(|n| format!("%{width}{n}")) {
+                for memory in MEMORY {
+                    asm.push_str(&format!("{mnemonic} {memory}, {register}\n"));
+                    asm.push_str(&format!("{mnemonic} {register}, {memory}\n"));
+                }
+                for other in [0, 7, 8, 15].map(|n| format!("%{width}{n}")) {
+                    asm.push_str(&format!("{mnemonic} {register}, {other}\n"));
+                }
+            }
+        }
+    }
+    for mnemonic in ["vmovntdq", "vmovntps", "vmovntpd"] {
+        for width in ["xmm", "ymm"] {
+            for register in [0, 7, 8, 15].map(|n| format!("%{width}{n}")) {
+                for memory in MEMORY {
+                    asm.push_str(&format!("{mnemonic} {register}, {memory}\n"));
+                }
+            }
+        }
+    }
+    asm.push_str("vzeroall\nvzeroupper\n");
+    let (output, reference) = oracle(&asm, "avx_packed");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// The VEX lane transfers, scalar moves and FMA3 set, where the two-byte
+/// prefix is chosen only when no field it cannot carry is in use.
+#[test]
+fn avx_transfers_and_fma_match_gas() {
+    const MEMORY: &[&str] = &[
+        "(%rax)",
+        "(%r12)",
+        "(%r13)",
+        "(%rsp)",
+        "(%rbp)",
+        "(%r12,%r13,2)",
+        "pinned(%rip)",
+        "-128(%r14)",
+    ];
+    let vectors = || [0, 7, 8, 15].map(|n| format!("%xmm{n}"));
+    let mut asm = String::from(".text\npinned: .quad 0\n");
+    for lane in [0, 1, 15, 255] {
+        for vector in vectors() {
+            for register in ["%eax", "%esp", "%ebp", "%r9d", "%r12d", "%r15d"] {
+                for mnemonic in ["vpextrb", "vpextrw", "vpextrd", "vextractps"] {
+                    asm.push_str(&format!("{mnemonic} ${lane}, {vector}, {register}\n"));
+                }
+                for mnemonic in ["vpinsrb", "vpinsrw", "vpinsrd"] {
+                    for first in vectors() {
+                        asm.push_str(&format!(
+                            "{mnemonic} ${lane}, {register}, {first}, {vector}\n"
+                        ));
+                    }
+                }
+            }
+            for register in ["%rax", "%rsp", "%rbp", "%r9", "%r12", "%r15"] {
+                asm.push_str(&format!("vpextrq ${lane}, {vector}, {register}\n"));
+                for first in vectors() {
+                    asm.push_str(&format!("vpinsrq ${lane}, {register}, {first}, {vector}\n"));
+                }
+            }
+            for memory in MEMORY {
+                for mnemonic in ["vpextrb", "vpextrw", "vpextrd", "vpextrq", "vextractps"] {
+                    asm.push_str(&format!("{mnemonic} ${lane}, {vector}, {memory}\n"));
+                }
+                for mnemonic in ["vpinsrb", "vpinsrw", "vpinsrd", "vpinsrq"] {
+                    asm.push_str(&format!("{mnemonic} ${lane}, {memory}, %xmm2, {vector}\n"));
+                }
+            }
+        }
+    }
+    for width in ["xmm", "ymm"] {
+        for vector in [0, 7, 8, 15].map(|n| format!("%{width}{n}")) {
+            for register in ["%eax", "%esp", "%ebp", "%r9d", "%r12d", "%r15d"] {
+                for mnemonic in ["vpmovmskb", "vmovmskps", "vmovmskpd"] {
+                    asm.push_str(&format!("{mnemonic} {vector}, {register}\n"));
+                }
+            }
+        }
+    }
+    for vector in vectors() {
+        for register in ["%rax", "%rsp", "%rbp", "%r9", "%r12", "%r15"] {
+            asm.push_str(&format!("vmovq {register}, {vector}\n"));
+            asm.push_str(&format!("vmovq {vector}, {register}\n"));
+        }
+        for register in ["%eax", "%esp", "%r12d"] {
+            asm.push_str(&format!("vmovd {register}, {vector}\n"));
+            asm.push_str(&format!("vmovd {vector}, {register}\n"));
+        }
+        for other in vectors() {
+            asm.push_str(&format!("vmovq {other}, {vector}\n"));
+            for mnemonic in ["vmovss", "vmovsd"] {
+                for first in vectors() {
+                    asm.push_str(&format!("{mnemonic} {other}, {first}, {vector}\n"));
+                }
+            }
+        }
+        for memory in MEMORY {
+            asm.push_str(&format!("vmovq {memory}, {vector}\n"));
+            asm.push_str(&format!("vmovq {vector}, {memory}\n"));
+            for mnemonic in ["vmovss", "vmovsd"] {
+                asm.push_str(&format!("{mnemonic} {memory}, {vector}\n"));
+                asm.push_str(&format!("{mnemonic} {vector}, {memory}\n"));
+            }
+            for mnemonic in ["vmovhps", "vmovlps", "vmovhpd", "vmovlpd"] {
+                asm.push_str(&format!("{mnemonic} {memory}, %xmm2, {vector}\n"));
+                asm.push_str(&format!("{mnemonic} {vector}, {memory}\n"));
+            }
+        }
+        for register in ["%eax", "%esp", "%r12d"] {
+            for first in vectors() {
+                asm.push_str(&format!("vcvtsi2ssl {register}, {first}, {vector}\n"));
+                asm.push_str(&format!("vcvtsi2sdl {register}, {first}, {vector}\n"));
+            }
+        }
+        for register in ["%rax", "%rsp", "%r12"] {
+            asm.push_str(&format!("vcvtsi2ssq {register}, %xmm2, {vector}\n"));
+            asm.push_str(&format!("vcvtsi2sdq {register}, %xmm2, {vector}\n"));
+        }
+        for register in ["%eax", "%r12d", "%rax", "%r12"] {
+            for mnemonic in ["vcvtss2si", "vcvtsd2si", "vcvttss2si", "vcvttsd2si"] {
+                asm.push_str(&format!("{mnemonic} {vector}, {register}\n"));
+            }
+        }
+    }
+    for operation in ["madd", "msub", "nmadd", "nmsub"] {
+        for order in ["132", "213", "231"] {
+            for kind in ["ps", "pd", "ss", "sd"] {
+                let mnemonic = format!("vf{operation}{order}{kind}");
+                let width = if kind.starts_with('p') { "ymm" } else { "xmm" };
+                let registers = [0, 7, 8, 15].map(|n| format!("%{width}{n}"));
+                for second in &registers {
+                    for destination in &registers {
+                        asm.push_str(&format!("{mnemonic} {second}, %{width}2, {destination}\n"));
+                    }
+                }
+                for memory in MEMORY {
+                    asm.push_str(&format!("{mnemonic} {memory}, %{width}2, %{width}3\n"));
+                }
+            }
+        }
+    }
+    for operation in ["maddsub", "msubadd"] {
+        for order in ["132", "213", "231"] {
+            for kind in ["ps", "pd"] {
+                let mnemonic = format!("vf{operation}{order}{kind}");
+                for second in [0, 7, 8, 15].map(|n| format!("%ymm{n}")) {
+                    asm.push_str(&format!("{mnemonic} {second}, %ymm2, %ymm15\n"));
+                }
+            }
+        }
+    }
+    for mnemonic in ["vmaskmovps", "vmaskmovpd", "vpmaskmovd", "vpmaskmovq"] {
+        for width in ["xmm", "ymm"] {
+            for register in [0, 7, 8, 15].map(|n| format!("%{width}{n}")) {
+                for memory in MEMORY {
+                    asm.push_str(&format!("{mnemonic} {memory}, {register}, %{width}3\n"));
+                    asm.push_str(&format!("{mnemonic} {register}, %{width}2, {memory}\n"));
+                }
+            }
+        }
+    }
+    for lane in [0, 1] {
+        for width in [("xmm", "ymm")] {
+            for register in [0, 7, 8, 15].map(|n| format!("%{}{n}", width.0)) {
+                asm.push_str(&format!("vinserti128 ${lane}, {register}, %ymm2, %ymm3\n"));
+                asm.push_str(&format!("vinsertf128 ${lane}, {register}, %ymm2, %ymm3\n"));
+                asm.push_str(&format!("vextracti128 ${lane}, %ymm9, {register}\n"));
+                asm.push_str(&format!("vextractf128 ${lane}, %ymm9, {register}\n"));
+            }
+            for memory in MEMORY {
+                asm.push_str(&format!("vextracti128 ${lane}, %ymm9, {memory}\n"));
+                asm.push_str(&format!("vinserti128 ${lane}, {memory}, %ymm2, %ymm3\n"));
+                asm.push_str(&format!("vperm2i128 ${lane}, {memory}, %ymm2, %ymm3\n"));
+            }
+        }
+    }
+    for second in [0, 7, 8, 15].map(|n| format!("%ymm{n}")) {
+        asm.push_str(&format!("vpermd {second}, %ymm2, %ymm3\n"));
+        asm.push_str(&format!("vpermps {second}, %ymm2, %ymm3\n"));
+        asm.push_str(&format!("vpermilps {second}, %ymm2, %ymm3\n"));
+        asm.push_str(&format!("vpermilpd {second}, %ymm2, %ymm3\n"));
+        asm.push_str(&format!("vperm2f128 $1, {second}, %ymm2, %ymm3\n"));
+        asm.push_str(&format!("vpermpd $27, {second}, %ymm3\n"));
+        asm.push_str(&format!(
+            "vbroadcastsd {}, %ymm3\n",
+            second.replace('y', "x")
+        ));
+    }
+    for memory in MEMORY {
+        asm.push_str(&format!("vbroadcasti128 {memory}, %ymm3\n"));
+        asm.push_str(&format!("vbroadcastf128 {memory}, %ymm3\n"));
+        asm.push_str(&format!("vbroadcastsd {memory}, %ymm3\n"));
+        asm.push_str(&format!("vlddqu {memory}, %ymm3\n"));
+        asm.push_str(&format!("vmovntdqa {memory}, %xmm3\n"));
+    }
+    let (output, reference) = oracle(&asm, "avx_transfers");
+    assert_eq!(text(&output), text(&reference));
+}
+
+/// The encoded bytes of the forms this pass added, pinned so a regression
+/// cannot hide behind a reference assembler that moved with it.
+#[test]
+fn extended_encodings_are_pinned() {
+    const CASES: &[(&str, &str)] = &[
+        ("pmaddwd %xmm1, %xmm2", "660ff5d1"),
+        ("pmaddwd %xmm9, %xmm12", "66450ff5e1"),
+        ("pmaddwd %xmm15, %xmm0", "66410ff5c7"),
+        ("pmaddwd 8(%rbp), %xmm3", "660ff55d08"),
+        ("pmaddwd (%r12), %xmm8", "66450ff50424"),
+        ("pmaddwd (%r13,%rax,4), %xmm15", "66450ff57c8500"),
+        ("pshufb %xmm1, %xmm2", "660f3800d1"),
+        ("pshufb %xmm9, %xmm12", "66450f3800e1"),
+        ("pshufb %xmm15, %xmm0", "66410f3800c7"),
+        ("pshufb 8(%rbp), %xmm3", "660f38005d08"),
+        ("pshufb (%r12), %xmm8", "66450f38000424"),
+        ("pshufb (%r13,%rax,4), %xmm15", "66450f38007c8500"),
+        ("packuswb %xmm1, %xmm2", "660f67d1"),
+        ("packuswb %xmm9, %xmm12", "66450f67e1"),
+        ("packuswb %xmm15, %xmm0", "66410f67c7"),
+        ("packuswb 8(%rbp), %xmm3", "660f675d08"),
+        ("packuswb (%r12), %xmm8", "66450f670424"),
+        ("packuswb (%r13,%rax,4), %xmm15", "66450f677c8500"),
+        ("packsswb %xmm1, %xmm2", "660f63d1"),
+        ("packsswb %xmm9, %xmm12", "66450f63e1"),
+        ("packsswb %xmm15, %xmm0", "66410f63c7"),
+        ("packsswb 8(%rbp), %xmm3", "660f635d08"),
+        ("packsswb (%r12), %xmm8", "66450f630424"),
+        ("packsswb (%r13,%rax,4), %xmm15", "66450f637c8500"),
+        ("packssdw %xmm1, %xmm2", "660f6bd1"),
+        ("packssdw %xmm9, %xmm12", "66450f6be1"),
+        ("packssdw %xmm15, %xmm0", "66410f6bc7"),
+        ("packssdw 8(%rbp), %xmm3", "660f6b5d08"),
+        ("packssdw (%r12), %xmm8", "66450f6b0424"),
+        ("packssdw (%r13,%rax,4), %xmm15", "66450f6b7c8500"),
+        ("packusdw %xmm1, %xmm2", "660f382bd1"),
+        ("packusdw %xmm9, %xmm12", "66450f382be1"),
+        ("packusdw %xmm15, %xmm0", "66410f382bc7"),
+        ("packusdw 8(%rbp), %xmm3", "660f382b5d08"),
+        ("packusdw (%r12), %xmm8", "66450f382b0424"),
+        ("packusdw (%r13,%rax,4), %xmm15", "66450f382b7c8500"),
+        ("pavgb %xmm1, %xmm2", "660fe0d1"),
+        ("pavgb %xmm9, %xmm12", "66450fe0e1"),
+        ("pavgb %xmm15, %xmm0", "66410fe0c7"),
+        ("pavgb 8(%rbp), %xmm3", "660fe05d08"),
+        ("pavgb (%r12), %xmm8", "66450fe00424"),
+        ("pavgb (%r13,%rax,4), %xmm15", "66450fe07c8500"),
+        ("pavgw %xmm1, %xmm2", "660fe3d1"),
+        ("pavgw %xmm9, %xmm12", "66450fe3e1"),
+        ("pavgw %xmm15, %xmm0", "66410fe3c7"),
+        ("pavgw 8(%rbp), %xmm3", "660fe35d08"),
+        ("pavgw (%r12), %xmm8", "66450fe30424"),
+        ("pavgw (%r13,%rax,4), %xmm15", "66450fe37c8500"),
+        ("psignb %xmm1, %xmm2", "660f3808d1"),
+        ("psignb %xmm9, %xmm12", "66450f3808e1"),
+        ("psignb %xmm15, %xmm0", "66410f3808c7"),
+        ("psignb 8(%rbp), %xmm3", "660f38085d08"),
+        ("psignb (%r12), %xmm8", "66450f38080424"),
+        ("psignb (%r13,%rax,4), %xmm15", "66450f38087c8500"),
+        ("psignw %xmm1, %xmm2", "660f3809d1"),
+        ("psignw %xmm9, %xmm12", "66450f3809e1"),
+        ("psignw %xmm15, %xmm0", "66410f3809c7"),
+        ("psignw 8(%rbp), %xmm3", "660f38095d08"),
+        ("psignw (%r12), %xmm8", "66450f38090424"),
+        ("psignw (%r13,%rax,4), %xmm15", "66450f38097c8500"),
+        ("psignd %xmm1, %xmm2", "660f380ad1"),
+        ("psignd %xmm9, %xmm12", "66450f380ae1"),
+        ("psignd %xmm15, %xmm0", "66410f380ac7"),
+        ("psignd 8(%rbp), %xmm3", "660f380a5d08"),
+        ("psignd (%r12), %xmm8", "66450f380a0424"),
+        ("psignd (%r13,%rax,4), %xmm15", "66450f380a7c8500"),
+        ("pabsb %xmm1, %xmm2", "660f381cd1"),
+        ("pabsb %xmm9, %xmm12", "66450f381ce1"),
+        ("pabsb %xmm15, %xmm0", "66410f381cc7"),
+        ("pabsb 8(%rbp), %xmm3", "660f381c5d08"),
+        ("pabsb (%r12), %xmm8", "66450f381c0424"),
+        ("pabsb (%r13,%rax,4), %xmm15", "66450f381c7c8500"),
+        ("pabsw %xmm1, %xmm2", "660f381dd1"),
+        ("pabsw %xmm9, %xmm12", "66450f381de1"),
+        ("pabsw %xmm15, %xmm0", "66410f381dc7"),
+        ("pabsw 8(%rbp), %xmm3", "660f381d5d08"),
+        ("pabsw (%r12), %xmm8", "66450f381d0424"),
+        ("pabsw (%r13,%rax,4), %xmm15", "66450f381d7c8500"),
+        ("pabsd %xmm1, %xmm2", "660f381ed1"),
+        ("pabsd %xmm9, %xmm12", "66450f381ee1"),
+        ("pabsd %xmm15, %xmm0", "66410f381ec7"),
+        ("pabsd 8(%rbp), %xmm3", "660f381e5d08"),
+        ("pabsd (%r12), %xmm8", "66450f381e0424"),
+        ("pabsd (%r13,%rax,4), %xmm15", "66450f381e7c8500"),
+        ("pminsb %xmm1, %xmm2", "660f3838d1"),
+        ("pminsb %xmm9, %xmm12", "66450f3838e1"),
+        ("pminsb %xmm15, %xmm0", "66410f3838c7"),
+        ("pminsb 8(%rbp), %xmm3", "660f38385d08"),
+        ("pminsb (%r12), %xmm8", "66450f38380424"),
+        ("pminsb (%r13,%rax,4), %xmm15", "66450f38387c8500"),
+        ("pminsw %xmm1, %xmm2", "660fead1"),
+        ("pminsw %xmm9, %xmm12", "66450feae1"),
+        ("pminsw %xmm15, %xmm0", "66410feac7"),
+        ("pminsw 8(%rbp), %xmm3", "660fea5d08"),
+        ("pminsw (%r12), %xmm8", "66450fea0424"),
+        ("pminsw (%r13,%rax,4), %xmm15", "66450fea7c8500"),
+        ("pminsd %xmm1, %xmm2", "660f3839d1"),
+        ("pminsd %xmm9, %xmm12", "66450f3839e1"),
+        ("pminsd %xmm15, %xmm0", "66410f3839c7"),
+        ("pminsd 8(%rbp), %xmm3", "660f38395d08"),
+        ("pminsd (%r12), %xmm8", "66450f38390424"),
+        ("pminsd (%r13,%rax,4), %xmm15", "66450f38397c8500"),
+        ("pmaxsb %xmm1, %xmm2", "660f383cd1"),
+        ("pmaxsb %xmm9, %xmm12", "66450f383ce1"),
+        ("pmaxsb %xmm15, %xmm0", "66410f383cc7"),
+        ("pmaxsb 8(%rbp), %xmm3", "660f383c5d08"),
+        ("pmaxsb (%r12), %xmm8", "66450f383c0424"),
+        ("pmaxsb (%r13,%rax,4), %xmm15", "66450f383c7c8500"),
+        ("pmaxsw %xmm1, %xmm2", "660feed1"),
+        ("pmaxsw %xmm9, %xmm12", "66450feee1"),
+        ("pmaxsw %xmm15, %xmm0", "66410feec7"),
+        ("pmaxsw 8(%rbp), %xmm3", "660fee5d08"),
+        ("pmaxsw (%r12), %xmm8", "66450fee0424"),
+        ("pmaxsw (%r13,%rax,4), %xmm15", "66450fee7c8500"),
+        ("pmaxsd %xmm1, %xmm2", "660f383dd1"),
+        ("pmaxsd %xmm9, %xmm12", "66450f383de1"),
+        ("pmaxsd %xmm15, %xmm0", "66410f383dc7"),
+        ("pmaxsd 8(%rbp), %xmm3", "660f383d5d08"),
+        ("pmaxsd (%r12), %xmm8", "66450f383d0424"),
+        ("pmaxsd (%r13,%rax,4), %xmm15", "66450f383d7c8500"),
+        ("pminub %xmm1, %xmm2", "660fdad1"),
+        ("pminub %xmm9, %xmm12", "66450fdae1"),
+        ("pminub %xmm15, %xmm0", "66410fdac7"),
+        ("pminub 8(%rbp), %xmm3", "660fda5d08"),
+        ("pminub (%r12), %xmm8", "66450fda0424"),
+        ("pminub (%r13,%rax,4), %xmm15", "66450fda7c8500"),
+        ("pminuw %xmm1, %xmm2", "660f383ad1"),
+        ("pminuw %xmm9, %xmm12", "66450f383ae1"),
+        ("pminuw %xmm15, %xmm0", "66410f383ac7"),
+        ("pminuw 8(%rbp), %xmm3", "660f383a5d08"),
+        ("pminuw (%r12), %xmm8", "66450f383a0424"),
+        ("pminuw (%r13,%rax,4), %xmm15", "66450f383a7c8500"),
+        ("pminud %xmm1, %xmm2", "660f383bd1"),
+        ("pminud %xmm9, %xmm12", "66450f383be1"),
+        ("pminud %xmm15, %xmm0", "66410f383bc7"),
+        ("pminud 8(%rbp), %xmm3", "660f383b5d08"),
+        ("pminud (%r12), %xmm8", "66450f383b0424"),
+        ("pminud (%r13,%rax,4), %xmm15", "66450f383b7c8500"),
+        ("pmaxub %xmm1, %xmm2", "660fded1"),
+        ("pmaxub %xmm9, %xmm12", "66450fdee1"),
+        ("pmaxub %xmm15, %xmm0", "66410fdec7"),
+        ("pmaxub 8(%rbp), %xmm3", "660fde5d08"),
+        ("pmaxub (%r12), %xmm8", "66450fde0424"),
+        ("pmaxub (%r13,%rax,4), %xmm15", "66450fde7c8500"),
+        ("pmaxuw %xmm1, %xmm2", "660f383ed1"),
+        ("pmaxuw %xmm9, %xmm12", "66450f383ee1"),
+        ("pmaxuw %xmm15, %xmm0", "66410f383ec7"),
+        ("pmaxuw 8(%rbp), %xmm3", "660f383e5d08"),
+        ("pmaxuw (%r12), %xmm8", "66450f383e0424"),
+        ("pmaxuw (%r13,%rax,4), %xmm15", "66450f383e7c8500"),
+        ("pmaxud %xmm1, %xmm2", "660f383fd1"),
+        ("pmaxud %xmm9, %xmm12", "66450f383fe1"),
+        ("pmaxud %xmm15, %xmm0", "66410f383fc7"),
+        ("pmaxud 8(%rbp), %xmm3", "660f383f5d08"),
+        ("pmaxud (%r12), %xmm8", "66450f383f0424"),
+        ("pmaxud (%r13,%rax,4), %xmm15", "66450f383f7c8500"),
+        ("pcmpeqq %xmm1, %xmm2", "660f3829d1"),
+        ("pcmpeqq %xmm9, %xmm12", "66450f3829e1"),
+        ("pcmpeqq %xmm15, %xmm0", "66410f3829c7"),
+        ("pcmpeqq 8(%rbp), %xmm3", "660f38295d08"),
+        ("pcmpeqq (%r12), %xmm8", "66450f38290424"),
+        ("pcmpeqq (%r13,%rax,4), %xmm15", "66450f38297c8500"),
+        ("pcmpgtq %xmm1, %xmm2", "660f3837d1"),
+        ("pcmpgtq %xmm9, %xmm12", "66450f3837e1"),
+        ("pcmpgtq %xmm15, %xmm0", "66410f3837c7"),
+        ("pcmpgtq 8(%rbp), %xmm3", "660f38375d08"),
+        ("pcmpgtq (%r12), %xmm8", "66450f38370424"),
+        ("pcmpgtq (%r13,%rax,4), %xmm15", "66450f38377c8500"),
+        ("pmuldq %xmm1, %xmm2", "660f3828d1"),
+        ("pmuldq %xmm9, %xmm12", "66450f3828e1"),
+        ("pmuldq %xmm15, %xmm0", "66410f3828c7"),
+        ("pmuldq 8(%rbp), %xmm3", "660f38285d08"),
+        ("pmuldq (%r12), %xmm8", "66450f38280424"),
+        ("pmuldq (%r13,%rax,4), %xmm15", "66450f38287c8500"),
+        ("pmulhw %xmm1, %xmm2", "660fe5d1"),
+        ("pmulhw %xmm9, %xmm12", "66450fe5e1"),
+        ("pmulhw %xmm15, %xmm0", "66410fe5c7"),
+        ("pmulhw 8(%rbp), %xmm3", "660fe55d08"),
+        ("pmulhw (%r12), %xmm8", "66450fe50424"),
+        ("pmulhw (%r13,%rax,4), %xmm15", "66450fe57c8500"),
+        ("pmulhuw %xmm1, %xmm2", "660fe4d1"),
+        ("pmulhuw %xmm9, %xmm12", "66450fe4e1"),
+        ("pmulhuw %xmm15, %xmm0", "66410fe4c7"),
+        ("pmulhuw 8(%rbp), %xmm3", "660fe45d08"),
+        ("pmulhuw (%r12), %xmm8", "66450fe40424"),
+        ("pmulhuw (%r13,%rax,4), %xmm15", "66450fe47c8500"),
+        ("pmulhrsw %xmm1, %xmm2", "660f380bd1"),
+        ("pmulhrsw %xmm9, %xmm12", "66450f380be1"),
+        ("pmulhrsw %xmm15, %xmm0", "66410f380bc7"),
+        ("pmulhrsw 8(%rbp), %xmm3", "660f380b5d08"),
+        ("pmulhrsw (%r12), %xmm8", "66450f380b0424"),
+        ("pmulhrsw (%r13,%rax,4), %xmm15", "66450f380b7c8500"),
+        ("pmaddubsw %xmm1, %xmm2", "660f3804d1"),
+        ("pmaddubsw %xmm9, %xmm12", "66450f3804e1"),
+        ("pmaddubsw %xmm15, %xmm0", "66410f3804c7"),
+        ("pmaddubsw 8(%rbp), %xmm3", "660f38045d08"),
+        ("pmaddubsw (%r12), %xmm8", "66450f38040424"),
+        ("pmaddubsw (%r13,%rax,4), %xmm15", "66450f38047c8500"),
+        ("psadbw %xmm1, %xmm2", "660ff6d1"),
+        ("psadbw %xmm9, %xmm12", "66450ff6e1"),
+        ("psadbw %xmm15, %xmm0", "66410ff6c7"),
+        ("psadbw 8(%rbp), %xmm3", "660ff65d08"),
+        ("psadbw (%r12), %xmm8", "66450ff60424"),
+        ("psadbw (%r13,%rax,4), %xmm15", "66450ff67c8500"),
+        ("phaddw %xmm1, %xmm2", "660f3801d1"),
+        ("phaddw %xmm9, %xmm12", "66450f3801e1"),
+        ("phaddw %xmm15, %xmm0", "66410f3801c7"),
+        ("phaddw 8(%rbp), %xmm3", "660f38015d08"),
+        ("phaddw (%r12), %xmm8", "66450f38010424"),
+        ("phaddw (%r13,%rax,4), %xmm15", "66450f38017c8500"),
+        ("phaddd %xmm1, %xmm2", "660f3802d1"),
+        ("phaddd %xmm9, %xmm12", "66450f3802e1"),
+        ("phaddd %xmm15, %xmm0", "66410f3802c7"),
+        ("phaddd 8(%rbp), %xmm3", "660f38025d08"),
+        ("phaddd (%r12), %xmm8", "66450f38020424"),
+        ("phaddd (%r13,%rax,4), %xmm15", "66450f38027c8500"),
+        ("phaddsw %xmm1, %xmm2", "660f3803d1"),
+        ("phaddsw %xmm9, %xmm12", "66450f3803e1"),
+        ("phaddsw %xmm15, %xmm0", "66410f3803c7"),
+        ("phaddsw 8(%rbp), %xmm3", "660f38035d08"),
+        ("phaddsw (%r12), %xmm8", "66450f38030424"),
+        ("phaddsw (%r13,%rax,4), %xmm15", "66450f38037c8500"),
+        ("phsubw %xmm1, %xmm2", "660f3805d1"),
+        ("phsubw %xmm9, %xmm12", "66450f3805e1"),
+        ("phsubw %xmm15, %xmm0", "66410f3805c7"),
+        ("phsubw 8(%rbp), %xmm3", "660f38055d08"),
+        ("phsubw (%r12), %xmm8", "66450f38050424"),
+        ("phsubw (%r13,%rax,4), %xmm15", "66450f38057c8500"),
+        ("phsubd %xmm1, %xmm2", "660f3806d1"),
+        ("phsubd %xmm9, %xmm12", "66450f3806e1"),
+        ("phsubd %xmm15, %xmm0", "66410f3806c7"),
+        ("phsubd 8(%rbp), %xmm3", "660f38065d08"),
+        ("phsubd (%r12), %xmm8", "66450f38060424"),
+        ("phsubd (%r13,%rax,4), %xmm15", "66450f38067c8500"),
+        ("phsubsw %xmm1, %xmm2", "660f3807d1"),
+        ("phsubsw %xmm9, %xmm12", "66450f3807e1"),
+        ("phsubsw %xmm15, %xmm0", "66410f3807c7"),
+        ("phsubsw 8(%rbp), %xmm3", "660f38075d08"),
+        ("phsubsw (%r12), %xmm8", "66450f38070424"),
+        ("phsubsw (%r13,%rax,4), %xmm15", "66450f38077c8500"),
+        ("pmovsxbw %xmm1, %xmm2", "660f3820d1"),
+        ("pmovsxbw %xmm9, %xmm12", "66450f3820e1"),
+        ("pmovsxbw %xmm15, %xmm0", "66410f3820c7"),
+        ("pmovsxbw 8(%rbp), %xmm3", "660f38205d08"),
+        ("pmovsxbw (%r12), %xmm8", "66450f38200424"),
+        ("pmovsxbw (%r13,%rax,4), %xmm15", "66450f38207c8500"),
+        ("pmovsxdq %xmm1, %xmm2", "660f3825d1"),
+        ("pmovsxdq %xmm9, %xmm12", "66450f3825e1"),
+        ("pmovsxdq %xmm15, %xmm0", "66410f3825c7"),
+        ("pmovsxdq 8(%rbp), %xmm3", "660f38255d08"),
+        ("pmovsxdq (%r12), %xmm8", "66450f38250424"),
+        ("pmovsxdq (%r13,%rax,4), %xmm15", "66450f38257c8500"),
+        ("pmovzxbw %xmm1, %xmm2", "660f3830d1"),
+        ("pmovzxbw %xmm9, %xmm12", "66450f3830e1"),
+        ("pmovzxbw %xmm15, %xmm0", "66410f3830c7"),
+        ("pmovzxbw 8(%rbp), %xmm3", "660f38305d08"),
+        ("pmovzxbw (%r12), %xmm8", "66450f38300424"),
+        ("pmovzxbw (%r13,%rax,4), %xmm15", "66450f38307c8500"),
+        ("pmovzxdq %xmm1, %xmm2", "660f3835d1"),
+        ("pmovzxdq %xmm9, %xmm12", "66450f3835e1"),
+        ("pmovzxdq %xmm15, %xmm0", "66410f3835c7"),
+        ("pmovzxdq 8(%rbp), %xmm3", "660f38355d08"),
+        ("pmovzxdq (%r12), %xmm8", "66450f38350424"),
+        ("pmovzxdq (%r13,%rax,4), %xmm15", "66450f38357c8500"),
+        ("ptest %xmm1, %xmm2", "660f3817d1"),
+        ("ptest %xmm9, %xmm12", "66450f3817e1"),
+        ("ptest %xmm15, %xmm0", "66410f3817c7"),
+        ("ptest 8(%rbp), %xmm3", "660f38175d08"),
+        ("ptest (%r12), %xmm8", "66450f38170424"),
+        ("ptest (%r13,%rax,4), %xmm15", "66450f38177c8500"),
+        ("phminposuw %xmm1, %xmm2", "660f3841d1"),
+        ("phminposuw %xmm9, %xmm12", "66450f3841e1"),
+        ("phminposuw %xmm15, %xmm0", "66410f3841c7"),
+        ("phminposuw 8(%rbp), %xmm3", "660f38415d08"),
+        ("phminposuw (%r12), %xmm8", "66450f38410424"),
+        ("phminposuw (%r13,%rax,4), %xmm15", "66450f38417c8500"),
+        ("paddsb %xmm1, %xmm2", "660fecd1"),
+        ("paddsb %xmm9, %xmm12", "66450fece1"),
+        ("paddsb %xmm15, %xmm0", "66410fecc7"),
+        ("paddsb 8(%rbp), %xmm3", "660fec5d08"),
+        ("paddsb (%r12), %xmm8", "66450fec0424"),
+        ("paddsb (%r13,%rax,4), %xmm15", "66450fec7c8500"),
+        ("paddusw %xmm1, %xmm2", "660fddd1"),
+        ("paddusw %xmm9, %xmm12", "66450fdde1"),
+        ("paddusw %xmm15, %xmm0", "66410fddc7"),
+        ("paddusw 8(%rbp), %xmm3", "660fdd5d08"),
+        ("paddusw (%r12), %xmm8", "66450fdd0424"),
+        ("paddusw (%r13,%rax,4), %xmm15", "66450fdd7c8500"),
+        ("psubsb %xmm1, %xmm2", "660fe8d1"),
+        ("psubsb %xmm9, %xmm12", "66450fe8e1"),
+        ("psubsb %xmm15, %xmm0", "66410fe8c7"),
+        ("psubsb 8(%rbp), %xmm3", "660fe85d08"),
+        ("psubsb (%r12), %xmm8", "66450fe80424"),
+        ("psubsb (%r13,%rax,4), %xmm15", "66450fe87c8500"),
+        ("psubusw %xmm1, %xmm2", "660fd9d1"),
+        ("psubusw %xmm9, %xmm12", "66450fd9e1"),
+        ("psubusw %xmm15, %xmm0", "66410fd9c7"),
+        ("psubusw 8(%rbp), %xmm3", "660fd95d08"),
+        ("psubusw (%r12), %xmm8", "66450fd90424"),
+        ("psubusw (%r13,%rax,4), %xmm15", "66450fd97c8500"),
+        ("aesenc %xmm1, %xmm2", "660f38dcd1"),
+        ("aesenc %xmm9, %xmm12", "66450f38dce1"),
+        ("aesenc %xmm15, %xmm0", "66410f38dcc7"),
+        ("aesenc 8(%rbp), %xmm3", "660f38dc5d08"),
+        ("aesenc (%r12), %xmm8", "66450f38dc0424"),
+        ("aesenc (%r13,%rax,4), %xmm15", "66450f38dc7c8500"),
+        ("aesdeclast %xmm1, %xmm2", "660f38dfd1"),
+        ("aesdeclast %xmm9, %xmm12", "66450f38dfe1"),
+        ("aesdeclast %xmm15, %xmm0", "66410f38dfc7"),
+        ("aesdeclast 8(%rbp), %xmm3", "660f38df5d08"),
+        ("aesdeclast (%r12), %xmm8", "66450f38df0424"),
+        ("aesdeclast (%r13,%rax,4), %xmm15", "66450f38df7c8500"),
+        ("aesimc %xmm1, %xmm2", "660f38dbd1"),
+        ("aesimc %xmm9, %xmm12", "66450f38dbe1"),
+        ("aesimc %xmm15, %xmm0", "66410f38dbc7"),
+        ("aesimc 8(%rbp), %xmm3", "660f38db5d08"),
+        ("aesimc (%r12), %xmm8", "66450f38db0424"),
+        ("aesimc (%r13,%rax,4), %xmm15", "66450f38db7c8500"),
+        ("maskmovdqu %xmm1, %xmm2", "660ff7d1"),
+        ("maskmovdqu %xmm9, %xmm12", "66450ff7e1"),
+        ("maskmovdqu %xmm15, %xmm0", "66410ff7c7"),
+        ("blendvps %xmm0, %xmm1, %xmm2", "660f3814d1"),
+        ("blendvps %xmm0, %xmm9, %xmm12", "66450f3814e1"),
+        ("blendvps %xmm0, (%r13), %xmm8", "66450f38144500"),
+        ("blendvpd %xmm0, %xmm1, %xmm2", "660f3815d1"),
+        ("blendvpd %xmm0, %xmm9, %xmm12", "66450f3815e1"),
+        ("blendvpd %xmm0, (%r13), %xmm8", "66450f38154500"),
+        ("pblendvb %xmm0, %xmm1, %xmm2", "660f3810d1"),
+        ("pblendvb %xmm0, %xmm9, %xmm12", "66450f3810e1"),
+        ("pblendvb %xmm0, (%r13), %xmm8", "66450f38104500"),
+        ("pblendw $255, %xmm1, %xmm2", "660f3a0ed1ff"),
+        ("pblendw $255, %xmm9, %xmm12", "66450f3a0ee1ff"),
+        ("pblendw $255, (%r12), %xmm8", "66450f3a0e0424ff"),
+        ("palignr $15, %xmm1, %xmm2", "660f3a0fd10f"),
+        ("palignr $15, %xmm9, %xmm12", "66450f3a0fe10f"),
+        ("palignr $15, (%r12), %xmm8", "66450f3a0f04240f"),
+        ("pclmulqdq $17, %xmm1, %xmm2", "660f3a44d111"),
+        ("pclmulqdq $17, %xmm9, %xmm12", "66450f3a44e111"),
+        ("pclmulqdq $17, (%r12), %xmm8", "66450f3a44042411"),
+        ("blendps $15, %xmm1, %xmm2", "660f3a0cd10f"),
+        ("blendps $15, %xmm9, %xmm12", "66450f3a0ce10f"),
+        ("blendps $15, (%r12), %xmm8", "66450f3a0c04240f"),
+        ("blendpd $3, %xmm1, %xmm2", "660f3a0dd103"),
+        ("blendpd $3, %xmm9, %xmm12", "66450f3a0de103"),
+        ("blendpd $3, (%r12), %xmm8", "66450f3a0d042403"),
+        ("insertps $78, %xmm1, %xmm2", "660f3a21d14e"),
+        ("insertps $78, %xmm9, %xmm12", "66450f3a21e14e"),
+        ("insertps $78, (%r12), %xmm8", "66450f3a2104244e"),
+        ("dpps $255, %xmm1, %xmm2", "660f3a40d1ff"),
+        ("dpps $255, %xmm9, %xmm12", "66450f3a40e1ff"),
+        ("dpps $255, (%r12), %xmm8", "66450f3a400424ff"),
+        ("dppd $51, %xmm1, %xmm2", "660f3a41d133"),
+        ("dppd $51, %xmm9, %xmm12", "66450f3a41e133"),
+        ("dppd $51, (%r12), %xmm8", "66450f3a41042433"),
+        ("mpsadbw $7, %xmm1, %xmm2", "660f3a42d107"),
+        ("mpsadbw $7, %xmm9, %xmm12", "66450f3a42e107"),
+        ("mpsadbw $7, (%r12), %xmm8", "66450f3a42042407"),
+        ("roundps $11, %xmm1, %xmm2", "660f3a08d10b"),
+        ("roundps $11, %xmm9, %xmm12", "66450f3a08e10b"),
+        ("roundps $11, (%r12), %xmm8", "66450f3a0804240b"),
+        ("roundpd $2, %xmm1, %xmm2", "660f3a09d102"),
+        ("roundpd $2, %xmm9, %xmm12", "66450f3a09e102"),
+        ("roundpd $2, (%r12), %xmm8", "66450f3a09042402"),
+        ("roundss $3, %xmm1, %xmm2", "660f3a0ad103"),
+        ("roundss $3, %xmm9, %xmm12", "66450f3a0ae103"),
+        ("roundss $3, (%r12), %xmm8", "66450f3a0a042403"),
+        ("roundsd $4, %xmm1, %xmm2", "660f3a0bd104"),
+        ("roundsd $4, %xmm9, %xmm12", "66450f3a0be104"),
+        ("roundsd $4, (%r12), %xmm8", "66450f3a0b042404"),
+        ("cmpps $7, %xmm1, %xmm2", "0fc2d107"),
+        ("cmpps $7, %xmm9, %xmm12", "450fc2e107"),
+        ("cmpps $7, (%r12), %xmm8", "450fc2042407"),
+        ("cmppd $7, %xmm1, %xmm2", "660fc2d107"),
+        ("cmppd $7, %xmm9, %xmm12", "66450fc2e107"),
+        ("cmppd $7, (%r12), %xmm8", "66450fc2042407"),
+        ("aeskeygenassist $255, %xmm1, %xmm2", "660f3adfd1ff"),
+        ("aeskeygenassist $255, %xmm9, %xmm12", "66450f3adfe1ff"),
+        ("aeskeygenassist $255, (%r12), %xmm8", "66450f3adf0424ff"),
+        ("pcmpistri $1, %xmm1, %xmm2", "660f3a63d101"),
+        ("pcmpistri $1, %xmm9, %xmm12", "66450f3a63e101"),
+        ("pcmpistri $1, (%r12), %xmm8", "66450f3a63042401"),
+        ("pcmpestrm $1, %xmm1, %xmm2", "660f3a60d101"),
+        ("pcmpestrm $1, %xmm9, %xmm12", "66450f3a60e101"),
+        ("pcmpestrm $1, (%r12), %xmm8", "66450f3a60042401"),
+        ("movntdq %xmm1, (%rax)", "660fe708"),
+        ("movntdq %xmm9, 8(%r12)", "66450fe74c2408"),
+        ("movntps %xmm1, (%rax)", "0f2b08"),
+        ("movntps %xmm9, 8(%r12)", "450f2b4c2408"),
+        ("movntpd %xmm1, (%rax)", "660f2b08"),
+        ("movntpd %xmm9, 8(%r12)", "66450f2b4c2408"),
+        ("lddqu (%rax), %xmm1", "f20ff008"),
+        ("lddqu (%r13), %xmm9", "f2450ff04d00"),
+        ("movntdqa (%rax), %xmm1", "660f382a08"),
+        ("movntdqa (%r12,%rax,8), %xmm15", "66450f382a3cc4"),
+        ("pmovmskb %xmm1, %eax", "660fd7c1"),
+        ("pmovmskb %xmm15, %r9d", "66450fd7cf"),
+        ("movmskps %xmm1, %eax", "0f50c1"),
+        ("movmskps %xmm15, %r9d", "450f50cf"),
+        ("movmskpd %xmm1, %eax", "660f50c1"),
+        ("movmskpd %xmm15, %r9d", "66450f50cf"),
+        ("pextrw $0, %xmm1, %eax", "660fc5c100"),
+        ("pextrw $0, %xmm9, %r12d", "66450fc5e100"),
+        ("pextrw $0, %xmm1, (%rax)", "660f3a150800"),
+        ("pextrw $0, %xmm9, (%r13)", "66450f3a154d0000"),
+        ("pextrw $0, %xmm15, 1024(%rbx)", "66440f3a15bb0004000000"),
+        ("pextrw $0, %xmm8, (%r12,%r13,2)", "66470f3a15046c00"),
+        ("pextrw $7, %xmm1, %eax", "660fc5c107"),
+        ("pextrw $7, %xmm9, %r12d", "66450fc5e107"),
+        ("pextrw $7, %xmm1, (%rax)", "660f3a150807"),
+        ("pextrw $7, %xmm9, (%r13)", "66450f3a154d0007"),
+        ("pextrw $7, %xmm15, 1024(%rbx)", "66440f3a15bb0004000007"),
+        ("pextrw $7, %xmm8, (%r12,%r13,2)", "66470f3a15046c07"),
+        ("extractps $1, %xmm1, %eax", "660f3a17c801"),
+        ("extractps $3, %xmm9, (%r13)", "66450f3a174d0003"),
+        ("crc32b %al, %eax", "f20f38f0c0"),
+        ("crc32b %r9b, %r12d", "f2450f38f0e1"),
+        ("crc32w %ax, %ecx", "66f20f38f1c8"),
+        ("crc32l (%r13), %eax", "f2410f38f14500"),
+        ("crc32q %rax, %rcx", "f2480f38f1c8"),
+        ("crc32q (%r12), %r15", "f24d0f38f13c24"),
+        ("movntil %eax, (%rax)", "0fc300"),
+        ("movntiq %r9, 8(%r13)", "4d0fc34d08"),
+        ("prefetcht0 (%rax)", "0f1808"),
+        ("prefetchnta (%r12)", "410f180424"),
+        ("prefetcht2 8(%r13)", "410f185d08"),
+        ("ldmxcsr (%rax)", "0fae10"),
+        ("stmxcsr (%r13)", "410fae5d00"),
+        ("sfence", "0faef8"),
+        ("lfence", "0faee8"),
+        ("pause", "f390"),
+        ("cvtss2si %xmm1, %eax", "f30f2dc1"),
+        ("cvtsd2si %xmm9, %r12", "f24d0f2de1"),
+        ("cvttss2si %xmm15, %rax", "f3490f2cc7"),
+        ("rcpss %xmm1, %xmm2", "f30f53d1"),
+        ("rsqrtss (%r13), %xmm9", "f3450f524d00"),
+        ("movlps (%rax), %xmm1", "0f1208"),
+        ("movlps %xmm9, (%r13)", "450f134d00"),
+        ("movhpd (%rax), %xmm1", "660f1608"),
+        ("movhpd %xmm9, (%r13)", "66450f174d00"),
+        ("movupd (%rax), %xmm1", "660f1008"),
+        ("movupd %xmm9, (%r13)", "66450f114d00"),
+        ("movlhps %xmm1, %xmm2", "0f16d1"),
+        ("movlhps %xmm15, %xmm8", "450f16c7"),
+        ("vpsllvd %xmm1, %xmm2, %xmm3", "c4e26947d9"),
+        ("vpsllvd %xmm9, %xmm12, %xmm15", "c4421947f9"),
+        ("vpsllvd %ymm1, %ymm2, %ymm3", "c4e26d47d9"),
+        ("vpsllvd %ymm9, %ymm12, %ymm15", "c4421d47f9"),
+        ("vpsllvd (%r13), %ymm2, %ymm3", "c4c26d475d00"),
+        ("vpsllvd (%r12,%rax,8), %xmm2, %xmm3", "c4c269471cc4"),
+        ("vpsrlvd %xmm1, %xmm2, %xmm3", "c4e26945d9"),
+        ("vpsrlvd %xmm9, %xmm12, %xmm15", "c4421945f9"),
+        ("vpsrlvd %ymm1, %ymm2, %ymm3", "c4e26d45d9"),
+        ("vpsrlvd %ymm9, %ymm12, %ymm15", "c4421d45f9"),
+        ("vpsrlvd (%r13), %ymm2, %ymm3", "c4c26d455d00"),
+        ("vpsrlvd (%r12,%rax,8), %xmm2, %xmm3", "c4c269451cc4"),
+        ("vpsravd %xmm1, %xmm2, %xmm3", "c4e26946d9"),
+        ("vpsravd %xmm9, %xmm12, %xmm15", "c4421946f9"),
+        ("vpsravd %ymm1, %ymm2, %ymm3", "c4e26d46d9"),
+        ("vpsravd %ymm9, %ymm12, %ymm15", "c4421d46f9"),
+        ("vpsravd (%r13), %ymm2, %ymm3", "c4c26d465d00"),
+        ("vpsravd (%r12,%rax,8), %xmm2, %xmm3", "c4c269461cc4"),
+        ("vpsllvq %xmm1, %xmm2, %xmm3", "c4e2e947d9"),
+        ("vpsllvq %xmm9, %xmm12, %xmm15", "c4429947f9"),
+        ("vpsllvq %ymm1, %ymm2, %ymm3", "c4e2ed47d9"),
+        ("vpsllvq %ymm9, %ymm12, %ymm15", "c4429d47f9"),
+        ("vpsllvq (%r13), %ymm2, %ymm3", "c4c2ed475d00"),
+        ("vpsllvq (%r12,%rax,8), %xmm2, %xmm3", "c4c2e9471cc4"),
+        ("vpsrlvq %xmm1, %xmm2, %xmm3", "c4e2e945d9"),
+        ("vpsrlvq %xmm9, %xmm12, %xmm15", "c4429945f9"),
+        ("vpsrlvq %ymm1, %ymm2, %ymm3", "c4e2ed45d9"),
+        ("vpsrlvq %ymm9, %ymm12, %ymm15", "c4429d45f9"),
+        ("vpsrlvq (%r13), %ymm2, %ymm3", "c4c2ed455d00"),
+        ("vpsrlvq (%r12,%rax,8), %xmm2, %xmm3", "c4c2e9451cc4"),
+        ("vpaddb %xmm1, %xmm2, %xmm3", "c5e9fcd9"),
+        ("vpaddb %ymm9, %ymm12, %ymm15", "c4411dfcf9"),
+        ("vpaddb (%r13), %ymm2, %ymm3", "c4c16dfc5d00"),
+        ("vpand %xmm1, %xmm2, %xmm3", "c5e9dbd9"),
+        ("vpand %ymm9, %ymm12, %ymm15", "c4411ddbf9"),
+        ("vpand (%r13), %ymm2, %ymm3", "c4c16ddb5d00"),
+        ("vpshufb %xmm1, %xmm2, %xmm3", "c4e26900d9"),
+        ("vpshufb %ymm9, %ymm12, %ymm15", "c4421d00f9"),
+        ("vpshufb (%r13), %ymm2, %ymm3", "c4c26d005d00"),
+        ("vpminsd %xmm1, %xmm2, %xmm3", "c4e26939d9"),
+        ("vpminsd %ymm9, %ymm12, %ymm15", "c4421d39f9"),
+        ("vpminsd (%r13), %ymm2, %ymm3", "c4c26d395d00"),
+        ("vpmulld %xmm1, %xmm2, %xmm3", "c4e26940d9"),
+        ("vpmulld %ymm9, %ymm12, %ymm15", "c4421d40f9"),
+        ("vpmulld (%r13), %ymm2, %ymm3", "c4c26d405d00"),
+        ("vaddps %xmm1, %xmm2, %xmm3", "c5e858d9"),
+        ("vaddps %ymm9, %ymm12, %ymm15", "c4411c58f9"),
+        ("vaddps (%r13), %ymm2, %ymm3", "c4c16c585d00"),
+        ("vpcmpeqq %xmm1, %xmm2, %xmm3", "c4e26929d9"),
+        ("vpcmpeqq %ymm9, %ymm12, %ymm15", "c4421d29f9"),
+        ("vpcmpeqq (%r13), %ymm2, %ymm3", "c4c26d295d00"),
+        ("vpsadbw %xmm1, %xmm2, %xmm3", "c5e9f6d9"),
+        ("vpsadbw %ymm9, %ymm12, %ymm15", "c4411df6f9"),
+        ("vpsadbw (%r13), %ymm2, %ymm3", "c4c16df65d00"),
+        ("vpabsd %xmm1, %xmm2", "c4e2791ed1"),
+        ("vpabsd (%r13), %ymm15", "c4427d1e7d00"),
+        ("vptest %xmm1, %xmm2", "c4e27917d1"),
+        ("vptest (%r13), %ymm15", "c4427d177d00"),
+        ("vsqrtpd %xmm1, %xmm2", "c5f951d1"),
+        ("vsqrtpd (%r13), %ymm15", "c4417d517d00"),
+        ("vpmovzxbw %xmm1, %xmm2", "c4e27930d1"),
+        ("vpmovzxbw %xmm9, %ymm15", "c4427d30f9"),
+        ("vbroadcastss %xmm1, %xmm2", "c4e27918d1"),
+        ("vbroadcastss %xmm9, %ymm15", "c4427d18f9"),
+        ("vpbroadcastd %xmm1, %xmm2", "c4e27958d1"),
+        ("vpbroadcastd %xmm9, %ymm15", "c4427d58f9"),
+        ("vmovntdqa (%rax), %xmm2", "c4e2792a10"),
+        ("vmovntdqa (%r13), %ymm15", "c4427d2a7d00"),
+        ("vlddqu (%rax), %xmm2", "c5fbf010"),
+        ("vlddqu (%r13), %ymm15", "c4417ff07d00"),
+        ("vblendvps %xmm4, %xmm1, %xmm2, %xmm3", "c4e3694ad940"),
+        ("vpblendvb %ymm12, %ymm9, %ymm15, %ymm1", "c4c3054cc9c0"),
+        ("vpalignr $15, %ymm1, %ymm2, %ymm3", "c4e36d0fd90f"),
+        ("vroundps $11, %ymm1, %ymm2", "c4e37d08d10b"),
+        ("vinserti128 $1, %xmm1, %ymm2, %ymm3", "c4e36d38d901"),
+        ("vextracti128 $1, %ymm9, %xmm12", "c4437d39cc01"),
+        ("vextractf128 $1, %ymm1, (%r13)", "c4c37d194d0001"),
+        ("vperm2i128 $1, %ymm1, %ymm2, %ymm3", "c4e36d46d901"),
+        ("vpermq $27, %ymm9, %ymm15", "c443fd00f91b"),
+        ("vpermd %ymm1, %ymm2, %ymm3", "c4e26d36d9"),
+        ("vpermilps $27, %ymm1, %ymm2", "c4e37d04d11b"),
+        ("vpermilps %ymm1, %ymm2, %ymm3", "c4e26d0cd9"),
+        ("vpsllw $7, %ymm1, %ymm2", "c5ed71f107"),
+        ("vpsrldq $4, %xmm9, %xmm12", "c4c11973d904"),
+        ("vpextrw $3, %xmm1, %eax", "c5f9c5c103"),
+        ("vpextrw $3, %xmm9, (%r13)", "c44379154d0003"),
+        ("vpextrb $15, %xmm15, (%r12)", "c44379143c240f"),
+        ("vpextrq $1, %xmm9, %r12", "c443f916cc01"),
+        ("vpinsrb $1, %eax, %xmm1, %xmm2", "c4e37120d001"),
+        ("vpinsrq $1, %r12, %xmm9, %xmm15", "c443b122fc01"),
+        ("vpinsrw $7, (%r13), %xmm1, %xmm2", "c4c171c4550007"),
+        ("vextractps $3, %xmm9, %r12d", "c4437917cc03"),
+        ("vpmovmskb %ymm9, %r12d", "c4417dd7e1"),
+        ("vmovmskpd %xmm15, %eax", "c4c17950c7"),
+        ("vmovq %xmm8, %xmm0", "c579d6c0"),
+        ("vmovq %rax, %xmm9", "c461f96ec8"),
+        ("vmovq %xmm9, (%r13)", "c44179d64d00"),
+        ("vmovq (%r12), %xmm15", "c4417a7e3c24"),
+        ("vmovss %xmm15, %xmm7, %xmm0", "c54211f8"),
+        ("vmovsd (%r13), %xmm9", "c4417b104d00"),
+        ("vmovss %xmm9, (%r12)", "c4417a110c24"),
+        ("vmovhps (%r13), %xmm1, %xmm2", "c4c170165500"),
+        ("vmovlpd %xmm9, (%r12)", "c44179130c24"),
+        ("vcvtsi2sdl %eax, %xmm1, %xmm2", "c5f32ad0"),
+        ("vcvtsi2ssq %r12, %xmm9, %xmm15", "c441b22afc"),
+        ("vcvttsd2si %xmm9, %r12", "c441fb2ce1"),
+        ("vcvtss2si (%r13), %eax", "c4c17a2d4500"),
+        ("vfmadd132ps %ymm1, %ymm2, %ymm3", "c4e26d98d9"),
+        ("vfmadd213sd %xmm9, %xmm12, %xmm15", "c44299a9f9"),
+        ("vfnmsub231pd (%r13), %ymm2, %ymm3", "c4c2edbe5d00"),
+        ("vfmaddsub132ps %ymm9, %ymm12, %ymm15", "c4421d96f9"),
+        ("vmaskmovps (%r13), %ymm1, %ymm2", "c4c2752c5500"),
+        ("vpmaskmovq %xmm9, %xmm12, (%r12)", "c442998e0c24"),
+        ("vzeroall", "c5fc77"),
+        ("vzeroupper", "c5f877"),
+        ("vmovaps %ymm9, (%r13)", "c4417c294d00"),
+        ("vmovupd (%r12), %ymm15", "c4417d103c24"),
+        ("vmovntdq %ymm9, (%r12)", "c4417de70c24"),
+    ];
+    for (asm, expected) in CASES {
+        let tmp = TempDir::new("pinned_extended");
+        let path = tmp.path().join("pinned.o");
+        Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+            .unwrap()
+            .assemble(&format!(".text\n{asm}\n"), &path)
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let encoded: String = text(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(&encoded, expected, "{asm}");
+    }
+}
+
+/// Forms GNU as refuses are not quietly encoded as something else.
+#[test]
+fn invalid_packed_forms_are_rejected() {
+    for asm in [
+        "movntdq %xmm1, %xmm2",
+        "movntps %xmm1, %xmm2",
+        "lddqu %xmm1, %xmm2",
+        "movntdqa %xmm1, %xmm2",
+        "vlddqu %xmm1, %xmm2",
+        "pblendvb %xmm1, %xmm2, %xmm3",
+        "blendvps %xmm4, %xmm2, %xmm3",
+        "extractps $1, %eax, %xmm1",
+        "vpsllw %ymm1, %ymm2, %ymm3",
+        "vpsrad %ymm1, %ymm2, %ymm3",
+        "pmovmskb %xmm1, %rax",
+        "prefetcht0 %xmm1",
+        "crc32b %eax, %eax",
+        "crc32q %eax, %rax",
+        "cvtss2si %xmm1, %ax",
+    ] {
+        let tmp = TempDir::new("invalid_packed");
+        let path = tmp.path().join("invalid.o");
+        assert!(
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(&format!(".text\n{asm}\n"), &path)
+                .is_err(),
+            "{asm}"
+        );
+    }
+}
