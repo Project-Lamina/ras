@@ -88,6 +88,7 @@ const ET_REL: u16 = 1;
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
+const EM_PPC64: u16 = 21;
 const EM_ARX64: u16 = 0xa064;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
@@ -105,6 +106,7 @@ fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
         TargetArchitecture::Aarch64 => Some(EM_AARCH64),
         TargetArchitecture::Arx64 => Some(EM_ARX64),
         TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64 => Some(EM_RISCV),
+        TargetArchitecture::PowerPC64 => Some(EM_PPC64),
         _ => None,
     }
 }
@@ -218,7 +220,8 @@ fn write_elf64_header_with_shnum<W: Write>(
         .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
     w.write_all(&(ELF64_HEADER_SIZE as u64).to_le_bytes())
         .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u32.to_le_bytes())
+    let e_flags: u32 = if e_machine == EM_PPC64 { 2 } else { 0 };
+    w.write_all(&e_flags.to_le_bytes())
         .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
     w.write_all(&64u16.to_le_bytes())
         .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
@@ -267,6 +270,31 @@ fn write_elf64_section_header_full<W: Write>(
     w.write_all(&header.addralign.to_le_bytes()).map_err(map)?;
     w.write_all(&header.entsize.to_le_bytes()).map_err(map)?;
     Ok(())
+}
+
+/// ELFv2 st_other bits 5-7 hold log2 of the local entry offset; 0 means none.
+fn elf_local_entry(
+    attributes: &crate::parser::SymbolAttributes,
+    arch: TargetArchitecture,
+) -> Result<u8, RasError> {
+    let Some(value) = attributes.local_entry.as_deref() else {
+        return Ok(0);
+    };
+    if arch != TargetArchitecture::PowerPC64 {
+        return Err(RasError::ObjectError(
+            ".localentry is only defined for ppc64le".into(),
+        ));
+    }
+    let offset: u64 = value
+        .parse()
+        .map_err(|_| RasError::ObjectError(format!("Invalid .localentry offset: {value}")))?;
+    match offset {
+        0 => Ok(0),
+        4 | 8 | 16 | 32 | 64 | 128 => Ok((offset.trailing_zeros() as u8) << 5),
+        _ => Err(RasError::ObjectError(format!(
+            "Unrepresentable .localentry offset {offset}; ELFv2 allows 0 or a power of two from 4 to 128"
+        ))),
+    }
 }
 
 fn elf_visibility(attributes: &crate::parser::SymbolAttributes) -> u8 {
@@ -495,7 +523,8 @@ impl ObjectWriter for ElfWriter {
                     u8::from(sym.global)
                 },
                 sym.attributes.symbol_type,
-                elf_visibility(&sym.attributes),
+                elf_visibility(&sym.attributes)
+                    | elf_local_entry(&sym.attributes, req.target_arch)?,
                 section as u16,
                 sym.value,
             )?;

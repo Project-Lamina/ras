@@ -99,6 +99,7 @@ fn is_arch_encoded(arch: TargetArchitecture) -> bool {
             | TargetArchitecture::Arx64
             | TargetArchitecture::Riscv32
             | TargetArchitecture::Riscv64
+            | TargetArchitecture::PowerPC64
     )
 }
 

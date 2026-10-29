@@ -8,6 +8,7 @@ use crate::{
     encoder::{
         aarch64::AArch64Encoder,
         arx64::Arx64Encoder,
+        powerpc::{PowerPcEncoder, branch_field_bits},
         riscv::RiscVEncoder,
         traits::{InstructionEncoder, ParsedInstruction, RipFixup, TlsModel},
         x86_64::X86_64Encoder,
@@ -185,6 +186,23 @@ enum PatchPoint {
         rs2: u8,
         funct3: u8,
     },
+    PowerPc {
+        offset: usize,
+        fixup: PowerPcFixup,
+    },
+}
+
+enum PowerPcFixup {
+    Branch {
+        target: String,
+        bits: u32,
+        call: bool,
+    },
+    Half {
+        symbol: String,
+        toc_label: Option<String>,
+        kind: u32,
+    },
 }
 
 impl RasAssembler {
@@ -208,6 +226,7 @@ impl RasAssembler {
             TargetArchitecture::Arx64 => Box::new(Arx64Encoder::new()),
             TargetArchitecture::Riscv32 => Box::new(RiscVEncoder::new(false)),
             TargetArchitecture::Riscv64 => Box::new(RiscVEncoder::new(true)),
+            TargetArchitecture::PowerPC64 => Box::new(PowerPcEncoder::new()),
             _ => {
                 return Err(RasError::UnsupportedTarget(unsupported_target_hint(
                     target_arch,
@@ -415,7 +434,9 @@ impl RasAssembler {
                 && self.target_os != TargetOperatingSystem::MacOS
                 || matches!(
                     self.target_arch,
-                    TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+                    TargetArchitecture::Riscv32
+                        | TargetArchitecture::Riscv64
+                        | TargetArchitecture::PowerPC64
                 ))
                 && section.flags.exec
             {
@@ -563,6 +584,10 @@ impl RasAssembler {
             {
                 symbol.attributes.internal = true;
             }
+            if let Some(expression) = &symbol.attributes.local_entry {
+                let offset = absolute_expression(expression, &positions)?;
+                symbol.attributes.local_entry = Some(offset.to_string());
+            }
             if let Some(expression) = &symbol.attributes.size {
                 let size = absolute_expression(expression, &positions)?;
                 u64::try_from(size)
@@ -593,6 +618,7 @@ impl RasAssembler {
                     TargetArchitecture::Aarch64
                         | TargetArchitecture::Riscv32
                         | TargetArchitecture::Riscv64
+                        | TargetArchitecture::PowerPC64
                 );
         let alignment = if power {
             1usize.checked_shl(u32::try_from(value).unwrap_or(u32::MAX))
@@ -870,13 +896,20 @@ impl RasAssembler {
                     } else if executable
                         && matches!(
                             self.target_arch,
-                            TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64
+                            TargetArchitecture::Riscv32
+                                | TargetArchitecture::Riscv64
+                                | TargetArchitecture::PowerPC64
                         )
                     {
                         let prefix = padding % 4;
                         code.resize(code.len() + prefix, 0);
+                        let nop = if self.target_arch == TargetArchitecture::PowerPC64 {
+                            0x6000_0000u32
+                        } else {
+                            0x0000_0013u32
+                        };
                         for _ in 0..padding / 4 {
-                            code.extend_from_slice(&0x0000_0013u32.to_le_bytes());
+                            code.extend_from_slice(&nop.to_le_bytes());
                         }
                     } else if executable && self.target_arch == TargetArchitecture::X86_64 {
                         x86_nop_padding(&mut code, padding);
@@ -920,6 +953,23 @@ impl RasAssembler {
                 Line::Instruction(inst) => {
                     let opcode = inst.opcode.to_lowercase();
                     let is_jmp_call = opcode == "jmp" || opcode == "jmpq" || opcode == "call";
+
+                    if self.target_arch == TargetArchitecture::PowerPC64
+                        && let Some((placeholder, fixup)) =
+                            powerpc_symbolic(&opcode, &inst.operands)?
+                    {
+                        let bytes = self
+                            .encoder
+                            .encode_instruction(&placeholder)
+                            .map_err(|e| RasError::EncodingError(e.to_string()))?;
+                        code.extend_from_slice(&bytes);
+                        patch_points.push(PatchPoint::PowerPc {
+                            offset: current_offset,
+                            fixup,
+                        });
+                        current_offset += 4;
+                        continue;
+                    }
 
                     if matches!(
                         self.target_arch,
@@ -1356,6 +1406,9 @@ impl RasAssembler {
                                 (TargetArchitecture::Aarch64, 8) => 257,
                                 (TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64, 4) => 1,
                                 (TargetArchitecture::Riscv64, 8) => 2,
+                                (TargetArchitecture::PowerPC64, 8) => 38,
+                                (TargetArchitecture::PowerPC64, 4) => 1,
+                                (TargetArchitecture::PowerPC64, 2) => 3,
                                 _ => {
                                     return Err(RasError::EncodingError(
                                         "Unsupported data relocation width or architecture".into(),
@@ -1374,6 +1427,66 @@ impl RasAssembler {
                                     "Data relocation addend out of range".into(),
                                 )
                             })?,
+                            trailing: 0,
+                            branch: false,
+                        });
+                    }
+                }
+                continue;
+            }
+            if let PatchPoint::PowerPc { offset, fixup } = patch {
+                match fixup {
+                    PowerPcFixup::Branch { target, bits, call } => match symbol_offsets.get(target)
+                    {
+                        Some(&target_offset)
+                            if !*call && !global_symbols.contains(target.as_str()) =>
+                        {
+                            let delta = target_offset as i64 - *offset as i64;
+                            let words = delta / 4;
+                            let limit = 1i64 << (bits - 1);
+                            if delta % 4 != 0 || !(-limit..limit).contains(&words) {
+                                return Err(RasError::EncodingError(format!(
+                                    "PowerPC branch to {target} out of range"
+                                )));
+                            }
+                            let field = ((words as u32) & ((1u32 << bits) - 1)) << 2;
+                            let word =
+                                u32::from_le_bytes(code[*offset..*offset + 4].try_into().unwrap());
+                            code[*offset..*offset + 4]
+                                .copy_from_slice(&(word | field).to_le_bytes());
+                        }
+                        _ => external_relocs.push(ExternalReloc {
+                            offset: *offset,
+                            symbol: target.clone(),
+                            section: String::new(),
+                            kind: if *bits == 24 { 10 } else { 11 },
+                            addend: 0,
+                            trailing: 0,
+                            branch: false,
+                        }),
+                    },
+                    PowerPcFixup::Half {
+                        symbol,
+                        toc_label,
+                        kind,
+                    } => {
+                        let addend = match toc_label {
+                            Some(label) => {
+                                let &label_offset = symbol_offsets.get(label).ok_or_else(|| {
+                                    RasError::EncodingError(format!(
+                                        "PowerPC .TOC.-{label} needs a label in the same section"
+                                    ))
+                                })?;
+                                *offset as i64 - label_offset as i64
+                            }
+                            None => 0,
+                        };
+                        external_relocs.push(ExternalReloc {
+                            offset: *offset,
+                            symbol: symbol.clone(),
+                            section: String::new(),
+                            kind: *kind,
+                            addend,
                             trailing: 0,
                             branch: false,
                         });
@@ -1412,7 +1525,7 @@ impl RasAssembler {
                 continue;
             }
             let target = match patch {
-                PatchPoint::Data { .. } => unreachable!(),
+                PatchPoint::Data { .. } | PatchPoint::PowerPc { .. } => unreachable!(),
                 PatchPoint::Riscv { target, .. }
                 | PatchPoint::RiscvPair { target, .. }
                 | PatchPoint::AArch64 { target, .. }
@@ -1557,6 +1670,7 @@ impl RasAssembler {
             if let Some(target_offset) = target_offset {
                 match patch {
                     PatchPoint::Data { .. }
+                    | PatchPoint::PowerPc { .. }
                     | PatchPoint::AArch64 { .. }
                     | PatchPoint::Riscv { .. }
                     | PatchPoint::RiscvPair { .. }
@@ -1840,6 +1954,78 @@ impl RasAssembler {
             ))),
         }
     }
+}
+
+fn is_numeric_operand(text: &str) -> bool {
+    text.trim()
+        .trim_start_matches(['-', '+'])
+        .starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// PowerPC operands that name a symbol: a branch target, or the `@ha`/`@l`
+/// immediate of an addi/addis/li/lis. The returned instruction carries a zero
+/// placeholder in that operand.
+fn powerpc_symbolic(
+    opcode: &str,
+    operands: &[String],
+) -> Result<Option<(ParsedInstruction, PowerPcFixup)>, RasError> {
+    let Some(last) = operands.last() else {
+        return Ok(None);
+    };
+    let mut placeholder = ParsedInstruction {
+        opcode: opcode.to_string(),
+        operands: operands.to_vec(),
+    };
+    if let Some(bits) = branch_field_bits(opcode) {
+        if is_numeric_operand(last) {
+            return Ok(None);
+        }
+        placeholder.operands.last_mut().unwrap().clear();
+        placeholder.operands.last_mut().unwrap().push('0');
+        return Ok(Some((
+            placeholder,
+            PowerPcFixup::Branch {
+                target: last.trim().to_string(),
+                bits,
+                call: opcode == "bl",
+            },
+        )));
+    }
+    if !matches!(opcode, "addi" | "addis" | "li" | "lis") {
+        return Ok(None);
+    }
+    let Some((expression, modifier)) = last.trim().split_once('@') else {
+        return Ok(None);
+    };
+    let (symbol, toc_label, kind) = match modifier {
+        "ha" | "l" => {
+            let high = modifier == "ha";
+            match expression.strip_prefix(".TOC.-") {
+                Some(label) => (
+                    ".TOC.".to_string(),
+                    Some(label.to_string()),
+                    if high { 252 } else { 250 },
+                ),
+                None => (expression.to_string(), None, if high { 6 } else { 4 }),
+            }
+        }
+        "toc@ha" => (expression.to_string(), None, 50),
+        "toc@l" => (expression.to_string(), None, 48),
+        _ => {
+            return Err(RasError::EncodingError(format!(
+                "Unsupported PowerPC relocation modifier: @{modifier}"
+            )));
+        }
+    };
+    *placeholder.operands.last_mut().unwrap() = "0".into();
+    Ok(Some((
+        placeholder,
+        PowerPcFixup::Half {
+            symbol,
+            toc_label,
+            kind,
+        },
+    )))
 }
 
 fn check_branch_target(target: &str) -> Result<(), RasError> {

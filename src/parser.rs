@@ -68,6 +68,7 @@ pub struct SymbolAttributes {
     pub common: Option<(u64, u64)>,
     pub symbol_type: u8,
     pub size: Option<String>,
+    pub local_entry: Option<String>,
 }
 
 pub struct ParsedAssembly {
@@ -607,6 +608,23 @@ impl AssemblyParser {
                     _ => expression.trim().into(),
                 };
                 self.attributes.entry(name.trim().into()).or_default().size = Some(expression);
+            }
+            ".localentry" => {
+                let (name, expression) = line[parts[0].len()..]
+                    .split_once(',')
+                    .ok_or_else(|| RasError::ParseError("Invalid .localentry".into()))?;
+                let name = symbol_name(name.trim())?;
+                self.attributes
+                    .entry(name.trim().into())
+                    .or_default()
+                    .local_entry = Some(expression.trim().into());
+            }
+            ".abiversion" => {
+                if line[parts[0].len()..].trim() != "2" {
+                    return Err(RasError::ParseError(
+                        "Only ELFv2 is supported: .abiversion must be 2".into(),
+                    ));
+                }
             }
             ".extern" => {
                 // Symbols are undefined until something defines them, so gas ignores
