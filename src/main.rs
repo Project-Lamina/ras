@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Target::from_str(target_str)
             .map_err(|e| format!("Invalid target '{}': {}", target_str, e))?
     } else {
-        Target::detect_host()
+        Target::detect_host().map_err(|e| format!("Failed to detect host target: {}", e))?
     };
 
     let input_desc = options
