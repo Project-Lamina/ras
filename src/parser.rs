@@ -6,7 +6,7 @@
 
 use crate::{encoder::traits::ParsedInstruction, error::RasError};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Section {
@@ -33,8 +33,20 @@ pub struct Symbol {
 }
 
 #[derive(Debug, Clone)]
+pub struct DebugFile {
+    pub directory: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum Line {
     Section(String),
+    Loc {
+        file: u32,
+        line: u32,
+        column: u32,
+        is_stmt: bool,
+    },
     Label(Symbol),
     Instruction(ParsedInstruction),
     Data(Vec<u8>),
@@ -79,6 +91,7 @@ pub struct ParsedAssembly {
     pub symbols: Vec<Symbol>,
     pub instructions: Vec<ParsedInstruction>,
     pub lines: Vec<Line>,
+    pub files: BTreeMap<u32, DebugFile>,
 }
 
 pub struct AssemblyParser {
@@ -90,6 +103,8 @@ pub struct AssemblyParser {
     sections: Vec<Section>,
     symbols: Vec<Symbol>,
     lines: Vec<Line>,
+    files: BTreeMap<u32, DebugFile>,
+    is_stmt: bool,
     attributes: HashMap<String, SymbolAttributes>,
     pending_globals: HashSet<String>,
     symbol_names: HashSet<String>,
@@ -115,6 +130,8 @@ impl AssemblyParser {
             sections: Vec::new(),
             symbols: Vec::new(),
             lines: Vec::new(),
+            files: BTreeMap::new(),
+            is_stmt: true,
             attributes: HashMap::new(),
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
@@ -224,6 +241,7 @@ impl AssemblyParser {
             symbols: self.symbols,
             instructions,
             lines: self.lines,
+            files: self.files,
         })
     }
 
@@ -636,7 +654,76 @@ impl AssemblyParser {
                     symbol_name(name)?;
                 }
             }
-            ".ident" | ".file" => {}
+            ".file" => {
+                let operands = split_fields(line[parts[0].len()..].trim());
+                if let Some(Ok(number)) = operands.first().map(|field| field.parse::<u32>()) {
+                    let quoted = |field: &str| {
+                        parse_quoted_string_bytes(field, false)
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                    };
+                    let (strings, checksum) = match operands.iter().position(|f| *f == "md5") {
+                        Some(at) => (&operands[1..at], &operands[at + 1..]),
+                        None => (&operands[1..], &operands[operands.len()..]),
+                    };
+                    let file = match (strings, checksum) {
+                        ([name], []) | ([name], [_]) => quoted(name).map(|name| DebugFile {
+                            directory: None,
+                            name,
+                        }),
+                        ([directory, name], []) | ([directory, name], [_]) => quoted(directory)
+                            .zip(quoted(name))
+                            .map(|(directory, name)| DebugFile {
+                                directory: Some(directory),
+                                name,
+                            }),
+                        _ => None,
+                    };
+                    let file = file.ok_or_else(|| {
+                        RasError::ParseError(format!("Invalid .file operands: {line}"))
+                    })?;
+                    self.files.insert(number, file);
+                }
+            }
+            ".loc" => {
+                let operands: Vec<&str> = line[parts[0].len()..].split_whitespace().collect();
+                let number = |text: Option<&&str>, what: &str| {
+                    text.and_then(|text| text.parse::<u32>().ok())
+                        .ok_or_else(|| RasError::ParseError(format!("Invalid .loc {what}")))
+                };
+                let file = number(operands.first(), "file number")?;
+                let source_line = number(operands.get(1), "line")?;
+                let (column, options_start) = match operands.get(2) {
+                    Some(text) if text.parse::<u32>().is_ok() => (number(Some(text), "column")?, 3),
+                    _ => (0, 2),
+                };
+                let mut options = operands[options_start..].iter();
+                while let Some(&option) = options.next() {
+                    match option {
+                        "is_stmt" => {
+                            self.is_stmt = match options.next() {
+                                Some(&"0") => false,
+                                Some(&"1") => true,
+                                _ => {
+                                    return Err(RasError::ParseError(
+                                        ".loc is_stmt requires 0 or 1".into(),
+                                    ));
+                                }
+                            };
+                        }
+                        "discriminator" | "isa" | "view" => {
+                            options.next();
+                        }
+                        _ => {}
+                    }
+                }
+                self.lines.push(Line::Loc {
+                    file,
+                    line: source_line,
+                    column,
+                    is_stmt: self.is_stmt,
+                });
+            }
+            ".ident" => {}
             _ => {
                 return Err(RasError::ParseError(format!(
                     "Unsupported directive: {}",
@@ -879,6 +966,36 @@ fn parse_quoted_string_bytes(s: &str, null_terminate: bool) -> Option<Vec<u8>> {
         out.push(0);
     }
     Some(out)
+}
+
+fn split_fields(text: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, c) in text.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+            start.get_or_insert(index);
+        } else if c.is_whitespace() {
+            if let Some(begin) = start.take() {
+                fields.push(&text[begin..index]);
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+    }
+    if let Some(begin) = start {
+        fields.push(&text[begin..]);
+    }
+    fields
 }
 
 fn split_operands(text: &str) -> Vec<String> {
@@ -1134,5 +1251,44 @@ mod tests {
             Line::Data(bytes) => assert_eq!(bytes, b"hello\0"),
             _ => panic!("expected Line::Data"),
         }
+    }
+
+    #[test]
+    fn file_and_loc_directives_record_rows_and_sticky_is_stmt() {
+        let asm = parse(
+            ".file 1 \"a.c\"\n.file 2 \"dir\" \"b.c\" md5 0x0123\n.loc 1 3 4\n.loc 2 5 0 is_stmt 0 discriminator 1\nnop\n.loc 2 6 1\nnop\n",
+        );
+        assert_eq!(asm.files[&1].name, "a.c");
+        assert_eq!(asm.files[&2].directory.as_deref(), Some("dir"));
+        assert_eq!(asm.files[&2].name, "b.c");
+        let rows: Vec<_> = asm
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Loc {
+                    file,
+                    line,
+                    column,
+                    is_stmt,
+                } => Some((*file, *line, *column, *is_stmt)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, [(1, 3, 4, true), (2, 5, 0, false), (2, 6, 1, false)]);
+    }
+
+    #[test]
+    fn file_directive_without_number_is_ignored() {
+        assert!(parse(".file \"x.c\"\n").files.is_empty());
+    }
+
+    #[test]
+    fn loc_rejects_malformed_operands() {
+        assert!(AssemblyParser::new().parse(".loc 1\n").is_err());
+        assert!(
+            AssemblyParser::new()
+                .parse(".loc 1 2 3 is_stmt 2\n")
+                .is_err()
+        );
     }
 }

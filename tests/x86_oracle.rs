@@ -6,6 +6,9 @@ use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 use std::process::Command;
 
+mod common;
+use common::TempDir;
+
 fn text(bytes: &[u8]) -> &[u8] {
     let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
     let headers = u64_at(40);
@@ -90,8 +93,8 @@ fn padding_comparison_ignores_nop_form() {
 
 #[test]
 fn move_widths_extensions_and_scalar_operations_match_gas() {
-    let dir = std::env::temp_dir().join(format!("ras_x86_oracle_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new("x86_oracle");
+    let dir = tmp.path();
     let source = dir.join("input.s");
     let reference = dir.join("reference.o");
     let output = dir.join("ras.o");
@@ -133,12 +136,12 @@ fn move_widths_extensions_and_scalar_operations_match_gas() {
         flatten_nops(text(&std::fs::read(&output).unwrap())),
         flatten_nops(text(&std::fs::read(&reference).unwrap()))
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn memory_move_rejects_an_unrepresentable_immediate() {
-    let path = std::env::temp_dir().join(format!("ras_invalid_immediate_{}.o", std::process::id()));
+    let tmp = TempDir::new("invalid_immediate");
+    let path = tmp.path().join("invalid_immediate.o");
     assert!(
         Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
             .unwrap()
@@ -148,8 +151,8 @@ fn memory_move_rejects_an_unrepresentable_immediate() {
 }
 
 fn oracle(asm: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
-    let dir = std::env::temp_dir().join(format!("ras_x86_{name}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new(&format!("x86_{name}"));
+    let dir = tmp.path();
     let source = dir.join("input.s");
     let reference = dir.join("reference.o");
     let output = dir.join("ras.o");
@@ -173,7 +176,6 @@ fn oracle(asm: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
         std::fs::read(output).unwrap(),
         std::fs::read(reference).unwrap(),
     );
-    std::fs::remove_dir_all(dir).unwrap();
     bytes
 }
 
@@ -324,7 +326,8 @@ fn compiler_string_escapes_match_gas() {
 
 #[test]
 fn invalid_compiler_operands_fail() {
-    let path = std::env::temp_dir().join(format!("ras_invalid_compiler_{}.o", std::process::id()));
+    let tmp = TempDir::new("invalid_compiler");
+    let path = tmp.path().join("invalid_compiler.o");
     for asm in [
         "cmpw %eax, %ax",
         "movd %ax, %xmm0",

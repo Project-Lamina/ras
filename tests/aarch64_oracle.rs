@@ -6,6 +6,9 @@ use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 use std::process::Command;
 
+mod common;
+use common::TempDir;
+
 fn text(bytes: &[u8]) -> &[u8] {
     let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
     let headers = u64_at(40);
@@ -24,8 +27,8 @@ fn text(bytes: &[u8]) -> &[u8] {
 
 #[test]
 fn integer_float_memory_and_branch_encodings_match_clang() {
-    let dir = std::env::temp_dir().join(format!("ras_aarch64_oracle_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new("aarch64_oracle");
+    let dir = tmp.path();
     let source = dir.join("input.s");
     let reference = dir.join("reference.o");
     let output = dir.join("ras.o");
@@ -110,12 +113,12 @@ ret
         text(&std::fs::read(&output).unwrap()),
         text(&std::fs::read(&reference).unwrap())
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn duplicate_symbols_are_rejected() {
-    let output = std::env::temp_dir().join("ras_duplicate_aarch64.o");
+    let tmp = TempDir::new("duplicate_aarch64");
+    let output = tmp.path().join("duplicate_aarch64.o");
     assert!(
         Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
             .unwrap()
@@ -126,7 +129,8 @@ fn duplicate_symbols_are_rejected() {
 
 #[test]
 fn bl_to_same_section_local_label_resolves_in_place() {
-    let output = std::env::temp_dir().join(format!("ras_bl_local_{}.o", std::process::id()));
+    let tmp = TempDir::new("bl_local");
+    let output = tmp.path().join("bl_local.o");
     let asm = ".text\nentry:\n  bl local\n  ret\nlocal:\n  ret\n";
     Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
         .unwrap()
@@ -134,12 +138,12 @@ fn bl_to_same_section_local_label_resolves_in_place() {
         .unwrap();
     let bytes = std::fs::read(&output).unwrap();
     assert_eq!(text(&bytes)[..4], 0x9400_0002u32.to_le_bytes());
-    std::fs::remove_file(output).unwrap();
 }
 
 #[test]
 fn hints_system_calls_and_register_branches_encode_like_clang() {
-    let output = std::env::temp_dir().join(format!("ras_hints_aarch64_{}.o", std::process::id()));
+    let tmp = TempDir::new("hints_aarch64");
+    let output = tmp.path().join("hints_aarch64.o");
     let asm = ".text\nnop\nyield\nwfi\nsvc #0\nbrk #0x1234\nbr x1\nblr x30\n";
     Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
         .unwrap()
@@ -149,7 +153,6 @@ fn hints_system_calls_and_register_branches_encode_like_clang() {
         .chunks(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    std::fs::remove_file(output).unwrap();
     assert_eq!(
         words,
         [
@@ -166,7 +169,8 @@ fn hints_system_calls_and_register_branches_encode_like_clang() {
 
 #[test]
 fn branches_to_global_same_section_labels_are_relocated() {
-    let output = std::env::temp_dir().join(format!("ras_global_b_{}.o", std::process::id()));
+    let tmp = TempDir::new("global_b");
+    let output = tmp.path().join("global_b.o");
     let asm = ".text\n.globl g\ng:\n  b g\n  b.eq g\n  ret\n";
     Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
         .unwrap()
@@ -176,23 +180,17 @@ fn branches_to_global_same_section_labels_are_relocated() {
         .chunks(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    std::fs::remove_file(output).unwrap();
     assert_eq!(words[..2], [0x1400_0000, 0x5400_0000]);
 }
 
 fn assemble_bytes(asm: &str) -> Result<Vec<u8>, String> {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let output = std::env::temp_dir().join(format!(
-        "ras_aarch64_words_{}_{}.o",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let tmp = TempDir::new("aarch64_words");
+    let output = tmp.path().join("aarch64_words.o");
     let result = Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(asm, &output)
         .map_err(|e| e.to_string())
         .and_then(|()| std::fs::read(&output).map_err(|e| e.to_string()));
-    let _ = std::fs::remove_file(&output);
     result
 }
 

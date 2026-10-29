@@ -3,6 +3,9 @@
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 
+mod common;
+use common::TempDir;
+
 fn u16_at(bytes: &[u8], offset: usize) -> usize {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize
 }
@@ -71,14 +74,13 @@ fn text_relocations(bytes: &[u8]) -> Vec<(u64, u32, String, i64)> {
 }
 
 fn assemble(name: &str, source: &str) -> Vec<u8> {
-    let path = std::env::temp_dir().join(format!("ras_x86_tls_{name}_{}.o", std::process::id()));
+    let tmp = TempDir::new(&format!("x86_tls_{name}"));
+    let path = tmp.path().join(format!("x86_tls_{name}.o"));
     Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(source, &path)
         .unwrap();
-    let bytes = std::fs::read(&path).unwrap();
-    std::fs::remove_file(path).unwrap();
-    bytes
+    std::fs::read(&path).unwrap()
 }
 
 #[test]
@@ -117,11 +119,11 @@ fn initial_and_local_exec_sequences_emit_tls_relocations() {
 
 #[test]
 fn unsupported_tls_model_is_an_error() {
-    let path = std::env::temp_dir().join(format!("ras_x86_tls_bad_{}.o", std::process::id()));
+    let tmp = TempDir::new("x86_tls_bad");
+    let path = tmp.path().join("x86_tls_bad.o");
     let result = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble("leaq tvar@tlsgd(%rip), %rdi\n", &path);
-    let _ = std::fs::remove_file(&path);
     let message = format!("{:?}", result.unwrap_err());
     assert!(
         message.contains("unsupported TLS model @tlsgd"),

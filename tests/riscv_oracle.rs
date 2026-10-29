@@ -6,6 +6,9 @@ use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 use std::process::Command;
 
+mod common;
+use common::TempDir;
+
 fn text(bytes: &[u8]) -> &[u8] {
     let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
     let headers = u64_at(40);
@@ -110,21 +113,20 @@ fn relocations(bytes: &[u8]) -> Vec<(u64, u32, String)> {
 }
 
 fn assemble_riscv(name: &str, asm: &str) -> Vec<u8> {
-    let dir = std::env::temp_dir().join(format!("ras_riscv_{name}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new(&format!("riscv_{name}"));
+    let dir = tmp.path();
     let output = dir.join("ras.o");
     Ras::new(TargetArchitecture::Riscv64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(asm, &output)
         .unwrap();
     let bytes = std::fs::read(&output).unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
     bytes
 }
 
 fn clang_riscv(name: &str, asm: &str, extra: &[&str]) -> Vec<u8> {
-    let dir = std::env::temp_dir().join(format!("ras_riscv_{name}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new(&format!("riscv_{name}"));
+    let dir = tmp.path();
     let source = dir.join("input.s");
     let reference = dir.join("reference.o");
     std::fs::write(&source, asm).unwrap();
@@ -142,7 +144,6 @@ fn clang_riscv(name: &str, asm: &str, extra: &[&str]) -> Vec<u8> {
         String::from_utf8_lossy(&result.stderr)
     );
     let bytes = std::fs::read(&reference).unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
     bytes
 }
 

@@ -5,6 +5,7 @@
 //! with label resolution.
 
 use crate::{
+    dwarf::{self, LocRow},
     encoder::{
         aarch64::AArch64Encoder,
         arx64::Arx64Encoder,
@@ -19,7 +20,7 @@ use crate::{
         object_writer_for_os,
     },
     parser::{AssemblyParser, DataExpression, Line, parse_data_expression},
-    target::unsupported_target_hint,
+    target::{ObjectFormat, object_format_for_os, unsupported_target_hint},
 };
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
@@ -353,6 +354,7 @@ impl RasAssembler {
             .collect();
         let mut positions = HashMap::new();
         let mut layouts: Vec<Option<Layout>> = sections.iter().map(|_| None).collect();
+        let mut loc_rows: Vec<LocRow> = Vec::new();
         let mut layout_inputs: Vec<Vec<i128>> = sections.iter().map(|_| Vec::new()).collect();
         let mut layout_caches: Vec<_> = sections.iter().map(|_| None).collect();
         for iteration in 0..64 {
@@ -422,8 +424,10 @@ impl RasAssembler {
                     }
                 }
             }
+            let layout = layout.unwrap();
+            loc_rows.extend(Self::loc_rows(&section.name, lines, &layout.line_offsets));
             let (data, mut syms, mut relocations) = Self::finish_layout(
-                layout.unwrap(),
+                layout,
                 lines,
                 &positions,
                 &section.name,
@@ -595,6 +599,29 @@ impl RasAssembler {
                 symbol.attributes.size = Some(size.to_string());
             }
         }
+        if let Some(row) = loc_rows
+            .iter()
+            .find(|row| !parsed.files.contains_key(&row.file))
+        {
+            return Err(RasError::EncodingError(format!(
+                ".loc refers to undefined file {}",
+                row.file
+            )));
+        }
+        if object_format_for_os(self.target_os) == Some(ObjectFormat::Elf) {
+            let debug = dwarf::build(
+                self.target_arch,
+                &sections,
+                &loc_rows,
+                &parsed.files,
+                &self.object_write_options.dwarf_decl_file_name,
+                self.object_write_options.emit_minimal_dwarf_sections,
+            )?;
+            if let Some(debug) = debug {
+                sections.extend(debug.sections);
+                relocs.extend(debug.relocs);
+            }
+        }
         let code = &sections.iter().find(|s| s.name == ".text").unwrap().data;
 
         self.object_writer
@@ -608,6 +635,36 @@ impl RasAssembler {
                 opts: &self.object_write_options,
             })
             .map_err(|e| RasError::ObjectError(e.to_string()))
+    }
+
+    fn loc_rows(section: &str, lines: &[Line], offsets: &[usize]) -> Vec<LocRow> {
+        let mut rows = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let Line::Loc {
+                file,
+                line,
+                column,
+                is_stmt,
+            } = line
+            else {
+                continue;
+            };
+            let Some(next) = lines[index + 1..]
+                .iter()
+                .position(|line| matches!(line, Line::Instruction(_)))
+            else {
+                continue;
+            };
+            rows.push(LocRow {
+                section: section.to_string(),
+                offset: offsets[index + 1 + next] as u64,
+                file: *file,
+                line: *line,
+                column: *column,
+                is_stmt: *is_stmt,
+            });
+        }
+        rows
     }
 
     fn alignment(&self, value: usize, directive: &str) -> Result<usize, RasError> {
@@ -873,7 +930,7 @@ impl RasAssembler {
                 }
             }
             match line {
-                Line::Section(_) => {}
+                Line::Section(_) | Line::Loc { .. } => {}
                 Line::Align {
                     value,
                     directive,
@@ -1376,6 +1433,7 @@ impl RasAssembler {
                                 addend: *offset as i64 - right as i64,
                                 trailing: 0,
                                 branch: false,
+                                section_symbol: false,
                             });
                         } else {
                             return Err(RasError::EncodingError(format!(
@@ -1429,6 +1487,7 @@ impl RasAssembler {
                             })?,
                             trailing: 0,
                             branch: false,
+                            section_symbol: false,
                         });
                     }
                 }
@@ -1463,6 +1522,7 @@ impl RasAssembler {
                             addend: 0,
                             trailing: 0,
                             branch: false,
+                            section_symbol: false,
                         }),
                     },
                     PowerPcFixup::Half {
@@ -1489,6 +1549,7 @@ impl RasAssembler {
                             addend,
                             trailing: 0,
                             branch: false,
+                            section_symbol: false,
                         });
                     }
                 }
@@ -1520,6 +1581,7 @@ impl RasAssembler {
                         addend: 0,
                         trailing: 0,
                         branch: false,
+                        section_symbol: false,
                     }),
                 }
                 continue;
@@ -1566,6 +1628,7 @@ impl RasAssembler {
                         addend: 0,
                         trailing: 0,
                         branch: false,
+                        section_symbol: false,
                     }),
                     _ => {
                         let label = format!("ras.pcrel_hi.{offset}");
@@ -1577,6 +1640,7 @@ impl RasAssembler {
                             addend: 0,
                             trailing: 0,
                             branch: false,
+                            section_symbol: false,
                         });
                         external_relocs.push(ExternalReloc {
                             offset: *offset + 4,
@@ -1586,6 +1650,7 @@ impl RasAssembler {
                             addend: 0,
                             trailing: 0,
                             branch: false,
+                            section_symbol: false,
                         });
                         pcrel_labels.push(ObjectSymbol {
                             attributes: Default::default(),
@@ -1636,6 +1701,7 @@ impl RasAssembler {
                         addend: *addend,
                         trailing: 0,
                         branch: false,
+                        section_symbol: false,
                     });
                 }
                 continue;
@@ -1727,6 +1793,7 @@ impl RasAssembler {
                             addend: -4,
                             trailing: 0,
                             branch: true,
+                            section_symbol: false,
                         });
                     }
                     PatchPoint::X86RipRel32 {
@@ -1744,6 +1811,7 @@ impl RasAssembler {
                             addend: *addend - (4 + *trailing as i64),
                             trailing: *trailing,
                             branch: false,
+                            section_symbol: false,
                         });
                     }
                     PatchPoint::X86Tls {
@@ -1762,6 +1830,7 @@ impl RasAssembler {
                             addend: *addend,
                             trailing: *trailing,
                             branch: false,
+                            section_symbol: false,
                         });
                     }
                     _ => {

@@ -5,13 +5,17 @@
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 
+mod common;
+use common::TempDir;
+
 fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
 #[test]
 fn sections_keep_contents_symbols_and_relocations() {
-    let path = std::env::temp_dir().join(format!("ras_sections_{}.o", std::process::id()));
+    let tmp = TempDir::new("sections");
+    let path = tmp.path().join("sections.o");
     Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(
@@ -20,7 +24,6 @@ fn sections_keep_contents_symbols_and_relocations() {
         )
         .unwrap();
     let bytes = std::fs::read(&path).unwrap();
-    std::fs::remove_file(path).unwrap();
     let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
     let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
     let headers = u64_at(&bytes, 40) as usize;
@@ -61,8 +64,8 @@ fn sections_keep_contents_symbols_and_relocations() {
 
 #[test]
 fn numeric_data_alignment_and_bss_match_gas() {
-    let dir = std::env::temp_dir().join(format!("ras_data_sections_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new("data_sections");
+    let dir = tmp.path();
     let source = dir.join("input.s");
     let reference = dir.join("reference.o");
     let output = dir.join("ras.o");
@@ -119,13 +122,12 @@ fn numeric_data_alignment_and_bss_match_gas() {
         sections
     };
     assert_eq!(inspect(&output), inspect(&reference));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn numeric_labels_and_deferred_data_match_gas() {
-    let dir = std::env::temp_dir().join(format!("ras_label_expressions_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new("label_expressions");
+    let dir = tmp.path();
     let source = dir.join("input.s");
     let reference = dir.join("gas.o");
     let output = dir.join("ras.o");
@@ -192,12 +194,12 @@ fn numeric_labels_and_deferred_data_match_gas() {
         sections
     };
     assert_eq!(inspect(&output), inspect(&reference));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn undefined_numeric_labels_and_cross_section_differences_fail() {
-    let path = std::env::temp_dir().join(format!("ras_invalid_labels_{}.o", std::process::id()));
+    let tmp = TempDir::new("invalid_labels");
+    let path = tmp.path().join("invalid_labels.o");
     for (asm, error) in [
         (".long 1f", "Undefined numeric label: 1f"),
         ("jmp 1b\n1: ret", "Undefined numeric label: 1b"),
@@ -216,8 +218,8 @@ fn undefined_numeric_labels_and_cross_section_differences_fail() {
 
 #[test]
 fn section_name_may_be_quoted() {
-    let dir = std::env::temp_dir().join(format!("ras_quoted_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new("quoted");
+    let dir = tmp.path();
     let body = ".text\n.globl f\nf: ret\n";
     let assemble = |source: &str, name: &str| {
         let path = dir.join(name);
@@ -236,5 +238,4 @@ fn section_name_may_be_quoted() {
         "bare.o",
     );
     assert_eq!(quoted, bare);
-    std::fs::remove_dir_all(dir).unwrap();
 }

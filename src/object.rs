@@ -10,11 +10,12 @@ use std::io::Write;
 /// Extra sections and metadata for [`ObjectWriter`] backends.
 #[derive(Debug, Clone)]
 pub struct ObjectWriteOptions {
-    /// When true, [`ElfWriter`] also emits minimal `.debug_line`, `.debug_abbrev`, and `.debug_info`.
+    /// Emit `.debug_line`, `.debug_abbrev` and `.debug_info` even without `.loc` rows.
+    /// Rows from `.file`/`.loc` always produce DWARF on ELF targets.
     pub emit_minimal_dwarf_sections: bool,
     /// Retain temporary local symbols in ELF output.
     pub keep_locals: bool,
-    /// File name stored in DWARF line/info (used when `emit_minimal_dwarf_sections` is set).
+    /// Compile unit name used when the source declares no `.file` entry.
     pub dwarf_decl_file_name: String,
 }
 
@@ -52,6 +53,9 @@ pub struct ExternalReloc {
     pub trailing: usize,
     /// x86_64: the reference is a call or jump target, encoded as a Mach-O branch.
     pub branch: bool,
+    /// `symbol` names a section, and the relocation targets that section's symbol
+    /// with `addend` measured from the section start.
+    pub section_symbol: bool,
 }
 
 /// All data needed to write a single relocatable object file.
@@ -109,90 +113,6 @@ fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
         TargetArchitecture::PowerPC64 => Some(EM_PPC64),
         _ => None,
     }
-}
-
-fn push_uleb128(buf: &mut Vec<u8>, mut n: u32) {
-    loop {
-        let mut b = (n & 0x7f) as u8;
-        n >>= 7;
-        if n != 0 {
-            b |= 0x80;
-        }
-        buf.push(b);
-        if n == 0 {
-            break;
-        }
-    }
-}
-
-fn dwarf_debug_line_bytes(decl_file: &str) -> Vec<u8> {
-    let mut prog = Vec::new();
-    prog.push(0);
-    push_uleb128(&mut prog, 9);
-    prog.push(2);
-    prog.extend_from_slice(&0u64.to_le_bytes());
-    prog.push(1);
-    prog.push(0);
-    push_uleb128(&mut prog, 1);
-    prog.push(1);
-
-    let std_lens = [0u8, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
-    let mut body_tail = vec![1u8, 1, 1, -5i8 as u8, 14, 13];
-    body_tail.extend_from_slice(&std_lens);
-    body_tail.push(0);
-    push_uleb128(&mut body_tail, 0);
-    push_uleb128(&mut body_tail, 0);
-    push_uleb128(&mut body_tail, 0);
-    for b in decl_file.as_bytes() {
-        if *b == 0 {
-            break;
-        }
-        body_tail.push(*b);
-    }
-    body_tail.push(0);
-    body_tail.push(0);
-    body_tail.extend_from_slice(&prog);
-
-    let header_length = body_tail.len() as u32;
-    let mut unit_inner = Vec::new();
-    unit_inner.extend_from_slice(&4u16.to_le_bytes());
-    unit_inner.extend_from_slice(&header_length.to_le_bytes());
-    unit_inner.extend_from_slice(&body_tail);
-    let unit_length = unit_inner.len() as u32;
-    let mut out = Vec::new();
-    out.extend_from_slice(&unit_length.to_le_bytes());
-    out.extend_from_slice(&unit_inner);
-    out
-}
-
-fn dwarf_debug_abbrev_bytes() -> Vec<u8> {
-    vec![
-        1, 0x11, 0x00, 0x16, 0x17, 0x03, 0x08, 0x00, 0x00, 0x00, 0x00,
-    ]
-}
-
-fn dwarf_debug_info_bytes(decl_file: &str) -> Vec<u8> {
-    let mut die = Vec::new();
-    die.push(1);
-    die.extend_from_slice(&0u32.to_le_bytes());
-    for b in decl_file.as_bytes() {
-        if *b == 0 {
-            break;
-        }
-        die.push(*b);
-    }
-    die.push(0);
-
-    let mut inner = Vec::new();
-    inner.extend_from_slice(&4u16.to_le_bytes());
-    inner.extend_from_slice(&0u32.to_le_bytes());
-    inner.push(8);
-    inner.extend_from_slice(&die);
-    let unit_length = inner.len() as u32;
-    let mut out = Vec::new();
-    out.extend_from_slice(&unit_length.to_le_bytes());
-    out.extend_from_slice(&inner);
-    out
 }
 
 fn write_elf64_header_with_shnum<W: Write>(
@@ -461,6 +381,21 @@ impl ObjectWriter for ElfWriter {
             .map(|s| (s.name.as_str(), s))
             .collect();
         let mut section_symbols = std::collections::HashMap::new();
+        for reloc in req.relocations.iter().filter(|r| r.section_symbol) {
+            if section_symbols.contains_key(reloc.symbol.as_str()) {
+                continue;
+            }
+            let section = names
+                .iter()
+                .position(|n| n == &reloc.symbol)
+                .ok_or_else(|| {
+                    RasError::ObjectError(format!("Unknown relocation section: {}", reloc.symbol))
+                })?
+                + 1;
+            let index = symtab.len() / ELF64_SYM_SIZE as usize;
+            section_symbols.insert(reloc.symbol.as_str(), index as u32);
+            write_elf64_symbol(&mut symtab, 0, 0, 3, 0, section as u16, 0)?;
+        }
         for reloc in req.relocations {
             let Some(symbol) = omitted.get(reloc.symbol.as_str()) else {
                 continue;
@@ -539,7 +474,7 @@ impl ObjectWriter for ElfWriter {
                 symtab[end - 8..].copy_from_slice(&size.to_le_bytes());
             }
         }
-        for reloc in req.relocations {
+        for reloc in req.relocations.iter().filter(|r| !r.section_symbol) {
             if !sym_indices.contains_key(reloc.symbol.as_str())
                 && !omitted.contains_key(reloc.symbol.as_str())
             {
@@ -565,7 +500,9 @@ impl ObjectWriter for ElfWriter {
             let mut bytes = Vec::new();
             for r in req.relocations.iter().filter(|r| r.section == section.name) {
                 bytes.extend_from_slice(&(r.offset as u64).to_le_bytes());
-                let (index, addend) = if let Some(symbol) = omitted.get(r.symbol.as_str()) {
+                let (index, addend) = if r.section_symbol {
+                    (section_symbols[r.symbol.as_str()], r.addend)
+                } else if let Some(symbol) = omitted.get(r.symbol.as_str()) {
                     (
                         section_symbols[symbol.section.as_str()],
                         r.addend.wrapping_add(symbol.value as i64),
@@ -643,27 +580,6 @@ impl ObjectWriter for ElfWriter {
             addralign: 1,
             ..Default::default()
         });
-        if req.opts.emit_minimal_dwarf_sections {
-            for (name, bytes) in [
-                (
-                    ".debug_line",
-                    dwarf_debug_line_bytes(&req.opts.dwarf_decl_file_name),
-                ),
-                (".debug_abbrev", dwarf_debug_abbrev_bytes()),
-                (
-                    ".debug_info",
-                    dwarf_debug_info_bytes(&req.opts.dwarf_decl_file_name),
-                ),
-            ] {
-                names.push(name.into());
-                data.push(bytes);
-                headers.push(Elf64SectionHeader {
-                    section_type: SHT_PROGBITS,
-                    addralign: 1,
-                    ..Default::default()
-                });
-            }
-        }
         names.push(".shstrtab".into());
         let mut shstrtab = vec![0];
         for name in names {
@@ -1618,6 +1534,8 @@ pub fn object_writer_for_os(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TempDir;
+
     use super::*;
 
     #[test]
@@ -1637,7 +1555,8 @@ mod tests {
             },
         }];
         let symbols: Vec<ObjectSymbol> = vec![];
-        let path = std::env::temp_dir().join("ras_elf_test_x86_64.o");
+        let tmp = TempDir::new("elf_test_x86_64");
+        let path = tmp.path().join("elf_test_x86_64.o");
         let opts = ObjectWriteOptions::default();
         let result = w.write_object_file(
             &path,
@@ -1651,7 +1570,6 @@ mod tests {
                 opts: &opts,
             },
         );
-        let _ = std::fs::remove_file(&path);
         result.expect("ELF write should succeed");
     }
 
@@ -1672,7 +1590,8 @@ mod tests {
             },
         }];
         let symbols: Vec<ObjectSymbol> = vec![];
-        let path = std::env::temp_dir().join("ras_elf_test_aarch64.o");
+        let tmp = TempDir::new("elf_test_aarch64");
+        let path = tmp.path().join("elf_test_aarch64.o");
         let opts = ObjectWriteOptions::default();
         let result = w.write_object_file(
             &path,
@@ -1686,7 +1605,6 @@ mod tests {
                 opts: &opts,
             },
         );
-        let _ = std::fs::remove_file(&path);
         result.expect("ELF write should succeed");
     }
 
@@ -1701,7 +1619,8 @@ mod tests {
     fn test_elf64_has_valid_magic() {
         let mut w = ElfWriter::new();
         let code = [0xc3u8];
-        let path = std::env::temp_dir().join("ras_elf_magic_test.o");
+        let tmp = TempDir::new("elf_magic_test");
+        let path = tmp.path().join("elf_magic_test.o");
         let opts = ObjectWriteOptions::default();
         w.write_object_file(
             &path,
@@ -1717,40 +1636,79 @@ mod tests {
         )
         .expect("write");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
 
     #[test]
-    fn test_elf64_emits_debug_sections_when_requested() {
-        let mut w = ElfWriter::new();
-        let code = [0xc3u8];
-        let path = std::env::temp_dir().join("ras_elf_dwarf_test.o");
-        let opts = ObjectWriteOptions {
-            emit_minimal_dwarf_sections: true,
-            dwarf_decl_file_name: "t.s".to_string(),
-            ..Default::default()
+    fn section_symbol_relocations_emit_rela_for_debug_sections() {
+        let text = Section {
+            group: None,
+            name: ".text".into(),
+            flags: SectionFlags {
+                alloc: true,
+                exec: true,
+                write: false,
+                tls: false,
+            },
+            data: vec![0x90; 4],
+            alignment: 1,
         };
-        w.write_object_file(
-            &path,
-            &ObjectWriteRequest {
+        let debug_line = Section {
+            group: None,
+            name: ".debug_line".into(),
+            flags: SectionFlags {
+                alloc: false,
+                exec: false,
+                write: false,
+                tls: false,
+            },
+            data: vec![0; 8],
+            alignment: 1,
+        };
+        let relocations = [ExternalReloc {
+            offset: 0,
+            symbol: ".text".into(),
+            section: ".debug_line".into(),
+            kind: 1,
+            addend: 2,
+            trailing: 0,
+            branch: false,
+            section_symbol: true,
+        }];
+        let code = vec![0x90u8; 4];
+        let opts = ObjectWriteOptions::default();
+        let buf = ElfWriter::new()
+            .object_bytes(&ObjectWriteRequest {
                 code: &code,
-                sections: &[],
+                sections: &[text, debug_line],
                 symbols: &[],
-                relocations: &[],
+                relocations: &relocations,
                 target_arch: TargetArchitecture::X86_64,
                 target_os: TargetOperatingSystem::Linux,
                 opts: &opts,
-            },
-        )
-        .expect("write");
-        let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            buf.windows(11).any(|w| w == b".debug_line"),
-            "expected .debug_line in shstrtab"
-        );
+            })
+            .expect("write");
+        let u64_at = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        let shoff = u64_at(0x28) as usize;
+        let shnum = u16::from_le_bytes([buf[0x3c], buf[0x3d]]) as usize;
+        let header = |index: usize| shoff + index * ELF64_SECTION_HEADER_SIZE;
+        let shstrtab = header(usize::from(u16::from_le_bytes([buf[0x3e], buf[0x3f]])));
+        let names = u64_at(shstrtab + 0x18) as usize;
+        let name_of = |index: usize| {
+            let start = names + u32_at(header(index)) as usize;
+            let end = start + buf[start..].iter().position(|b| *b == 0).unwrap();
+            std::str::from_utf8(&buf[start..end]).unwrap().to_string()
+        };
+        let rela = (0..shnum)
+            .find(|&i| name_of(i) == ".rela.debug_line")
+            .expect(".rela.debug_line section");
+        assert_eq!(u32_at(header(rela) + 4), SHT_RELA);
+        let entry = u64_at(header(rela) + 0x18) as usize;
+        assert_eq!(u64_at(entry + 8) & 0xffff_ffff, 1, "R_X86_64_64");
+        assert_eq!(u64_at(entry + 8) >> 32, 1, "section symbol for .text");
+        assert_eq!(u64_at(entry + 16), 2, "addend");
     }
 
     fn macho_text_section(data: Vec<u8>) -> Section {
@@ -1828,6 +1786,7 @@ mod tests {
             addend: -4,
             trailing: 0,
             branch: true,
+            section_symbol: false,
         }];
         let buf = macho_object(&sections, &symbols, &relocations).expect("write");
         let text_reloc = le32(&buf, 32 + 72 + 56) as usize;
@@ -1876,6 +1835,7 @@ mod tests {
             addend: 0,
             trailing: 0,
             branch: false,
+            section_symbol: false,
         };
         let err = macho_object(&[macho_text_section(vec![0; 8])], &[], &[pc64]).expect_err("pc64");
         assert!(err.to_string().contains("kind 24"), "{err}");
@@ -2001,6 +1961,7 @@ mod tests {
                 addend: 0,
                 trailing: 0,
                 branch: false,
+                section_symbol: false,
             },
             ExternalReloc {
                 offset: 4,
@@ -2010,6 +1971,7 @@ mod tests {
                 addend: 0,
                 trailing: 0,
                 branch: false,
+                section_symbol: false,
             },
         ];
         let buf = macho_arm64_object(&sections, &symbols, &relocations).expect("write");
@@ -2075,6 +2037,7 @@ mod tests {
             addend: 0,
             trailing: 0,
             branch: true,
+            section_symbol: false,
         }];
         let buf = macho_arm64_object(&sections, &symbols, &relocations).expect("write");
         assert_eq!(
@@ -2104,6 +2067,7 @@ mod tests {
                 addend: 0,
                 trailing: 0,
                 branch: false,
+                section_symbol: false,
             };
             let sections = [arm64_section(".text", true, vec![0; 8])];
             let symbols = [arm64_symbol("_f", true, ".text", 0)];
@@ -2117,7 +2081,8 @@ mod tests {
     fn test_coff_amd64_write() {
         let mut w = CoffWriter::new();
         let code = [0xc3u8];
-        let path = std::env::temp_dir().join("ras_coff_test.obj");
+        let tmp = TempDir::new("coff_test");
+        let path = tmp.path().join("coff_test.obj");
         let opts = ObjectWriteOptions::default();
         w.write_object_file(
             &path,
@@ -2133,7 +2098,6 @@ mod tests {
         )
         .expect("coff write");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert_eq!(&buf[0..2], &IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
     }
 }

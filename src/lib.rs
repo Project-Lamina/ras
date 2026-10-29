@@ -5,12 +5,15 @@
 
 pub mod assembler;
 mod cfi;
+mod dwarf;
 pub mod encoder;
 pub mod error;
 pub mod object;
 pub mod parser;
 pub mod runtime;
 pub mod target;
+#[cfg(test)]
+mod test_support;
 
 pub use assembler::RasAssembler;
 pub use error::RasError;
@@ -84,6 +87,8 @@ impl Ras {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TempDir;
+
     use super::*;
 
     #[test]
@@ -97,10 +102,10 @@ main:
 "#;
         let mut ras =
             Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
-        let path = std::env::temp_dir().join("ras_gas_style_test.o");
+        let dir = crate::test_support::TempDir::new("gas_style");
+        let path = dir.path().join("out.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
@@ -117,10 +122,10 @@ main:
         let mut ras =
             Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
         let bytes = ras.assemble_to_bytes(asm).expect("assemble to bytes");
-        let path = std::env::temp_dir().join("ras_bytes_vs_file_test.o");
+        let tmp = TempDir::new("bytes_vs_file_test");
+        let path = tmp.path().join("bytes_vs_file_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let file = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert_eq!(bytes, file);
     }
 
@@ -142,10 +147,10 @@ main:
 "#;
         let mut ras =
             Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
-        let path = std::env::temp_dir().join("ras_mem_test.o");
+        let tmp = TempDir::new("mem_test");
+        let path = tmp.path().join("mem_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
@@ -168,10 +173,10 @@ main:
 "#;
         let mut ras =
             Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
-        let path = std::env::temp_dir().join("ras_jmp_test.o");
+        let tmp = TempDir::new("jmp_test");
+        let path = tmp.path().join("jmp_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
@@ -189,10 +194,10 @@ get_fmt:
 "#;
         let mut ras =
             Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
-        let path = std::env::temp_dir().join("ras_rip_rel_test.o");
+        let tmp = TempDir::new("rip_rel_test");
+        let path = tmp.path().join("rip_rel_test.o");
         ras.assemble(asm, &path).expect("assemble should succeed");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }
 
@@ -210,10 +215,10 @@ done:
 "#;
         let mut ras =
             Ras::new(TargetArchitecture::Arx64, TargetOperatingSystem::Linux).expect("ras new");
-        let path = std::env::temp_dir().join("ras_arx64_label_test.o");
+        let tmp = TempDir::new("arx64_label_test");
+        let path = tmp.path().join("arx64_label_test.o");
         ras.assemble(asm, &path).expect("assemble");
         let buf = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
     }

@@ -4,8 +4,11 @@
 
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
+
+mod common;
+use common::TempDir;
 
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
@@ -99,22 +102,6 @@ impl Object {
     }
 }
 
-struct WorkDir(PathBuf);
-
-impl WorkDir {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("ras_{name}_{}", std::process::id()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn run(command: &mut Command) -> Vec<u8> {
     let result = command.output().unwrap();
     assert!(
@@ -149,9 +136,9 @@ fn assemble_pair(dir: &Path, source: &str) -> (Object, Object) {
 
 #[test]
 fn weak_hidden_comdat_and_relative_relocations_match_gas() {
-    let dir = WorkDir::new("cpp_metadata");
+    let dir = TempDir::new("cpp_metadata");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".section .gcc_except_table,\"a\"\n.long DW.ref.type-.\n.byte 7\nbase: .long DW.ref.type-base\n.long DW.ref.type-base\n.hidden DW.ref.type\n.weak DW.ref.type\n.section .data.ref,\"awG\",@progbits,DW.ref.type,comdat\n.balign 8\n.type DW.ref.type,@object\n.size DW.ref.type,8\nDW.ref.type: .quad external\n.weak external\n.hidden external\n",
     );
     for name in ["DW.ref.type", "external"] {
@@ -176,9 +163,9 @@ fn weak_hidden_comdat_and_relative_relocations_match_gas() {
 
 #[test]
 fn implicit_group_signature_is_defined_locally() {
-    let dir = WorkDir::new("group_signature");
+    let dir = TempDir::new("group_signature");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".section .text.inline,\"axG\",@progbits,signature,comdat\n.weak function\nfunction: ret\n",
     );
     assert_eq!(ras.group(), gas.group());
@@ -192,9 +179,9 @@ fn implicit_group_signature_is_defined_locally() {
 
 #[test]
 fn symbolic_leb128_and_aliases_match_gas() {
-    let dir = WorkDir::new("leb128");
+    let dir = TempDir::new("leb128");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".text\nstart: .space 130\nend: ret\n.weak alias\n.set alias,start\n.data\n.uleb128 end-start,0,127,128,16384\n.sleb128 -65,-64,63,64,start-end\n.uleb128 tail-head\nhead: .space 128\ntail:\n",
     );
     assert_eq!(
@@ -210,9 +197,9 @@ fn symbolic_leb128_and_aliases_match_gas() {
 
 #[test]
 fn relaxed_branches_with_symbolic_leb128_match_gas() {
-    let dir = WorkDir::new("relaxed_leb128");
+    let dir = TempDir::new("relaxed_leb128");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".text\nstart: jmp end\n.space 128,0x90\nend: ret\n.data\n.uleb128 end-start\n.sleb128 start-end\n.balign 16\n.byte 7\n",
     );
     for section in [".text", ".data"] {
@@ -225,9 +212,9 @@ fn relaxed_branches_with_symbolic_leb128_match_gas() {
 
 #[test]
 fn chained_layout_dependencies_match_gas() {
-    let dir = WorkDir::new("layout_dependencies");
+    let dir = TempDir::new("layout_dependencies");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".text\nstart: .space 16384\nend: ret\n.data\n.uleb128 tail-head\nhead: .uleb128 end-start\ntail:\n.section .dependent,\"a\"\n.sleb128 tail-head\n",
     );
     for section in [".text", ".data", ".dependent"] {
@@ -241,7 +228,7 @@ fn chained_layout_dependencies_match_gas() {
 
 #[test]
 fn cascading_forward_branches_match_gas() {
-    let dir = WorkDir::new("branch_cascade");
+    let dir = TempDir::new("branch_cascade");
     let mut source = String::from(".text\n.globl cascade\ncascade:\n");
     let count = 16;
     for index in 0..count {
@@ -253,7 +240,7 @@ fn cascading_forward_branches_match_gas() {
         source.push_str(&format!(".space {padding},0x90\n"));
     }
     source.push_str(&format!("target{}: ret\n", count - 1));
-    let (ras, gas) = assemble_pair(&dir.0, &source);
+    let (ras, gas) = assemble_pair(dir.path(), &source);
     let text = ras.contents(ras.section(".text"));
     assert_eq!(text, gas.contents(gas.section(".text")));
     for index in 0..count {
@@ -263,9 +250,9 @@ fn cascading_forward_branches_match_gas() {
 
 #[test]
 fn local_and_common_storage_match_gas() {
-    let dir = WorkDir::new("common");
+    let dir = TempDir::new("common");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".local private\n.comm private,17,16\n.comm shared,24,8\n.local second\n.comm second,8,8\n",
     );
     for name in ["private", "shared", "second"] {
@@ -284,7 +271,7 @@ fn local_and_common_storage_match_gas() {
 
 #[test]
 fn unsupported_directives_and_unresolved_leb128_fail() {
-    let dir = WorkDir::new("unsupported");
+    let dir = TempDir::new("unsupported");
     for source in [
         ".unknown 1",
         ".cfi_startproc\n.cfi_unknown\n.cfi_endproc",
@@ -292,7 +279,7 @@ fn unsupported_directives_and_unresolved_leb128_fail() {
         ".uleb128 -1",
         ".set alias,missing",
     ] {
-        let path = dir.0.join("bad.o");
+        let path = dir.path().join("bad.o");
         assert!(
             Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
                 .unwrap()
@@ -307,13 +294,14 @@ fn unsupported_directives_and_unresolved_leb128_fail() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn gcc_cpp_exceptions_unwind_with_pie_and_fixed_addresses() {
-    let dir = WorkDir::new("cpp_runtime");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ras"), dir.0.join("as")).unwrap();
+    let dir = TempDir::new("cpp_runtime");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ras"), dir.path().join("as")).unwrap();
     if let Some(weld) = std::env::var_os("RAS_TEST_WELD") {
-        std::os::unix::fs::symlink(std::fs::canonicalize(weld).unwrap(), dir.0.join("ld")).unwrap();
+        std::os::unix::fs::symlink(std::fs::canonicalize(weld).unwrap(), dir.path().join("ld"))
+            .unwrap();
     }
-    let input = dir.0.join("input.cpp");
-    let duplicate = dir.0.join("duplicate.cpp");
+    let input = dir.path().join("input.cpp");
+    let duplicate = dir.path().join("duplicate.cpp");
     std::fs::write(&input, include_str!("fixtures/exceptions.cpp")).unwrap();
     std::fs::write(
         &duplicate,
@@ -321,10 +309,10 @@ fn gcc_cpp_exceptions_unwind_with_pie_and_fixed_addresses() {
     )
     .unwrap();
     for mode in ["-pie", "-no-pie"] {
-        let output = dir.0.join("program");
+        let output = dir.path().join("program");
         run(Command::new("g++")
             .arg(mode)
-            .arg(format!("-B{}/", dir.0.display()))
+            .arg(format!("-B{}/", dir.path().display()))
             .arg(&input)
             .arg(&duplicate)
             .arg("-o")
@@ -336,10 +324,10 @@ fn gcc_cpp_exceptions_unwind_with_pie_and_fixed_addresses() {
     }
     std::fs::write(&input, "#include <cstdio>\n#include <stdexcept>\nstruct Guard { ~Guard() { puts(\"cleanup\"); } };\n__attribute__((noinline)) void raise() { Guard g; throw std::runtime_error(\"boom\"); }\nint main() { try { raise(); } catch (const std::exception&) { puts(\"caught\"); } }\n").unwrap();
     for optimization in ["-O0", "-O2"] {
-        let output = dir.0.join("unwind");
+        let output = dir.path().join("unwind");
         run(Command::new("g++")
             .arg(optimization)
-            .arg(format!("-B{}/", dir.0.display()))
+            .arg(format!("-B{}/", dir.path().display()))
             .arg(&input)
             .arg("-o")
             .arg(&output));
@@ -349,9 +337,9 @@ fn gcc_cpp_exceptions_unwind_with_pie_and_fixed_addresses() {
 
 #[test]
 fn weak_calls_and_global_aliases_match_gas() {
-    let dir = WorkDir::new("weak_calls");
+    let dir = TempDir::new("weak_calls");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".text\n.weak target\n.type target,@function\n.size target,11\ntarget: call target\ncall late\nlate: ret\n.weak late\n.globl alias\n.set alias,target\n",
     );
     assert_eq!(ras.relocations(".rela.text"), gas.relocations(".rela.text"));
@@ -363,9 +351,9 @@ fn weak_calls_and_global_aliases_match_gas() {
 
 #[test]
 fn increment_and_decrement_encodings_match_gas() {
-    let dir = WorkDir::new("inc_dec");
+    let dir = TempDir::new("inc_dec");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".text\nincb %al\ndecb %r8b\nincl %ecx\ndecl %r12d\nincq %r15\ndecq %rdx\nincb (%rax)\ndecq 8(%rbp)\n",
     );
     assert_eq!(
@@ -376,11 +364,11 @@ fn increment_and_decrement_encodings_match_gas() {
 
 #[test]
 fn temporary_symbols_resolve_without_leaking_internal_labels() {
-    let dir = WorkDir::new("temporary_symbols");
+    let dir = TempDir::new("temporary_symbols");
     let source = ".text\n.Lras_cfi: nop\n.Lras_size: nop\n.globl entry\n.type entry,@function\nentry:\n.cfi_startproc\n1: nop\n.Ltarget: ret\n.cfi_endproc\n.size entry,.-entry\n.type .Ltyped,@function\n.Ltyped: ret\n.globl .Lglobal\n.Lglobal: ret\n.set .Lalias,.Ltarget+1\n.data\n.quad .Ltarget+3\n.quad 1b\n.quad .Lalias\n";
-    let input = dir.0.join("input.s");
+    let input = dir.path().join("input.s");
     std::fs::write(&input, source).unwrap();
-    let (default, gas) = assemble_pair(&dir.0, source);
+    let (default, gas) = assemble_pair(dir.path(), source);
     let targets = |object: &Object| {
         let symbols = object.symbols();
         object
@@ -405,14 +393,14 @@ fn temporary_symbols_resolve_without_leaking_internal_labels() {
             .iter()
             .all(|(name, _)| !name.starts_with(".L") || *name == ".Lglobal")
     );
-    let driver = dir.0.join("as");
+    let driver = dir.path().join("as");
     #[cfg(unix)]
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ras"), &driver).unwrap();
     #[cfg(not(unix))]
     std::fs::copy(env!("CARGO_BIN_EXE_ras"), &driver).unwrap();
     for program in [std::path::Path::new(env!("CARGO_BIN_EXE_ras")), &driver] {
         for flag in ["-L", "--keep-locals"] {
-            let output = dir.0.join("kept.o");
+            let output = dir.path().join("kept.o");
             run(Command::new(program)
                 .arg(flag)
                 .arg(&input)
@@ -436,9 +424,9 @@ fn temporary_symbols_resolve_without_leaking_internal_labels() {
 
 #[test]
 fn relocations_retain_merge_and_got_local_symbols() {
-    let dir = WorkDir::new("retained_locals");
+    let dir = TempDir::new("retained_locals");
     let (ras, gas) = assemble_pair(
-        &dir.0,
+        dir.path(),
         ".text\nmovq .Lgot@GOTPCREL(%rip),%rax\n.Lgot: ret\nleaq .Lmerged(%rip),%rax\n.section .rodata.str1.1,\"aMS\",@progbits,1\n.Lmerged: .asciz \"kept\"\n.Lunused: .asciz \"discarded\"\n",
     );
     for name in [".Lgot", ".Lmerged"] {
@@ -450,7 +438,7 @@ fn relocations_retain_merge_and_got_local_symbols() {
 
 #[test]
 fn compact_cfi_preserves_decoded_unwind_rows() {
-    let dir = WorkDir::new("compact_cfi");
+    let dir = TempDir::new("compact_cfi");
     let mut source = String::from(".text\n.cfi_startproc\n");
     for (index, advance) in [1, 63, 64, 255, 256, 65535, 65536].iter().enumerate() {
         source.push_str(&format!(
@@ -459,7 +447,7 @@ fn compact_cfi_preserves_decoded_unwind_rows() {
         ));
     }
     source.push_str(".cfi_offset 3,-16\n.cfi_offset 64,-24\n.cfi_offset 4,8\n.cfi_val_offset 5,-16\n.cfi_val_offset 6,8\n.cfi_restore 3\n.cfi_restore 64\n.cfi_def_cfa 7,-8\nnop\n.cfi_endproc\n");
-    let (ras, gas) = assemble_pair(&dir.0, &source);
+    let (ras, gas) = assemble_pair(dir.path(), &source);
     assert!(
         ras.contents(ras.section(".eh_frame")).len()
             <= gas.contents(gas.section(".eh_frame")).len()
@@ -485,12 +473,15 @@ fn compact_cfi_preserves_decoded_unwind_rows() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(rows(&dir.0.join("ras.o")), rows(&dir.0.join("gas.o")));
+    assert_eq!(
+        rows(&dir.path().join("ras.o")),
+        rows(&dir.path().join("gas.o"))
+    );
 }
 
 #[test]
 fn cies_share_only_compatible_unwind_metadata() {
-    let dir = WorkDir::new("shared_cies");
+    let dir = TempDir::new("shared_cies");
     let mut source = String::from(".text\n");
     for (simple, directives) in [
         ("", ""),
@@ -515,7 +506,7 @@ fn cies_share_only_compatible_unwind_metadata() {
         ));
     }
     for architecture in [TargetArchitecture::X86_64, TargetArchitecture::Aarch64] {
-        let output = dir.0.join("frames.o");
+        let output = dir.path().join("frames.o");
         Ras::new(architecture, TargetOperatingSystem::Linux)
             .unwrap()
             .assemble(&source, &output)

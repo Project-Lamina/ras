@@ -1,6 +1,9 @@
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 
+mod common;
+use common::TempDir;
+
 fn section(bytes: &[u8], wanted: &str) -> Vec<u8> {
     let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
     let headers = u64_at(40);
@@ -19,8 +22,8 @@ fn section(bytes: &[u8], wanted: &str) -> Vec<u8> {
 }
 
 fn assemble(name: &str, source: &str) -> Result<Vec<u8>, ras::error::RasError> {
-    let dir = std::env::temp_dir().join(format!("ras_riscv_labels_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = TempDir::new("riscv_labels");
+    let dir = tmp.path();
     let output = dir.join(format!("{name}.o"));
     Ras::new(TargetArchitecture::Riscv64, TargetOperatingSystem::Linux)
         .unwrap()
@@ -114,7 +117,8 @@ fn align_counts_powers_of_two_and_pads_text_with_nops() {
 
 #[test]
 fn riscv32_object_output_is_refused_rather_than_written_as_elf64() {
-    let output = std::env::temp_dir().join(format!("ras_riscv32_{}.o", std::process::id()));
+    let tmp = TempDir::new("riscv32");
+    let output = tmp.path().join("riscv32.o");
     let result = Ras::new(TargetArchitecture::Riscv32, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(".text\n  ret\n", &output);
