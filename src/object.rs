@@ -88,6 +88,7 @@ const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHF_INFO_LINK: u64 = 0x40;
+const SHF_TLS: u64 = 0x400;
 const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
 const STB_GLOBAL: u8 = 1;
@@ -313,6 +314,7 @@ impl ObjectWriter for ElfWriter {
                     alloc: true,
                     exec: true,
                     write: false,
+                    tls: false,
                 },
                 data: req.code.to_vec(),
                 alignment: 1,
@@ -328,6 +330,7 @@ impl ObjectWriter for ElfWriter {
                             alloc: true,
                             exec: false,
                             write: true,
+                            tls: false,
                         },
                         data: Vec::new(),
                         alignment: 1,
@@ -340,7 +343,7 @@ impl ObjectWriter for ElfWriter {
         let mut headers: Vec<Elf64SectionHeader> = sections
             .iter()
             .map(|s| Elf64SectionHeader {
-                section_type: if s.name == ".bss" {
+                section_type: if matches!(s.name.as_str(), ".bss" | ".tbss") {
                     8
                 } else if s.name.starts_with(".note.") && s.name != ".note.GNU-stack" {
                     7
@@ -350,7 +353,8 @@ impl ObjectWriter for ElfWriter {
                 flags: u64::from(s.flags.write)
                     | (u64::from(s.flags.alloc) << 1)
                     | (u64::from(s.flags.exec) << 2)
-                    | if s.group.is_some() { 0x200 } else { 0 },
+                    | if s.group.is_some() { 0x200 } else { 0 }
+                    | if s.flags.tls { SHF_TLS } else { 0 },
                 addralign: s.alignment as u64,
                 ..Default::default()
             })
@@ -892,6 +896,7 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
                 alloc: true,
                 exec: true,
                 write: false,
+                tls: false,
             },
             data: req.code.to_vec(),
             alignment: 1,
@@ -1469,6 +1474,12 @@ impl ObjectWriter for CoffWriter {
         strtab[0..4].copy_from_slice(&strtab_size.to_le_bytes());
         let total_syms = (1 + exported.len() + extern_names.len()) as u32;
 
+        if let Some(r) = relocations.iter().find(|r| matches!(r.kind, 18 | 22 | 23)) {
+            return Err(RasError::ObjectError(format!(
+                "x86_64 TLS relocation kind {} for {} is only supported in ELF objects",
+                r.kind, r.symbol
+            )));
+        }
         // Build COFF relocation entries (10 bytes each).
         let mut reloc_bytes: Vec<u8> = Vec::new();
         for r in relocations {
@@ -1585,6 +1596,7 @@ mod tests {
                 alloc: true,
                 exec: true,
                 write: false,
+                tls: false,
             },
         }];
         let symbols: Vec<ObjectSymbol> = vec![];
@@ -1619,6 +1631,7 @@ mod tests {
                 alloc: true,
                 exec: true,
                 write: false,
+                tls: false,
             },
         }];
         let symbols: Vec<ObjectSymbol> = vec![];
@@ -1711,6 +1724,7 @@ mod tests {
                 alloc: true,
                 exec: true,
                 write: false,
+                tls: false,
             },
             data,
             alignment: 16,
@@ -1810,6 +1824,7 @@ mod tests {
                 alloc: true,
                 exec: false,
                 write: true,
+                tls: false,
             },
             ..macho_text_section(vec![1, 0])
         };
@@ -1854,6 +1869,7 @@ mod tests {
                 alloc: true,
                 exec,
                 write: false,
+                tls: false,
             },
             data,
             alignment: 4,

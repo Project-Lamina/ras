@@ -22,6 +22,7 @@ pub struct SectionFlags {
     pub alloc: bool,
     pub exec: bool,
     pub write: bool,
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -335,8 +336,12 @@ impl AssemblyParser {
                                 |f| f.contains('a'),
                             ),
                             exec: explicit.map_or(name == ".text", |f| f.contains('x')),
-                            write: explicit
-                                .map_or(name == ".data" || name == ".bss", |f| f.contains('w')),
+                            write: explicit.map_or(
+                                matches!(name, ".data" | ".bss" | ".tdata" | ".tbss"),
+                                |f| f.contains('w'),
+                            ),
+                            tls: explicit
+                                .map_or(matches!(name, ".tdata" | ".tbss"), |f| f.contains('T')),
                         },
                         data: Vec::new(),
                         alignment: 1,
@@ -690,6 +695,9 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
     if let Some(value) = parse_integer_opt(text) {
         return Ok(DataExpression::Constant(value));
     }
+    if let Some(suffix) = crate::encoder::x86_64::unsupported_tls_suffix(text) {
+        return Err(crate::encoder::x86_64::unsupported_tls_error(suffix));
+    }
     let symbol = |s: &str| {
         !s.is_empty()
             && s.chars()
@@ -702,6 +710,11 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
                 && s.as_bytes()[0].is_ascii_digit()
                 && matches!(s.as_bytes()[1], b'f' | b'b'))
     };
+    if let Some(name) = text.strip_suffix("@tpoff")
+        && symbol(name)
+    {
+        return Ok(DataExpression::Symbol(text.into(), 0));
+    }
     if let Some((index, op)) = text.char_indices().find(|(_, c)| matches!(c, '+' | '-')) {
         let left = text[..index].trim();
         let right = text[index + 1..].trim();

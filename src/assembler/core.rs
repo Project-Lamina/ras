@@ -9,7 +9,7 @@ use crate::{
         aarch64::AArch64Encoder,
         arx64::Arx64Encoder,
         riscv::RiscVEncoder,
-        traits::{InstructionEncoder, ParsedInstruction, RipFixup},
+        traits::{InstructionEncoder, ParsedInstruction, RipFixup, TlsModel},
         x86_64::X86_64Encoder,
     },
     error::RasError,
@@ -23,6 +23,9 @@ use crate::{
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
 const R_X86_64_REX_GOTPCRELX: u32 = 42;
+const R_X86_64_TPOFF32: u32 = 23;
+const R_X86_64_TPOFF64: u32 = 18;
+const R_X86_64_GOTTPOFF: u32 = 22;
 use std::collections::{HashMap, HashSet};
 
 /// Return type of the two-pass encoding pass.
@@ -149,6 +152,13 @@ enum PatchPoint {
         trailing: usize,
         addend: i64,
         relocate: bool,
+    },
+    X86Tls {
+        offset: usize,
+        target: String,
+        kind: u32,
+        trailing: usize,
+        addend: i64,
     },
     Riscv {
         offset: usize,
@@ -281,6 +291,7 @@ impl RasAssembler {
                         alloc: true,
                         exec: true,
                         write: false,
+                        tls: false,
                     },
                     data: Vec::new(),
                     alignment: 1,
@@ -481,6 +492,7 @@ impl RasAssembler {
                                 alloc: true,
                                 exec: false,
                                 write: true,
+                                tls: false,
                             },
                             data: Vec::new(),
                             alignment: 1,
@@ -1321,21 +1333,35 @@ impl RasAssembler {
                         }
                     }
                     DataExpression::Symbol(symbol, addend) => {
-                        let kind = match (arch, width) {
-                            (TargetArchitecture::X86_64, 1) => 14,
-                            (TargetArchitecture::X86_64, 2) => 12,
-                            (TargetArchitecture::X86_64, 4) => 10,
-                            (TargetArchitecture::X86_64, 8) => 1,
-                            (TargetArchitecture::Aarch64, 2) => 259,
-                            (TargetArchitecture::Aarch64, 4) => 258,
-                            (TargetArchitecture::Aarch64, 8) => 257,
-                            (TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64, 4) => 1,
-                            (TargetArchitecture::Riscv64, 8) => 2,
-                            _ => {
-                                return Err(RasError::EncodingError(
-                                    "Unsupported data relocation width or architecture".into(),
-                                ));
-                            }
+                        let (symbol, kind) = if let Some(name) = symbol.strip_suffix("@tpoff") {
+                            let kind = match (arch, width) {
+                                (TargetArchitecture::X86_64, 4) => R_X86_64_TPOFF32,
+                                (TargetArchitecture::X86_64, 8) => R_X86_64_TPOFF64,
+                                _ => {
+                                    return Err(RasError::EncodingError(
+                                        "@tpoff data needs a 4- or 8-byte field on x86_64".into(),
+                                    ));
+                                }
+                            };
+                            (name.to_string(), kind)
+                        } else {
+                            let kind = match (arch, width) {
+                                (TargetArchitecture::X86_64, 1) => 14,
+                                (TargetArchitecture::X86_64, 2) => 12,
+                                (TargetArchitecture::X86_64, 4) => 10,
+                                (TargetArchitecture::X86_64, 8) => 1,
+                                (TargetArchitecture::Aarch64, 2) => 259,
+                                (TargetArchitecture::Aarch64, 4) => 258,
+                                (TargetArchitecture::Aarch64, 8) => 257,
+                                (TargetArchitecture::Riscv32 | TargetArchitecture::Riscv64, 4) => 1,
+                                (TargetArchitecture::Riscv64, 8) => 2,
+                                _ => {
+                                    return Err(RasError::EncodingError(
+                                        "Unsupported data relocation width or architecture".into(),
+                                    ));
+                                }
+                            };
+                            (symbol, kind)
                         };
                         external_relocs.push(ExternalReloc {
                             offset: *offset,
@@ -1391,6 +1417,7 @@ impl RasAssembler {
                 | PatchPoint::AArch64 { target, .. }
                 | PatchPoint::X86Rel32 { target, .. }
                 | PatchPoint::X86RipRel32 { target, .. }
+                | PatchPoint::X86Tls { target, .. }
                 | PatchPoint::Arx64Jal { target, .. }
                 | PatchPoint::Arx64Branch { target, .. } => target,
             };
@@ -1523,6 +1550,7 @@ impl RasAssembler {
                             patch,
                             PatchPoint::X86Rel32 { relocate: true, .. }
                                 | PatchPoint::X86RipRel32 { relocate: true, .. }
+                                | PatchPoint::X86Tls { .. }
                         )
                 });
             if let Some(target_offset) = target_offset {
@@ -1530,7 +1558,8 @@ impl RasAssembler {
                     PatchPoint::Data { .. }
                     | PatchPoint::AArch64 { .. }
                     | PatchPoint::Riscv { .. }
-                    | PatchPoint::RiscvPair { .. } => unreachable!(),
+                    | PatchPoint::RiscvPair { .. }
+                    | PatchPoint::X86Tls { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
                         let rel32_bytes = (rel32 as i32).to_le_bytes();
@@ -1598,6 +1627,24 @@ impl RasAssembler {
                             section: String::new(),
                             kind: if got { R_X86_64_REX_GOTPCRELX } else { 2 },
                             addend: *addend - (4 + *trailing as i64),
+                            trailing: *trailing,
+                            branch: false,
+                        });
+                    }
+                    PatchPoint::X86Tls {
+                        offset,
+                        kind,
+                        trailing,
+                        addend,
+                        ..
+                    } => {
+                        code[*offset..*offset + 4].fill(0);
+                        external_relocs.push(ExternalReloc {
+                            offset: *offset,
+                            symbol: target.to_string(),
+                            section: String::new(),
+                            kind: *kind,
+                            addend: *addend,
                             trailing: *trailing,
                             branch: false,
                         });
@@ -2115,6 +2162,23 @@ fn rip_relative_patch(
     offset: usize,
     global_labels: &HashSet<&str>,
 ) -> Option<PatchPoint> {
+    if let Some(model) = fixup.tls {
+        let (label, addend) = inst
+            .operands
+            .iter()
+            .find_map(|op| extract_tls_label(op.trim()))?;
+        let (kind, addend) = match model {
+            TlsModel::InitialExec => (R_X86_64_GOTTPOFF, addend - (4 + fixup.trailing as i64)),
+            TlsModel::LocalExec => (R_X86_64_TPOFF32, addend),
+        };
+        return Some(PatchPoint::X86Tls {
+            offset: offset + fixup.disp_offset,
+            target: reloc_symbol(label).to_string(),
+            kind,
+            trailing: fixup.trailing,
+            addend,
+        });
+    }
     let (label, addend) = inst
         .operands
         .iter()
@@ -2126,6 +2190,12 @@ fn rip_relative_patch(
         addend,
         relocate: global_labels.contains(label),
     })
+}
+
+fn extract_tls_label(op: &str) -> Option<(&str, i64)> {
+    let disp = op.find('(').map_or(op, |paren| &op[..paren]).trim();
+    let disp = disp.strip_prefix("%fs:").unwrap_or(disp);
+    crate::encoder::x86_64::rip_expression(disp).filter(|(label, _)| label.contains('@'))
 }
 
 fn extract_rip_label(op: &str) -> Option<(&str, i64)> {

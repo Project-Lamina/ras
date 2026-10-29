@@ -1,7 +1,7 @@
 //! x86-64 binary instruction encoder
 
 use crate::{
-    encoder::traits::{InstructionEncoder, ParsedInstruction, RipFixup},
+    encoder::traits::{InstructionEncoder, ParsedInstruction, RipFixup, TlsModel},
     error::RasError,
 };
 
@@ -66,12 +66,14 @@ impl X86_64Encoder {
             base: None,
             index: None,
             rip: false,
+            tls: None,
         };
         if !disp_text.is_empty() {
             match parse_imm(disp_text) {
                 Ok(value) => mem.disp = value,
                 Err(_) => {
                     let (label, addend) = rip_expression(disp_text).ok_or_else(invalid)?;
+                    mem.tls = tls_model(label);
                     mem.label = Some(label.to_string());
                     mem.disp = addend;
                 }
@@ -110,7 +112,25 @@ impl X86_64Encoder {
                 mem.index = Some((reg.num, scale_bits));
             }
         }
-        if mem.label.is_some() && !mem.rip {
+        match mem.tls {
+            Some(TlsModel::InitialExec) if !mem.rip => {
+                return Err(RasError::EncodingError(
+                    "@gottpoff requires %rip-relative addressing".into(),
+                ));
+            }
+            Some(TlsModel::LocalExec) if mem.rip => {
+                return Err(RasError::EncodingError(
+                    "@tpoff cannot be %rip-relative; use a base register or %fs:".into(),
+                ));
+            }
+            Some(TlsModel::LocalExec) if mem.base.is_none() && !mem.fs => {
+                return Err(RasError::EncodingError(
+                    "@tpoff needs a base register or %fs:".into(),
+                ));
+            }
+            _ => {}
+        }
+        if mem.label.is_some() && mem.tls.is_none() && !mem.rip {
             return Err(RasError::EncodingError(
                 "Absolute symbol operands are not supported".into(),
             ));
@@ -980,6 +1000,13 @@ impl InstructionEncoder for X86_64Encoder {
 
     fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         self.rip_fixup = None;
+        if let Some(suffix) = inst
+            .operands
+            .iter()
+            .find_map(|op| unsupported_tls_suffix(op))
+        {
+            return Err(unsupported_tls_error(suffix));
+        }
         let opcode = inst.opcode.to_lowercase();
         if let Some((stem, width)) = alu_mnemonic(&opcode) {
             let encoded = self.encode_alu(stem, width, &inst.operands)?;
@@ -1837,6 +1864,7 @@ struct Mem {
     base: Option<u8>,
     index: Option<(u8, u8)>,
     rip: bool,
+    tls: Option<TlsModel>,
 }
 
 struct Encoded {
@@ -1918,7 +1946,8 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     let mut rex_b = 0;
     let reg_field = (op.reg & 7) << 3;
     let mut seg = false;
-    let mut rip_disp = None;
+    let mut disp_field = None;
+    let mut tls = None;
     match &op.rm {
         Rm::Reg(number) => {
             tail.push(0xc0 | reg_field | (number & 7));
@@ -1926,11 +1955,13 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
         }
         Rm::Mem(mem) if mem.rip => {
             tail.push(reg_field | 5);
-            rip_disp = Some(tail.len());
+            disp_field = Some(tail.len());
+            tls = mem.tls;
             tail.extend_from_slice(&disp32(mem.disp)?);
         }
         Rm::Mem(mem) => {
             seg = mem.fs;
+            tls = mem.tls;
             if let Some((index, _)) = mem.index {
                 rex_x = index >> 3;
             }
@@ -1940,12 +1971,15 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
                 None => {
                     tail.push(reg_field | 4);
                     tail.push((scale << 6) | (index_field << 3) | 5);
+                    disp_field = tls.map(|_| tail.len());
                     tail.extend_from_slice(&disp32(mem.disp)?);
                 }
                 Some(base) => {
                     rex_b = base >> 3;
                     let need_sib = mem.index.is_some() || base & 7 == 4;
-                    let mode = if mem.disp == 0 && base & 7 != 5 {
+                    let mode = if mem.tls.is_some() {
+                        2
+                    } else if mem.disp == 0 && base & 7 != 5 {
                         0
                     } else if i8::try_from(mem.disp).is_ok() {
                         1
@@ -1959,7 +1993,10 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
                     }
                     match mode {
                         1 => tail.push(mem.disp as u8),
-                        2 => tail.extend_from_slice(&disp32(mem.disp)?),
+                        2 => {
+                            disp_field = tls.map(|_| tail.len());
+                            tail.extend_from_slice(&disp32(mem.disp)?);
+                        }
                         _ => {}
                     }
                 }
@@ -1988,9 +2025,10 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     bytes.extend_from_slice(op.opcode);
     let tail_start = bytes.len();
     bytes.extend(tail);
-    let rip = rip_disp.map(|position| RipFixup {
+    let rip = disp_field.map(|position| RipFixup {
         disp_offset: tail_start + position,
         trailing: op.imm.len(),
+        tls,
     });
     bytes.extend_from_slice(op.imm);
     Ok(Encoded { bytes, rip })
@@ -2035,7 +2073,7 @@ fn parse_imm(text: &str) -> Result<i64, RasError> {
 }
 
 pub(crate) fn rip_expression(text: &str) -> Option<(&str, i64)> {
-    let symbol = |s: &str| is_symbol(s) || is_got_symbol(s);
+    let symbol = |s: &str| is_symbol(s) || is_got_symbol(s) || tls_model(s).is_some();
     if symbol(text) {
         return Some((text, 0));
     }
@@ -2069,6 +2107,44 @@ pub(crate) fn rip_expression(text: &str) -> Option<(&str, i64)> {
 
 fn is_got_symbol(text: &str) -> bool {
     text.strip_suffix("@GOTPCREL").is_some_and(is_symbol)
+}
+
+/// The thread-local model a `sym@gottpoff` or `sym@tpoff` reference selects.
+pub(crate) fn tls_model(text: &str) -> Option<TlsModel> {
+    let (name, suffix) = text.rsplit_once('@')?;
+    if !is_symbol(name) {
+        return None;
+    }
+    match suffix {
+        "gottpoff" => Some(TlsModel::InitialExec),
+        "tpoff" => Some(TlsModel::LocalExec),
+        _ => None,
+    }
+}
+
+/// The TLS relocation suffix of an operand that this assembler does not implement.
+pub(crate) fn unsupported_tls_suffix(operand: &str) -> Option<&str> {
+    let (_, after) = operand.split_once('@')?;
+    let suffix = after
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default();
+    const UNSUPPORTED: [&str; 7] = [
+        "tlsgd",
+        "tlsld",
+        "dtpoff",
+        "gotntpoff",
+        "indntpoff",
+        "tlsdesc",
+        "tlscall",
+    ];
+    UNSUPPORTED.contains(&suffix).then_some(suffix)
+}
+
+pub(crate) fn unsupported_tls_error(suffix: &str) -> RasError {
+    RasError::EncodingError(format!(
+        "unsupported TLS model @{suffix}: only initial-exec (@gottpoff) and local-exec (@tpoff) are implemented"
+    ))
 }
 
 fn is_symbol(text: &str) -> bool {
@@ -2489,5 +2565,115 @@ mod tests {
             encode_one("movq", &["foo@GOTPCREL(%rip)", "%rax"]),
             vec![0x48, 0x8b, 0x05, 0, 0, 0, 0]
         );
+    }
+
+    fn encode_with_fixup(opcode: &str, operands: &[&str]) -> (Vec<u8>, Option<RipFixup>) {
+        let inst = ParsedInstruction {
+            opcode: opcode.to_string(),
+            operands: operands.iter().map(|op| op.to_string()).collect(),
+        };
+        let mut encoder = X86_64Encoder::new();
+        let bytes = encoder.encode_instruction(&inst).expect("encode");
+        (bytes, encoder.take_rip_fixup())
+    }
+
+    #[test]
+    fn initial_exec_load_is_rip_relative_gottpoff() {
+        assert_eq!(
+            encode_with_fixup("movq", &["tvar@gottpoff(%rip)", "%rax"]),
+            (
+                vec![0x48, 0x8b, 0x05, 0, 0, 0, 0],
+                Some(RipFixup {
+                    disp_offset: 3,
+                    trailing: 0,
+                    tls: Some(TlsModel::InitialExec),
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn fs_relative_load_through_register() {
+        assert_eq!(
+            encode_with_fixup("movq", &["%fs:(%rax)", "%rdx"]),
+            (vec![0x64, 0x48, 0x8b, 0x10], None)
+        );
+    }
+
+    #[test]
+    fn fs_absolute_zero_is_disp32_sib() {
+        assert_eq!(
+            encode_with_fixup("movq", &["%fs:0", "%rax"]),
+            (vec![0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0], None)
+        );
+        assert_eq!(
+            encode_one("movq", &["%fs:0x0", "%rax"]),
+            vec![0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn local_exec_lea_is_base_relative_tpoff32() {
+        assert_eq!(
+            encode_with_fixup("leaq", &["tvar@tpoff(%rax)", "%rdx"]),
+            (
+                vec![0x48, 0x8d, 0x90, 0, 0, 0, 0],
+                Some(RipFixup {
+                    disp_offset: 3,
+                    trailing: 0,
+                    tls: Some(TlsModel::LocalExec),
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn local_exec_fs_absolute_tpoff32() {
+        assert_eq!(
+            encode_with_fixup("movq", &["%fs:tvar@tpoff+8", "%rax"]),
+            (
+                vec![0x64, 0x48, 0x8b, 0x04, 0x25, 8, 0, 0, 0],
+                Some(RipFixup {
+                    disp_offset: 5,
+                    trailing: 0,
+                    tls: Some(TlsModel::LocalExec),
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn tls_operands_reject_wrong_addressing() {
+        let encode = |opcode: &str, operands: &[&str]| {
+            X86_64Encoder::new()
+                .encode_instruction(&ParsedInstruction {
+                    opcode: opcode.to_string(),
+                    operands: operands.iter().map(|op| op.to_string()).collect(),
+                })
+                .map_err(|e| e.to_string())
+        };
+        assert!(encode("movq", &["tvar@gottpoff(%rax)", "%rdx"]).is_err());
+        assert!(encode("movq", &["tvar@tpoff(%rip)", "%rdx"]).is_err());
+        assert!(encode("movq", &["tvar@tpoff", "%rdx"]).is_err());
+    }
+
+    #[test]
+    fn unsupported_tls_models_are_named() {
+        let err = X86_64Encoder::new()
+            .encode_instruction(&ParsedInstruction {
+                opcode: "leaq".into(),
+                operands: vec!["tvar@tlsgd(%rip)".into(), "%rdi".into()],
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported TLS model @tlsgd"), "{err}");
+        let err = X86_64Encoder::new()
+            .encode_instruction(&ParsedInstruction {
+                opcode: "movq".into(),
+                operands: vec!["tvar@dtpoff(%rax)".into(), "%rdx".into()],
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported TLS model @dtpoff"), "{err}");
     }
 }
