@@ -4,7 +4,10 @@
 
 use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_mir::{MirType, ScalarType};
+use lamina_platform::{PointerWidth, TargetArchitecture};
 use std::collections::HashMap;
+
+const X86_64_POINTER: PointerWidth = TargetArchitecture::X86_64.pointer_width();
 
 /// Compile MIR to binary for x86_64
 #[cfg(feature = "encoder")]
@@ -1146,11 +1149,12 @@ fn encode_mir_instruction_x86_64(
             };
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
             code.extend_from_slice(&encode_extend_rax(
-                from.size_bytes().min(to.size_bytes()),
+                from.size_bytes(X86_64_POINTER)
+                    .min(to.size_bytes(X86_64_POINTER)),
                 *signed,
             ));
-            if to.size_bytes() < 8 {
-                code.extend_from_slice(&encode_extend_rax(to.size_bytes(), true));
+            if to.size_bytes(X86_64_POINTER) < 8 {
+                code.extend_from_slice(&encode_extend_rax(to.size_bytes(X86_64_POINTER), true));
             }
             code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
