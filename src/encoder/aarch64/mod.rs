@@ -173,6 +173,7 @@ fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
     let flags = match op {
         "cmp" => 0x6000_0000,
         "sub" => 0x4000_0000,
+        "subs" => 0x6000_0000,
         "cmn" => 0x2000_0000,
         _ => 0,
     };
@@ -209,8 +210,46 @@ fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
             | (rn << 5)
             | rd);
     }
+    if let Some(option) = tail.and_then(extend_option) {
+        let amount = extend_amount(tail.unwrap_or_default())?;
+        return Ok(0x0b20_0000
+            | sf
+            | flags
+            | (rm << 16)
+            | (option << 13)
+            | (amount << 10)
+            | (rn << 5)
+            | rd);
+    }
     let (kind, amount) = shifted_register(tail, wide)?;
     Ok(0x0b00_0000 | sf | flags | (kind << 22) | (rm << 16) | (amount << 10) | (rn << 5) | rd)
+}
+
+/// The option field of an extended-register operand, from the ARM ARM
+/// (DDI 0487) ADD/SUB (extended register) table: UXTB=000 up to SXTX=111.
+fn extend_option(shift: &str) -> Option<u32> {
+    Some(match shift.split(' ').next()? {
+        "uxtb" => 0,
+        "uxth" => 1,
+        "uxtw" => 2,
+        "uxtx" => 3,
+        "sxtb" => 4,
+        "sxth" => 5,
+        "sxtw" => 6,
+        "sxtx" => 7,
+        _ => return None,
+    })
+}
+
+fn extend_amount(shift: &str) -> Result<u32, RasError> {
+    let Some((_, amount)) = shift.split_once(' ') else {
+        return Ok(0);
+    };
+    let amount = immediate(amount)?;
+    if !(0..=4).contains(&amount) {
+        return Err(error(format!("Extension amount out of range: {amount}")));
+    }
+    Ok(amount as u32)
 }
 
 /// Logical-immediate fields `(N, immr, imms)` for a bitmask of `size` bits, or `None` when the
@@ -566,7 +605,7 @@ impl AArch64Encoder {
                     }
                 }
             }
-            "add" | "sub" | "cmp" | "cmn" => encode_add_sub(op, p)?,
+            "add" | "sub" | "subs" | "cmp" | "cmn" => encode_add_sub(op, p)?,
             "and" | "orr" | "eor" | "ands" | "tst" => encode_logical(op, p)?,
             "mul" | "sdiv" | "udiv" => {
                 let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
@@ -609,6 +648,26 @@ impl AArch64Encoder {
                     return Err(error("uxtb takes a 32-bit source register"));
                 }
                 0x5300_1c00 | (rn << 5) | rd
+            }
+            "sxtb" | "sxth" => {
+                let (rd, rd_wide) = gpr(arg(0)?)?;
+                let (rn, rn_wide) = gpr(arg(1)?)?;
+                if rn_wide || is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
+                    return Err(error(format!("{op} takes a 32-bit source register")));
+                }
+                let imms = if op == "sxtb" { 0x1c00 } else { 0x3c00 };
+                let base = if rd_wide { 0x9340_0000 } else { 0x1300_0000 };
+                base | imms | (rn << 5) | rd
+            }
+            "clrex" => {
+                let crm = match p.first() {
+                    Some(text) => immediate(text)?,
+                    None => 15,
+                };
+                if !(0..=15).contains(&crm) {
+                    return Err(error("clrex takes a barrier option from 0 to 15"));
+                }
+                0xd503_305f | ((crm as u32) << 8)
             }
             "sxtw" => {
                 let (rd, rd_wide) = gpr(arg(0)?)?;
@@ -703,6 +762,46 @@ impl AArch64Encoder {
                     _ => return Err(error("Invalid fmov register combination")),
                 };
                 base | (r(1)? << 5) | r(0)?
+            }
+            "fsqrt" => {
+                let (rd, kind) = data_reg(arg(0)?)?;
+                let (rn, kind_n) = data_reg(arg(1)?)?;
+                if !matches!(kind, DataKind::S | DataKind::D) || kind_n != kind {
+                    return Err(error("fsqrt takes two scalar registers of one size"));
+                }
+                let double = if kind == DataKind::D { 0x0040_0000 } else { 0 };
+                0x1e21_c000 | double | (rn << 5) | rd
+            }
+            "fneg" => {
+                let (rd, kind) = data_reg(arg(0)?)?;
+                let (rn, kind_n) = data_reg(arg(1)?)?;
+                if !matches!(kind, DataKind::S | DataKind::D) || kind_n != kind {
+                    return Err(error("fneg takes two scalar registers of one size"));
+                }
+                let double = if kind == DataKind::D { 0x0040_0000 } else { 0 };
+                0x1e21_4000 | double | (rn << 5) | rd
+            }
+            "fcmp" => {
+                let (rn, kind) = data_reg(arg(0)?)?;
+                let (rm, kind_m) = data_reg(arg(1)?)?;
+                if !matches!(kind, DataKind::S | DataKind::D) || kind_m != kind {
+                    return Err(error("fcmp takes two scalar registers of one size"));
+                }
+                let double = if kind == DataKind::D { 0x0040_0000 } else { 0 };
+                0x1e20_2000 | double | (rm << 16) | (rn << 5)
+            }
+            "fcvt" => {
+                let (rd, kind) = data_reg(arg(0)?)?;
+                let (rn, kind_n) = data_reg(arg(1)?)?;
+                match (kind, kind_n) {
+                    (DataKind::D, DataKind::S) => 0x1e22_c000 | (rn << 5) | rd,
+                    (DataKind::S, DataKind::D) => 0x1e62_4000 | (rn << 5) | rd,
+                    _ => {
+                        return Err(error(
+                            "fcvt converts between a single and a double register",
+                        ));
+                    }
+                }
             }
             "fmul" | "fdiv" | "fadd" | "fsub" => {
                 let (rd, kind) = data_reg(arg(0)?)?;
@@ -1015,6 +1114,28 @@ mod exclusive_tests {
         assert_eq!(word("ldarh", &["w0", "[x0]"]), 0x48DF_FC00);
         assert_eq!(word("stlr", &["x1", "[x2]"]), 0xC89F_FC41);
         assert_eq!(word("stxrb", &["w1", "w2", "[x3]"]), 0x0801_7C62);
+    }
+
+    /// Each word is derived from the ARM ARM (DDI 0487) fixed fields of the
+    /// instruction class named in the comment.
+    #[test]
+    fn subs_sxth_clrex_and_scalar_float_match_arm_arm() {
+        assert_eq!(word("subs", &["x0", "x0", "#1"]), 0xF100_0400);
+        assert_eq!(word("subs", &["w3", "w4", "#7"]), 0x7100_1C83);
+        assert_eq!(word("sxth", &["x0", "w0"]), 0x9340_3C00);
+        assert_eq!(word("sxth", &["w1", "w2"]), 0x1300_3C41);
+        assert_eq!(word("sxtb", &["x0", "w0"]), 0x9340_1C00);
+        assert_eq!(word("sxtb", &["w1", "w2"]), 0x1300_1C41);
+        assert_eq!(word("cmp", &["w9", "w12", "uxtb"]), 0x6B2C_013F);
+        assert_eq!(word("fsqrt", &["d0", "d1"]), 0x1E61_C020);
+        assert_eq!(word("clrex", &[]), 0xD503_3F5F);
+        assert_eq!(word("clrex", &["#0"]), 0xD503_305F);
+        assert_eq!(word("fcmp", &["d0", "d1"]), 0x1E61_2000);
+        assert_eq!(word("fcmp", &["s2", "s3"]), 0x1E23_2040);
+        assert_eq!(word("fneg", &["d0", "d0"]), 0x1E61_4000);
+        assert_eq!(word("fneg", &["s0", "s1"]), 0x1E21_4020);
+        assert_eq!(word("fcvt", &["d0", "s0"]), 0x1E22_C000);
+        assert_eq!(word("fcvt", &["s0", "d0"]), 0x1E62_4000);
     }
 
     #[test]

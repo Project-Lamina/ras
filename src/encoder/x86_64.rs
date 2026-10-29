@@ -634,6 +634,97 @@ impl X86_64Encoder {
         })
     }
 
+    /// A BMI2 shift, written `op %count, %src, %dst`. SDM: SHLX is
+    /// VEX.LZ.66.0F38.W0/W1 F7 /r, SARX is F3 and SHRX is F2. The count
+    /// travels in vvvv, the shifted value in r/m and the result in reg.
+    fn encode_bmi2_shift(&self, opcode: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let [count, src, dst] = operands else {
+            return Err(RasError::EncodingError(
+                "BMI2 shift requires 3 operands".into(),
+            ));
+        };
+        let pp = match opcode.get(..3) {
+            Some("shl") => 1,
+            Some("sar") => 2,
+            _ => 3,
+        };
+        let wide = opcode.ends_with('q');
+        let (rm, rm_gpr) = self.parse_rm(src, false)?;
+        let reg = gpr(dst.trim()).ok_or_else(|| {
+            RasError::EncodingError("BMI2 shift destination must be a general register".into())
+        })?;
+        let count = gpr(count.trim()).ok_or_else(|| {
+            RasError::EncodingError("BMI2 shift count must be a general register".into())
+        })?;
+        operand_width(
+            Some(if wide { 64 } else { 32 }),
+            &[rm_gpr, Some(reg), Some(count)],
+        )?;
+        encode_op(Op {
+            opcode: &[0xf7],
+            reg: reg.num,
+            rm,
+            vex: Some(Vex {
+                map: 2,
+                pp,
+                wide,
+                vvvv: count.num,
+                ..Vex::default()
+            }),
+            ..Op::default()
+        })
+    }
+
+    /// An EVEX three-operand instruction, written `op src2, src1, dst`, with
+    /// register operands only. EVEX scales disp8 by the access size, which
+    /// this encoder does not model, so memory operands are refused.
+    fn encode_evex_rrm(
+        &self,
+        map: u8,
+        pp: u8,
+        wide: bool,
+        opcode: u8,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        let [rm, first, reg] = operands else {
+            return Err(RasError::EncodingError(
+                "EVEX arithmetic requires 3 operands".into(),
+            ));
+        };
+        let (rm, rm_wide) = self.parse_vector_rm(rm)?;
+        if matches!(rm, Rm::Mem(_)) {
+            return Err(RasError::EncodingError(
+                "EVEX memory operands are not encoded".into(),
+            ));
+        }
+        let (first, first_wide) = parse_vector(first.trim()).ok_or_else(|| {
+            RasError::EncodingError(
+                "EVEX arithmetic: first source must be a vector register".into(),
+            )
+        })?;
+        let (reg, reg_wide) = parse_vector(reg.trim()).ok_or_else(|| {
+            RasError::EncodingError("EVEX arithmetic: destination must be a vector register".into())
+        })?;
+        if rm_wide != first_wide || first_wide != reg_wide {
+            return Err(RasError::EncodingError(
+                "EVEX arithmetic: operand widths differ".into(),
+            ));
+        }
+        encode_op(Op {
+            opcode: &[opcode],
+            reg,
+            rm,
+            evex: Some(Evex {
+                map,
+                pp,
+                wide,
+                vvvv: first,
+                ll: u8::from(first_wide),
+            }),
+            ..Op::default()
+        })
+    }
+
     /// A VEX shift by an immediate, written `op $count, src, dst`, which keeps
     /// the shifted register in the r/m field and the destination in `vvvv`.
     /// `vmovd` between a general register or memory and the low lane of a
@@ -1287,9 +1378,19 @@ impl InstructionEncoder for X86_64Encoder {
                     ..Op::default()
                 })?);
             }
-            "popcntw" | "popcntl" | "popcntq" => {
+            "popcntw" | "popcntl" | "popcntq" | "lzcntw" | "lzcntl" | "lzcntq" | "tzcntw"
+            | "tzcntl" | "tzcntq" => {
                 let [src, dst] = inst.operands.as_slice() else {
-                    return Err(RasError::EncodingError("popcnt requires 2 operands".into()));
+                    return Err(RasError::EncodingError(
+                        "bit count requires 2 operands".into(),
+                    ));
+                };
+                let count_opcode = if opcode.starts_with("popcnt") {
+                    0xb8
+                } else if opcode.starts_with("lzcnt") {
+                    0xbd
+                } else {
+                    0xbc
                 };
                 let width = if opcode.ends_with('q') {
                     64
@@ -1300,13 +1401,13 @@ impl InstructionEncoder for X86_64Encoder {
                 };
                 let (rm, rm_gpr) = self.parse_rm(src, false)?;
                 let reg = gpr(dst).ok_or_else(|| {
-                    RasError::EncodingError("popcnt requires register destination".into())
+                    RasError::EncodingError("bit count requires register destination".into())
                 })?;
                 operand_width(Some(width), &[rm_gpr, Some(reg)])?;
                 code = self.emit(encode_op(Op {
                     legacy: if width == 16 { &[0x66, 0xf3] } else { &[0xf3] },
                     wide: width == 64,
-                    opcode: &[0x0f, 0xb8],
+                    opcode: &[0x0f, count_opcode],
                     reg: reg.num,
                     rm,
                     ..Op::default()
@@ -1785,6 +1886,14 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_vmovd(&inst.operands)?;
                 code = self.emit(enc);
             }
+            "shlxl" | "shlxq" | "shrxl" | "shrxq" | "sarxl" | "sarxq" => {
+                let enc = self.encode_bmi2_shift(&opcode, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            "vpmullq" => {
+                let enc = self.encode_evex_rrm(2, 1, true, 0x40, &inst.operands)?;
+                code = self.emit(enc);
+            }
             "vpaddd" => {
                 let enc = self.encode_vex_rrm(1, 0xfe, &inst.operands)?;
                 code = self.emit(enc);
@@ -1978,6 +2087,7 @@ struct Op<'a> {
     rm: Rm,
     imm: &'a [u8],
     vex: Option<Vex>,
+    evex: Option<Evex>,
 }
 
 /// The parts of a VEX prefix that vary between instructions.
@@ -2021,6 +2131,33 @@ impl Vex {
         bytes.push(0xc4);
         bytes.push(((1 - rex_r) << 7) | ((1 - rex_x) << 6) | ((1 - rex_b) << 5) | self.map);
         bytes.push((u8::from(self.wide) << 7) | tail);
+    }
+}
+
+/// The EVEX prefix fields for a register-only 128- or 256-bit instruction.
+/// `ll` is the vector length: 0 for 128 bits, 1 for 256. Registers stay below
+/// 16, so the R' and V' extension bits are always clear.
+#[derive(Clone, Copy)]
+struct Evex {
+    map: u8,
+    pp: u8,
+    wide: bool,
+    vvvv: u8,
+    ll: u8,
+}
+
+impl Evex {
+    fn emit(self, reg: u8, rex_x: u8, rex_b: u8, bytes: &mut Vec<u8>) {
+        bytes.push(0x62);
+        bytes.push(
+            ((1 - ((reg >> 3) & 1)) << 7)
+                | ((1 - rex_x) << 6)
+                | ((1 - rex_b) << 5)
+                | (1 << 4)
+                | self.map,
+        );
+        bytes.push((u8::from(self.wide) << 7) | ((!self.vvvv & 15) << 3) | 0b100 | self.pp);
+        bytes.push((self.ll << 5) | (1 << 3));
     }
 }
 
@@ -2091,7 +2228,9 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     if seg {
         bytes.push(0x64);
     }
-    if let Some(vex) = op.vex {
+    if let Some(evex) = op.evex {
+        evex.emit(op.reg, rex_x, rex_b, &mut bytes);
+    } else if let Some(vex) = op.vex {
         vex.emit(op.reg >> 3, rex_x, rex_b, &mut bytes);
     } else {
         let rex = 0x40 | (u8::from(op.wide) << 3) | ((op.reg >> 3) << 2) | (rex_x << 1) | rex_b;
@@ -2681,6 +2820,41 @@ mod tests {
         );
         assert_eq!(encode_one("mfence", &[]), vec![0x0f, 0xae, 0xf0]);
         assert_eq!(encode_one("rdtsc", &[]), vec![0x0f, 0x31]);
+    }
+
+    /// Bytes derived by hand from the field layouts. Intel SDM Vol. 2:
+    /// LZCNT and TZCNT are F3 REX.W 0F BD / BC /r; SHLX, SARX and SHRX are
+    /// VEX.LZ.{66,F3,F2}.0F38.W 'F7 /r'; VPMULLQ is EVEX.128.66.0F38.W1 40 /r.
+    #[test]
+    fn bit_count_and_bmi2_match_sdm_bytes() {
+        assert_eq!(
+            encode_one("lzcntq", &["%rax", "%rax"]),
+            vec![0xf3, 0x48, 0x0f, 0xbd, 0xc0]
+        );
+        assert_eq!(
+            encode_one("tzcntq", &["%rax", "%rax"]),
+            vec![0xf3, 0x48, 0x0f, 0xbc, 0xc0]
+        );
+        assert_eq!(
+            encode_one("lzcntl", &["%ecx", "%edx"]),
+            vec![0xf3, 0x0f, 0xbd, 0xd1]
+        );
+        assert_eq!(
+            encode_one("shlxq", &["%r12", "%r8", "%r8"]),
+            vec![0xc4, 0x42, 0x99, 0xf7, 0xc0]
+        );
+        assert_eq!(
+            encode_one("sarxq", &["%rax", "%r15", "%r15"]),
+            vec![0xc4, 0x42, 0xfa, 0xf7, 0xff]
+        );
+        assert_eq!(
+            encode_one("shrxl", &["%ecx", "%edx", "%eax"]),
+            vec![0xc4, 0xe2, 0x73, 0xf7, 0xc2]
+        );
+        assert_eq!(
+            encode_one("vpmullq", &["%xmm2", "%xmm0", "%xmm1"]),
+            vec![0x62, 0xf2, 0xfd, 0x08, 0x40, 0xca]
+        );
     }
 
     fn encode_with_fixup(opcode: &str, operands: &[&str]) -> (Vec<u8>, Option<RipFixup>) {

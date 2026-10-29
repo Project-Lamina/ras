@@ -491,6 +491,139 @@ impl RiscVEncoder {
         Ok(bytes)
     }
 
+    fn parse_fregister(&self, s: &str) -> Result<u8, RasError> {
+        let s = s.trim().trim_start_matches('%');
+        fp_register(s).ok_or_else(|| {
+            RasError::EncodingError(format!("Unknown RISC-V floating-point register: {s}"))
+        })
+    }
+
+    /// F and D extensions. In OP-FP, funct7 is `funct5 << 2 | fmt`, with fmt 0
+    /// for single and 1 for double, and the rounding mode sits in funct3.
+    /// Returns `None` for names this encoder does not own.
+    fn encode_fp(&self, name: &str, ops: &[String]) -> Result<Option<Vec<u8>>, RasError> {
+        const OP_FP: u8 = 0x53;
+        let f = |s: &String| self.parse_fregister(s);
+        let x = |s: &String| self.parse_register(s);
+        let word = match name {
+            "flw" | "fld" => {
+                let [rd, mem] = ops else {
+                    return Err(fp_operands(name, "rd, offset(rs1)"));
+                };
+                let funct3 = if name == "flw" { 0x2 } else { 0x3 };
+                let rd = f(rd)?;
+                let (rs1, offset) = self.parse_mem_operand(mem)?;
+                Self::i_type(offset, rs1, funct3, rd, 0x07)
+            }
+            "fsw" | "fsd" => {
+                let [rs2, mem] = ops else {
+                    return Err(fp_operands(name, "rs2, offset(rs1)"));
+                };
+                let funct3 = if name == "fsw" { 0x2 } else { 0x3 };
+                let rs2 = f(rs2)?;
+                let (rs1, offset) = self.parse_mem_operand(mem)?;
+                Self::s_type(offset, rs2, rs1, funct3, 0x27)
+            }
+            "fmv.x.w" | "fmv.x.d" => {
+                let [rd, rs1] = ops else {
+                    return Err(fp_operands(name, "rd, rs1"));
+                };
+                let funct7 = if name == "fmv.x.w" { 0x70 } else { 0x71 };
+                Self::r_type(funct7, 0, f(rs1)?, 0, x(rd)?, OP_FP)
+            }
+            "fmv.w.x" | "fmv.d.x" => {
+                let [rd, rs1] = ops else {
+                    return Err(fp_operands(name, "rd, rs1"));
+                };
+                let funct7 = if name == "fmv.w.x" { 0x78 } else { 0x79 };
+                Self::r_type(funct7, 0, x(rs1)?, 0, f(rd)?, OP_FP)
+            }
+            _ => {
+                if let Some((funct7, rs2, int_dst, int_src)) = fcvt_encoding(name) {
+                    let [rd, rs1, rest @ ..] = ops else {
+                        return Err(fp_operands(name, "rd, rs1[, rm]"));
+                    };
+                    let default = if funct7 == 0x21 { 0 } else { 0b111 };
+                    let rm = fp_rounding(rest, default)?;
+                    let rd = if int_dst { x(rd)? } else { f(rd)? };
+                    let rs1 = if int_src { x(rs1)? } else { f(rs1)? };
+                    return Ok(Some(Self::emit(Self::r_type(
+                        funct7, rs2, rs1, rm, rd, OP_FP,
+                    ))));
+                }
+                let Some((base, fmt)) = split_format(name) else {
+                    return Ok(None);
+                };
+                match base {
+                    "fadd" | "fsub" | "fmul" | "fdiv" => {
+                        let [rd, rs1, rs2, rest @ ..] = ops else {
+                            return Err(fp_operands(name, "rd, rs1, rs2[, rm]"));
+                        };
+                        let funct5 = match base {
+                            "fadd" => 0x00,
+                            "fsub" => 0x01,
+                            "fmul" => 0x02,
+                            _ => 0x03,
+                        };
+                        let rm = fp_rounding(rest, 0b111)?;
+                        Self::r_type((funct5 << 2) | fmt, f(rs2)?, f(rs1)?, rm, f(rd)?, OP_FP)
+                    }
+                    "fsqrt" => {
+                        let [rd, rs1, rest @ ..] = ops else {
+                            return Err(fp_operands(name, "rd, rs1[, rm]"));
+                        };
+                        let rm = fp_rounding(rest, 0b111)?;
+                        Self::r_type((0x0b << 2) | fmt, 0, f(rs1)?, rm, f(rd)?, OP_FP)
+                    }
+                    "fsgnj" | "fsgnjn" | "fsgnjx" | "fmin" | "fmax" => {
+                        let [rd, rs1, rs2] = ops else {
+                            return Err(fp_operands(name, "rd, rs1, rs2"));
+                        };
+                        let (funct5, rm) = match base {
+                            "fsgnj" => (0x04, 0),
+                            "fsgnjn" => (0x04, 1),
+                            "fsgnjx" => (0x04, 2),
+                            "fmin" => (0x05, 0),
+                            _ => (0x05, 1),
+                        };
+                        Self::r_type((funct5 << 2) | fmt, f(rs2)?, f(rs1)?, rm, f(rd)?, OP_FP)
+                    }
+                    "feq" | "flt" | "fle" => {
+                        let [rd, rs1, rs2] = ops else {
+                            return Err(fp_operands(name, "rd, rs1, rs2"));
+                        };
+                        let rm = match base {
+                            "fle" => 0,
+                            "flt" => 1,
+                            _ => 2,
+                        };
+                        Self::r_type(0x50 | fmt, f(rs2)?, f(rs1)?, rm, x(rd)?, OP_FP)
+                    }
+                    "fclass" => {
+                        let [rd, rs1] = ops else {
+                            return Err(fp_operands(name, "rd, rs1"));
+                        };
+                        Self::r_type(0x70 | fmt, 0, f(rs1)?, 1, x(rd)?, OP_FP)
+                    }
+                    "fmv" | "fneg" | "fabs" => {
+                        let [rd, rs] = ops else {
+                            return Err(fp_operands(name, "rd, rs"));
+                        };
+                        let rm = match base {
+                            "fmv" => 0,
+                            "fneg" => 1,
+                            _ => 2,
+                        };
+                        let (rd, rs) = (f(rd)?, f(rs)?);
+                        Self::r_type(0x04 << 2 | fmt, rs, rs, rm, rd, OP_FP)
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        };
+        Ok(Some(Self::emit(word)))
+    }
+
     fn encode_store(&self, ops: &[String], funct3: u8) -> Result<Vec<u8>, RasError> {
         if ops.len() != 2 {
             return Err(RasError::EncodingError(
@@ -500,6 +633,96 @@ impl RiscVEncoder {
         let rs2 = self.parse_register(&ops[0])?;
         let (rs1, offset) = self.parse_mem_operand(&ops[1])?;
         Ok(Self::emit(Self::s_type(offset, rs2, rs1, funct3, 0x23)))
+    }
+}
+
+fn fp_operands(name: &str, shape: &str) -> RasError {
+    RasError::EncodingError(format!(
+        "{} requires operands: {shape}",
+        name.to_uppercase()
+    ))
+}
+
+/// The optional trailing rounding mode, `default` when omitted.
+fn fp_rounding(rest: &[String], default: u8) -> Result<u8, RasError> {
+    let text = match rest {
+        [] => return Ok(default),
+        [text] => text.trim(),
+        _ => {
+            return Err(RasError::EncodingError(
+                "Too many operands for an FP instruction".into(),
+            ));
+        }
+    };
+    Ok(match text {
+        "rne" => 0,
+        "rtz" => 1,
+        "rdn" => 2,
+        "rup" => 3,
+        "rmm" => 4,
+        "dyn" => 7,
+        other => {
+            return Err(RasError::EncodingError(format!(
+                "Unknown RISC-V rounding mode: {other}"
+            )));
+        }
+    })
+}
+
+/// The `.s` / `.d` suffix of an F or D mnemonic, with the base name before it.
+fn split_format(name: &str) -> Option<(&str, u8)> {
+    let (base, suffix) = name.rsplit_once('.')?;
+    match suffix {
+        "s" => Some((base, 0)),
+        "d" => Some((base, 1)),
+        _ => None,
+    }
+}
+
+/// `fcvt.<dst>.<src>` as `(funct7, rs2, rd is integer, rs1 is integer)`.
+/// The integer selector in rs2 is 0 for W, 1 for WU, 2 for L and 3 for LU.
+fn fcvt_encoding(name: &str) -> Option<(u8, u8, bool, bool)> {
+    let (dst, src) = name.strip_prefix("fcvt.")?.split_once('.')?;
+    let integer = |t: &str| match t {
+        "w" => Some(0u8),
+        "wu" => Some(1),
+        "l" => Some(2),
+        "lu" => Some(3),
+        _ => None,
+    };
+    let format = |t: &str| match t {
+        "s" => Some(0u8),
+        "d" => Some(1),
+        _ => None,
+    };
+    if let (Some(sel), Some(fmt)) = (integer(dst), format(src)) {
+        return Some((0x60 | fmt, sel, true, false));
+    }
+    if let (Some(fmt), Some(sel)) = (format(dst), integer(src)) {
+        return Some((0x68 | fmt, sel, false, true));
+    }
+    match (format(dst), format(src)) {
+        (Some(dst_fmt), Some(src_fmt)) if dst_fmt != src_fmt => {
+            Some((0x20 | dst_fmt, src_fmt, false, false))
+        }
+        _ => None,
+    }
+}
+
+/// An `f` register by number or ABI name (ft0-11, fs0-11, fa0-7).
+fn fp_register(name: &str) -> Option<u8> {
+    if let Some(number) = name.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+        return (number < 32).then_some(number);
+    }
+    let (class, index) = name.split_at_checked(2)?;
+    let index: u8 = index.parse().ok()?;
+    match (class, index) {
+        ("ft", 0..=7) => Some(index),
+        ("ft", 8..=11) => Some(index + 20),
+        ("fs", 0..=1) => Some(index + 8),
+        ("fs", 2..=11) => Some(index + 16),
+        ("fa", 0..=7) => Some(index + 10),
+        _ => None,
     }
 }
 
@@ -546,8 +769,14 @@ fn expand_alu_pseudo(
         ("snez", [rd, rs]) => ("sltu", vec![rd.clone(), "zero".into(), rs.clone()]),
         ("sltz", [rd, rs]) => ("slt", vec![rd.clone(), rs.clone(), "zero".into()]),
         ("sgtz", [rd, rs]) => ("slt", vec![rd.clone(), "zero".into(), rs.clone()]),
+        ("sgt", [rd, rs, rt]) => ("slt", vec![rd.clone(), rt.clone(), rs.clone()]),
+        ("sgtu", [rd, rs, rt]) => ("sltu", vec![rd.clone(), rt.clone(), rs.clone()]),
         ("jr", [rs]) => ("jalr", vec!["zero".into(), format!("0({rs})")]),
-        ("not" | "neg" | "negw" | "sext.w" | "seqz" | "snez" | "sltz" | "sgtz" | "jr", _) => {
+        (
+            "not" | "neg" | "negw" | "sext.w" | "seqz" | "snez" | "sltz" | "sgtz" | "sgt" | "sgtu"
+            | "jr",
+            _,
+        ) => {
             return Err(RasError::EncodingError(format!(
                 "{} has the wrong number of operands",
                 opcode.to_uppercase()
@@ -702,6 +931,10 @@ impl InstructionEncoder for RiscVEncoder {
                 opcode: base.to_string(),
                 operands,
             });
+        }
+        if let Some(bytes) = self.encode_fp(&opcode, ops)? {
+            self.position += bytes.len();
+            return Ok(bytes);
         }
 
         let bytes = match opcode.as_str() {
@@ -985,6 +1218,26 @@ mod tests {
             .encode_instruction(&instr("addi", &["x0", "x0", "0"]))
             .unwrap();
         assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn test_fp_and_compare_pseudos_match_spec_fields() {
+        let word = |opcode: &str, ops: &[&str]| {
+            let bytes = enc().encode_instruction(&instr(opcode, ops)).unwrap();
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        };
+        assert_eq!(word("fadd.d", &["fa0", "fa1", "fa2"]), 0x02C5_F553);
+        assert_eq!(word("fld", &["fa0", "8(sp)"]), 0x0081_3507);
+        assert_eq!(word("fsd", &["fa0", "8(sp)"]), 0x00A1_3427);
+        assert_eq!(word("fmv.d.x", &["fa0", "t0"]), 0xF202_8553);
+        assert_eq!(word("fmv.w.x", &["fa0", "t0"]), 0xF002_8553);
+        assert_eq!(word("fcvt.l.d", &["a0", "fa0", "rtz"]), 0xC225_1553);
+        assert_eq!(word("fcvt.d.l", &["fa0", "a0"]), 0xD225_7553);
+        assert_eq!(word("feq.d", &["a0", "fa0", "fa1"]), 0xA2B5_2553);
+        assert_eq!(word("fneg.d", &["fa0", "fa0"]), 0x22A5_1553);
+        assert_eq!(word("fcvt.d.s", &["fa0", "fa0"]), 0x4205_0553);
+        assert_eq!(word("sgt", &["a0", "a0", "a1"]), 0x00A5_A533);
+        assert_eq!(word("sgtu", &["a0", "a0", "a1"]), 0x00A5_B533);
     }
 
     #[test]
