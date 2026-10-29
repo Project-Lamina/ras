@@ -103,6 +103,7 @@ const SHF_TLS: u64 = 0x400;
 const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
 const STB_GLOBAL: u8 = 1;
+const STT_TLS: u8 = 6;
 
 fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
@@ -428,6 +429,11 @@ impl ObjectWriter for ElfWriter {
                 .iter()
                 .filter(|s| !s.global && !s.attributes.weak)
                 .count() as u32;
+        let tls_sections: std::collections::HashSet<&str> = sections
+            .iter()
+            .filter(|s| s.flags.tls)
+            .map(|s| s.name.as_str())
+            .collect();
         for sym in defined {
             let index = symtab.len() / ELF64_SYM_SIZE as usize;
             sym_indices.insert(sym.name.as_str(), index as u32);
@@ -457,7 +463,11 @@ impl ObjectWriter for ElfWriter {
                 } else {
                     u8::from(sym.global)
                 },
-                sym.attributes.symbol_type,
+                if tls_sections.contains(sym.section.as_str()) {
+                    STT_TLS
+                } else {
+                    sym.attributes.symbol_type
+                },
                 elf_visibility(&sym.attributes)
                     | elf_local_entry(&sym.attributes, req.target_arch)?,
                 section as u16,
@@ -1638,6 +1648,69 @@ mod tests {
         let buf = std::fs::read(&path).expect("read");
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
+    }
+
+    #[test]
+    fn tls_section_symbols_are_stt_tls() {
+        let tls_section = |name: &str, nobits: bool| Section {
+            group: None,
+            name: name.into(),
+            flags: SectionFlags {
+                alloc: true,
+                exec: false,
+                write: true,
+                tls: true,
+            },
+            data: if nobits { vec![0; 8] } else { vec![1; 8] },
+            alignment: 8,
+        };
+        let symbol = |name: &str, global: bool, section: &str| ObjectSymbol {
+            name: name.into(),
+            global,
+            section: section.into(),
+            value: 0,
+            attributes: Default::default(),
+        };
+        let opts = ObjectWriteOptions::default();
+        let buf = ElfWriter::new()
+            .object_bytes(&ObjectWriteRequest {
+                code: &[],
+                sections: &[tls_section(".tdata", false), tls_section(".tbss", true)],
+                symbols: &[
+                    symbol("tls_init", true, ".tdata"),
+                    symbol("tls_zero", false, ".tbss"),
+                ],
+                relocations: &[],
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Linux,
+                opts: &opts,
+            })
+            .expect("write");
+        let u64_at = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        let shoff = u64_at(0x28) as usize;
+        let shnum = u16::from_le_bytes([buf[0x3c], buf[0x3d]]) as usize;
+        let header = |index: usize| shoff + index * ELF64_SECTION_HEADER_SIZE;
+        let symtab = (0..shnum)
+            .find(|&i| u32_at(header(i) + 4) == SHT_SYMTAB)
+            .expect(".symtab section");
+        let strtab = header(u32_at(header(symtab) + 0x28) as usize);
+        let strings = u64_at(strtab + 0x18) as usize;
+        let sym_base = u64_at(header(symtab) + 0x18) as usize;
+        let sym_count = u64_at(header(symtab) + 0x20) as usize / ELF64_SYM_SIZE as usize;
+        let type_of = |wanted: &str| {
+            (0..sym_count)
+                .map(|i| sym_base + i * ELF64_SYM_SIZE as usize)
+                .find(|&entry| {
+                    let start = strings + u32_at(entry) as usize;
+                    let end = start + buf[start..].iter().position(|b| *b == 0).unwrap();
+                    &buf[start..end] == wanted.as_bytes()
+                })
+                .map(|entry| buf[entry + 4] & 0xf)
+                .unwrap_or_else(|| panic!("symbol {wanted} missing"))
+        };
+        assert_eq!(type_of("tls_init"), 6, "STT_TLS in .tdata");
+        assert_eq!(type_of("tls_zero"), 6, "STT_TLS in .tbss");
     }
 
     #[test]
