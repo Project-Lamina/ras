@@ -65,7 +65,7 @@ pub fn compile_mir_x86_64_function(
         }
 
         for inst in &func.blocks[0].instructions {
-            match inst {
+            match &inst.instr {
                 lamina_mir::Instruction::Jmp { .. }
                 | lamina_mir::Instruction::Br { .. }
                 | lamina_mir::Instruction::Switch { .. }
@@ -125,7 +125,7 @@ pub fn compile_mir_x86_64_function(
         code.extend_from_slice(&prologue);
 
         let skip_epilogue_and_ret = matches!(
-            func.blocks[0].instructions.last(),
+            func.blocks[0].terminator(),
             Some(lamina_mir::Instruction::Unreachable)
         );
 
