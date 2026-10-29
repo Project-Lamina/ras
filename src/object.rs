@@ -67,12 +67,18 @@ pub struct ObjectWriteRequest<'a> {
 
 /// Backend for writing relocatable object files (ELF, Mach-O, or COFF/PE).
 pub trait ObjectWriter {
+    /// Build a relocatable object file in memory.
+    fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>;
+
     /// Write a relocatable object file to `path`.
     fn write_object_file(
         &mut self,
         path: &std::path::Path,
         req: &ObjectWriteRequest<'_>,
-    ) -> Result<(), RasError>;
+    ) -> Result<(), RasError> {
+        let bytes = self.object_bytes(req)?;
+        std::fs::write(path, bytes).map_err(|e| RasError::ObjectError(e.to_string()))
+    }
 }
 
 const ELF64_HEADER_SIZE: usize = 64;
@@ -298,11 +304,7 @@ impl ElfWriter {
 }
 
 impl ObjectWriter for ElfWriter {
-    fn write_object_file(
-        &mut self,
-        path: &std::path::Path,
-        req: &ObjectWriteRequest<'_>,
-    ) -> Result<(), RasError> {
+    fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
         let machine = elf64_e_machine(req.target_arch)
             .ok_or_else(|| RasError::ObjectError("Unsupported ELF architecture".into()))?;
         let mut sections = req.sections.to_vec();
@@ -656,8 +658,7 @@ impl ObjectWriter for ElfWriter {
                 payload.extend_from_slice(&bytes);
             }
         }
-        let mut f =
-            std::fs::File::create(path).map_err(|e| RasError::ObjectError(e.to_string()))?;
+        let mut f: Vec<u8> = Vec::new();
         write_elf64_header_with_shnum(
             &mut f,
             machine,
@@ -670,7 +671,7 @@ impl ObjectWriter for ElfWriter {
         }
         f.write_all(&payload)
             .map_err(|e| RasError::ObjectError(e.to_string()))?;
-        Ok(())
+        Ok(f)
     }
 }
 
@@ -1355,14 +1356,8 @@ impl MachOWriter {
 }
 
 impl ObjectWriter for MachOWriter {
-    fn write_object_file(
-        &mut self,
-        path: &std::path::Path,
-        req: &ObjectWriteRequest<'_>,
-    ) -> Result<(), RasError> {
-        let bytes = macho_object_bytes(req)?;
-        std::fs::write(path, bytes)
-            .map_err(|e| RasError::ObjectError(format!("Mach-O write: {}", e)))
+    fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+        macho_object_bytes(req)
     }
 }
 
@@ -1390,11 +1385,7 @@ const IMAGE_SYM_CLASS_STATIC: u8 = 3;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
 
 impl ObjectWriter for CoffWriter {
-    fn write_object_file(
-        &mut self,
-        path: &std::path::Path,
-        req: &ObjectWriteRequest<'_>,
-    ) -> Result<(), RasError> {
+    fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
         let code = req.code;
         let symbols = req.symbols;
         let relocations = req.relocations;
@@ -1509,8 +1500,7 @@ impl ObjectWriter for CoffWriter {
             | IMAGE_SCN_MEM_READ;
 
         let map = |e: std::io::Error| RasError::ObjectError(format!("COFF write: {}", e));
-        let mut f = std::fs::File::create(path)
-            .map_err(|e| RasError::ObjectError(format!("Failed to create COFF file: {}", e)))?;
+        let mut f: Vec<u8> = Vec::new();
 
         // COFF file header (20 bytes)
         f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes())
@@ -1553,7 +1543,7 @@ impl ObjectWriter for CoffWriter {
         f.write_all(&sym_bytes).map_err(map)?;
         f.write_all(&strtab).map_err(map)?;
 
-        Ok(())
+        Ok(f)
     }
 }
 

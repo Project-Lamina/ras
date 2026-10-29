@@ -245,14 +245,20 @@ impl RasAssembler {
     }
 
     /// Assemble `asm_text` and write a relocatable object file to `output_path`.
-    ///
-    /// Uses two-pass assembly for `jmp`/`call` instructions with forward label
-    /// resolution.
     pub fn assemble_text_to_object(
         &mut self,
         asm_text: &str,
         output_path: &std::path::Path,
     ) -> Result<(), RasError> {
+        let bytes = self.assemble_text_to_object_bytes(asm_text)?;
+        std::fs::write(output_path, bytes).map_err(|e| RasError::ObjectError(e.to_string()))
+    }
+
+    /// Assemble `asm_text` into the bytes of a relocatable object file.
+    ///
+    /// Uses two-pass assembly for `jmp`/`call` instructions with forward label
+    /// resolution.
+    pub fn assemble_text_to_object_bytes(&mut self, asm_text: &str) -> Result<Vec<u8>, RasError> {
         if self.target_arch == TargetArchitecture::Riscv32 {
             return Err(RasError::UnsupportedTarget(
                 "riscv32 object output is not implemented: ras writes ELF64 only".into(),
@@ -567,21 +573,16 @@ impl RasAssembler {
         let code = &sections.iter().find(|s| s.name == ".text").unwrap().data;
 
         self.object_writer
-            .write_object_file(
-                output_path,
-                &ObjectWriteRequest {
-                    code,
-                    sections: &sections,
-                    symbols: &symbols,
-                    relocations: &relocs,
-                    target_arch: self.target_arch,
-                    target_os: self.target_os,
-                    opts: &self.object_write_options,
-                },
-            )
-            .map_err(|e| RasError::ObjectError(e.to_string()))?;
-
-        Ok(())
+            .object_bytes(&ObjectWriteRequest {
+                code,
+                sections: &sections,
+                symbols: &symbols,
+                relocations: &relocs,
+                target_arch: self.target_arch,
+                target_os: self.target_os,
+                opts: &self.object_write_options,
+            })
+            .map_err(|e| RasError::ObjectError(e.to_string()))
     }
 
     fn alignment(&self, value: usize, directive: &str) -> Result<usize, RasError> {

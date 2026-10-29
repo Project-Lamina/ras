@@ -59,6 +59,10 @@ impl Ras {
             .assemble_text_to_object(asm_text, output_path)
     }
 
+    pub fn assemble_to_bytes(&mut self, asm_text: &str) -> Result<Vec<u8>, RasError> {
+        self.assembler.assemble_text_to_object_bytes(asm_text)
+    }
+
     pub fn assemble_file(
         &mut self,
         input_path: &std::path::Path,
@@ -99,6 +103,25 @@ main:
         let _ = std::fs::remove_file(&path);
         assert!(buf.len() >= 64);
         assert_eq!(&buf[0..4], &[0x7f, b'E', b'L', b'F']);
+    }
+
+    #[test]
+    fn test_assemble_to_bytes_matches_file_output() {
+        let asm = r#"
+.text
+.globl main
+main:
+    movq $42, %rax
+    ret
+"#;
+        let mut ras =
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux).expect("ras new");
+        let bytes = ras.assemble_to_bytes(asm).expect("assemble to bytes");
+        let path = std::env::temp_dir().join("ras_bytes_vs_file_test.o");
+        ras.assemble(asm, &path).expect("assemble");
+        let file = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes, file);
     }
 
     #[test]
