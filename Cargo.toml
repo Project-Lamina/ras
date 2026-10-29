@@ -2,7 +2,7 @@
 name = "lamina-ras"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Eira <eira@nornity.com>"]
 description = "ras - as/GAS alternative. Cross-platform assembler: assembly source (.s) to relocatable object files (.o). Used by Lamina, usable standalone."
 license = "Apache-2.0"
