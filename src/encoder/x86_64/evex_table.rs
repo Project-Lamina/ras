@@ -8,6 +8,7 @@ pub(super) const ROUND: u8 = 1 << 3;
 pub(super) const SAE: u8 = 1 << 4;
 pub(super) const MEMSRC: u8 = 1 << 5;
 pub(super) const KDST: u8 = 1 << 6;
+pub(super) const STORE: u8 = 1 << 7;
 
 macro_rules! shift {
     ($name:literal, $wide:literal, $opcode:literal, $digit:literal, $flags:expr $(,)?) => {
@@ -76,6 +77,8 @@ pub(super) static EVEX_TABLE: &[EvexEntry] = &[
     entry!("vcmpps", 1, 0, false, 0xc2, NdsImm, Scaled(1), BCST | MASK | SAE | KDST, 0b111, 0, 0),
     entry!("vcmpsd", 1, 3, true, 0xc2, NdsImm, Scaled(2), MASK | SAE | KDST, 0b001, 0, 0),
     entry!("vcmpss", 1, 2, false, 0xc2, NdsImm, Scaled(4), MASK | SAE | KDST, 0b001, 0, 0),
+    entry!("vcompresspd", 2, 1, true, 0x8a, Rm, Fixed(8), MASK | ZERO | STORE, 0b111, 0, 0),
+    entry!("vcompressps", 2, 1, false, 0x8a, Rm, Fixed(4), MASK | ZERO | STORE, 0b111, 0, 0),
     entry!("vcvtdq2pd", 1, 2, false, 0xe6, Rm, Scaled(2), BCST | MASK | ZERO, 0b111, 1, 0),
     entry!("vcvtdq2ps", 1, 0, false, 0x5b, Rm, Scaled(1), BCST | MASK | ZERO | ROUND, 0b111, 0, 0),
     entry!("vcvtpd2dq", 1, 3, true, 0xe6, Rm, Scaled(1), BCST | MASK | ZERO | ROUND, 0b111, 0, 1),
@@ -212,6 +215,7 @@ pub(super) static EVEX_TABLE: &[EvexEntry] = &[
     entry!("vmovdqu32", 1, 2, false, 0x6f, Rm, Scaled(1), MASK | ZERO, 0b111, 0, 0),
     entry!("vmovdqu64", 1, 2, true, 0x6f, Rm, Scaled(1), MASK | ZERO, 0b111, 0, 0),
     entry!("vmovdqu8", 1, 3, false, 0x6f, Rm, Scaled(1), MASK | ZERO, 0b111, 0, 0),
+    entry!("vmovntdqa", 2, 1, false, 0x2a, Rm, Scaled(1), MEMSRC, 0b111, 0, 0),
     entry!("vmovshdup", 1, 2, false, 0x16, Rm, Scaled(1), MASK | ZERO, 0b111, 0, 0),
     entry!("vmovsldup", 1, 2, false, 0x12, Rm, Scaled(1), MASK | ZERO, 0b111, 0, 0),
     entry!("vmovupd", 1, 1, true, 0x10, Rm, Scaled(1), MASK | ZERO, 0b111, 0, 0),
@@ -269,6 +273,8 @@ pub(super) static EVEX_TABLE: &[EvexEntry] = &[
     entry!("vpcmpuq", 3, 1, true, 0x1e, NdsImm, Scaled(1), BCST | MASK | KDST, 0b111, 0, 0),
     entry!("vpcmpuw", 3, 1, true, 0x3e, NdsImm, Scaled(1), MASK | KDST, 0b111, 0, 0),
     entry!("vpcmpw", 3, 1, true, 0x3f, NdsImm, Scaled(1), MASK | KDST, 0b111, 0, 0),
+    entry!("vpcompressd", 2, 1, false, 0x8b, Rm, Fixed(4), MASK | ZERO | STORE, 0b111, 0, 0),
+    entry!("vpcompressq", 2, 1, true, 0x8b, Rm, Fixed(8), MASK | ZERO | STORE, 0b111, 0, 0),
     entry!("vpconflictd", 2, 1, false, 0xc4, Rm, Scaled(1), BCST | MASK | ZERO, 0b111, 0, 0),
     entry!("vpconflictq", 2, 1, true, 0xc4, Rm, Scaled(1), BCST | MASK | ZERO, 0b111, 0, 0),
     entry!("vpermd", 2, 1, false, 0x36, Nds, Scaled(1), BCST | MASK | ZERO, 0b110, 0, 0),

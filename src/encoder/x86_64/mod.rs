@@ -6,7 +6,7 @@ use crate::{
 };
 
 mod evex_table;
-use evex_table::{BCST, EVEX_TABLE, KDST, MASK, MEMSRC, ROUND, SAE, ZERO};
+use evex_table::{BCST, EVEX_TABLE, KDST, MASK, MEMSRC, ROUND, SAE, STORE, ZERO};
 
 pub struct X86_64Encoder {
     position: usize,
@@ -960,7 +960,7 @@ impl X86_64Encoder {
         let (index, _, index_len) = memory
             .vindex
             .ok_or_else(|| bad(format!("{} requires a vector index", name)))?;
-        if memory.broadcast.is_some() || memory.fs || memory.label.is_some() {
+        if memory.broadcast.is_some() || memory.label.is_some() {
             return Err(bad(format!("{} takes a plain base and vector index", name)));
         }
         let (destination, mask, zeroing) = split_mask(destination)?;
@@ -1025,6 +1025,347 @@ impl X86_64Encoder {
                 ..Op::default()
             })
         }
+    }
+
+    /// Whether a scalar move names a register or a decorator that only the
+    /// AVX-512 encoding can carry.
+    fn scalar_move_needs_evex(&self, operands: &[String]) -> bool {
+        operands.iter().any(|op| {
+            let op = op.trim();
+            op.contains('{') || parse_vreg(op).is_some_and(|(number, _)| number >= 16)
+        })
+    }
+
+    /// `vmovss` and `vmovsd` under EVEX, which merge into the destination
+    /// under an opmask and reach the whole register file.
+    fn encode_evex_scalar_move(
+        &self,
+        name: &str,
+        operands: &[String],
+    ) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let wide = name == "vmovsd";
+        let pp = if wide { 3 } else { 2 };
+        let low = |text: &str| -> Result<u8, RasError> {
+            match parse_vreg(text) {
+                Some((number, 0)) => Ok(number),
+                _ => Err(bad(format!("{} takes xmm registers: {}", name, text))),
+            }
+        };
+        let prefix = |mask, zeroing, vvvv| Evex {
+            map: 1,
+            pp,
+            wide,
+            vvvv,
+            mask,
+            zeroing,
+            tuple: Tuple::Fixed(if wide { 8 } else { 4 }),
+            ..Evex::default()
+        };
+        match operands {
+            [source, destination] => {
+                let (destination, mask, zeroing) = split_mask(destination)?;
+                if self.is_memory(destination) {
+                    if zeroing {
+                        return Err(bad("{z} requires a register destination".into()));
+                    }
+                    return encode_op(Op {
+                        opcode: &[0x11],
+                        reg: low(source)?,
+                        rm: Rm::Mem(self.parse_mem(destination)?),
+                        evex: Some(prefix(mask, false, 0)),
+                        ..Op::default()
+                    });
+                }
+                if !self.is_memory(source) {
+                    return Err(bad(format!(
+                        "{} between registers names a merge source",
+                        name
+                    )));
+                }
+                encode_op(Op {
+                    opcode: &[0x10],
+                    reg: low(destination)?,
+                    rm: Rm::Mem(self.parse_mem(source)?),
+                    evex: Some(prefix(mask, zeroing, 0)),
+                    ..Op::default()
+                })
+            }
+            [source, first, destination] => {
+                let (destination, mask, zeroing) = split_mask(destination)?;
+                encode_op(Op {
+                    opcode: &[0x10],
+                    reg: low(destination)?,
+                    rm: Rm::Reg(low(source)?),
+                    evex: Some(prefix(mask, zeroing, low(first)?)),
+                    ..Op::default()
+                })
+            }
+            _ => Err(bad(format!("{} requires 2 or 3 operands", name))),
+        }
+    }
+
+    /// A convert whose mnemonic spells its source width with a trailing `x`
+    /// or `y`, which pins the vector length the unsuffixed spelling would
+    /// have to read off an operand.
+    fn encode_sized_convert(&self, name: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let (base, length) =
+            sized_convert(name).ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+        let [source, destination] = operands else {
+            return Err(bad(format!("{} requires 2 operands", name)));
+        };
+        if self.needs_evex(base, operands) {
+            let entry = packed_evex(base, false)
+                .ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+            let narrowed = EvexEntry {
+                lens: entry.lens & (1 << length),
+                ..*entry
+            };
+            return self.encode_evex_packed(&narrowed, operands);
+        }
+        let (map, pp, wide, opcode, _) =
+            packed_vex(base).ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+        let (rm, rm_wide) = self.parse_vector_rm(source)?;
+        if matches!(rm, Rm::Reg(_)) && rm_wide != (length == 1) {
+            return Err(bad(format!("{}: wrong source register width", name)));
+        }
+        let reg = parse_xmm(destination.trim())
+            .ok_or_else(|| bad(format!("{} writes an xmm register", name)))?;
+        encode_op(Op {
+            opcode: &[opcode],
+            reg,
+            rm,
+            vex: Some(Vex {
+                map,
+                pp,
+                wide,
+                len256: length == 1,
+                vvvv: 0,
+            }),
+            ..Op::default()
+        })
+    }
+
+    /// An opmask instruction. These are VEX-encoded and move between opmask
+    /// registers, general registers and memory.
+    fn encode_kmask(&self, name: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let (map, pp, wide, opcode, form) =
+            kmask(name).ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+        let kreg = |text: &str| -> Result<u8, RasError> {
+            mask_register(text).ok_or_else(|| bad(format!("Expected an opmask register: {}", text)))
+        };
+        let expected = match form {
+            KForm::Unary | KForm::Move => 2,
+            KForm::Binary | KForm::Shift => 3,
+        };
+        if operands.len() != expected {
+            return Err(bad(format!("{} requires {} operands", name, expected)));
+        }
+        let plain = |vvvv, len256, reg, rm, imm: &[u8]| {
+            encode_op(Op {
+                opcode: &[opcode],
+                reg,
+                rm,
+                imm,
+                vex: Some(Vex {
+                    map,
+                    pp,
+                    wide,
+                    len256,
+                    vvvv,
+                }),
+                ..Op::default()
+            })
+        };
+        match form {
+            KForm::Unary => plain(
+                0,
+                false,
+                kreg(&operands[1])?,
+                Rm::Reg(kreg(&operands[0])?),
+                &[],
+            ),
+            KForm::Binary => plain(
+                kreg(&operands[1])?,
+                true,
+                kreg(&operands[2])?,
+                Rm::Reg(kreg(&operands[0])?),
+                &[],
+            ),
+            KForm::Shift => {
+                let count = operands[0]
+                    .trim()
+                    .strip_prefix('$')
+                    .map(parse_imm)
+                    .ok_or_else(|| bad(format!("{} takes an immediate count", name)))??;
+                let count = u8::try_from(count)
+                    .map_err(|_| bad(format!("Shift count out of range: {}", count)))?;
+                plain(
+                    0,
+                    false,
+                    kreg(&operands[2])?,
+                    Rm::Reg(kreg(&operands[1])?),
+                    &[count],
+                )
+            }
+            KForm::Move => {
+                let suffix = &name[name.len() - 1..];
+                let (source, destination) = (operands[0].trim(), operands[1].trim());
+                let (transfer_wide, transfer_pp, width) = kmov_transfer(suffix)
+                    .ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+                let general = |register: Gpr, k: u8, load: bool| {
+                    if register.width != width || register.high {
+                        return Err(bad(format!("{} transfers a {}-bit register", name, width)));
+                    }
+                    let (reg, rm) = if load {
+                        (k, Rm::Reg(register.num))
+                    } else {
+                        (register.num, Rm::Reg(k))
+                    };
+                    encode_op(Op {
+                        opcode: &[opcode + if load { 2 } else { 3 }],
+                        reg,
+                        rm,
+                        vex: Some(Vex {
+                            map,
+                            pp: transfer_pp,
+                            wide: transfer_wide,
+                            len256: false,
+                            vvvv: 0,
+                        }),
+                        ..Op::default()
+                    })
+                };
+                match (mask_register(source), mask_register(destination)) {
+                    (Some(source), Some(destination)) => {
+                        plain(0, false, destination, Rm::Reg(source), &[])
+                    }
+                    (None, Some(destination)) => match gpr(source) {
+                        Some(register) => general(register, destination, true),
+                        None if self.is_memory(source) => {
+                            plain(0, false, destination, Rm::Mem(self.parse_mem(source)?), &[])
+                        }
+                        None => Err(bad(format!("{}: unsupported source: {}", name, source))),
+                    },
+                    (Some(source), None) => match gpr(destination) {
+                        Some(register) => general(register, source, false),
+                        None if self.is_memory(destination) => encode_op(Op {
+                            opcode: &[opcode + 1],
+                            reg: source,
+                            rm: Rm::Mem(self.parse_mem(destination)?),
+                            vex: Some(Vex {
+                                map,
+                                pp,
+                                wide,
+                                len256: false,
+                                vvvv: 0,
+                            }),
+                            ..Op::default()
+                        }),
+                        None => Err(bad(format!(
+                            "{}: unsupported destination: {}",
+                            name, destination
+                        ))),
+                    },
+                    (None, None) => Err(bad(format!("{} names at least one opmask", name))),
+                }
+            }
+        }
+    }
+
+    /// A VSIB scatter, which names the scattered register first and the
+    /// vector-indexed destination second. The opmask is not optional.
+    fn encode_scatter(&self, name: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let (index_wide, element_wide, opcode) =
+            scatter(name).ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+        let index_shift = u8::from(!index_wide && element_wide);
+        let element_shift = u8::from(index_wide && !element_wide);
+        let [source, destination] = operands else {
+            return Err(bad(format!("{} requires 2 operands", name)));
+        };
+        let (destination, mask, zeroing) = split_mask(destination)?;
+        if zeroing {
+            return Err(bad(format!("{} takes no zeroing mask", name)));
+        }
+        if mask == 0 {
+            return Err(bad(format!("{} requires a write mask", name)));
+        }
+        let memory = self.parse_mem_mode(destination, true)?;
+        let (_, _, index_len) = memory
+            .vindex
+            .ok_or_else(|| bad(format!("{} requires a vector index", name)))?;
+        if memory.broadcast.is_some() || memory.label.is_some() {
+            return Err(bad(format!("{} takes a plain base and vector index", name)));
+        }
+        let (number, element_len) =
+            parse_vreg(source).ok_or_else(|| bad(format!("{} reads a vector register", name)))?;
+        let length = (0..3u8)
+            .find(|length| {
+                index_len == length.saturating_sub(index_shift)
+                    && element_len == length.saturating_sub(element_shift)
+            })
+            .ok_or_else(|| bad(format!("{}: operand sizes do not match", name)))?;
+        encode_op(Op {
+            opcode: &[opcode],
+            reg: number,
+            rm: Rm::Mem(memory),
+            evex: Some(Evex {
+                map: 2,
+                pp: 1,
+                wide: element_wide,
+                ll: length,
+                mask,
+                tuple: Tuple::Fixed(if element_wide { 8 } else { 4 }),
+                ..Evex::default()
+            }),
+            ..Op::default()
+        })
+    }
+
+    /// A VSIB gather or scatter prefetch. These name only the memory operand
+    /// and are always 512 bits wide; the hint sits in the `reg` field.
+    fn encode_vsib_prefetch(&self, name: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let (index_wide, element_wide, opcode, digit) =
+            vsib_prefetch(name).ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+        let [operand] = operands else {
+            return Err(bad(format!("{} requires 1 operand", name)));
+        };
+        let (operand, mask, zeroing) = split_mask(operand)?;
+        if zeroing {
+            return Err(bad(format!("{} takes no zeroing mask", name)));
+        }
+        if mask == 0 {
+            return Err(bad(format!("{} requires a write mask", name)));
+        }
+        let memory = self.parse_mem_mode(operand, true)?;
+        let (_, _, index_len) = memory
+            .vindex
+            .ok_or_else(|| bad(format!("{} requires a vector index", name)))?;
+        if memory.broadcast.is_some() || memory.label.is_some() {
+            return Err(bad(format!("{} takes a plain base and vector index", name)));
+        }
+        if index_len != 2 - u8::from(!index_wide && element_wide) {
+            return Err(bad(format!("{}: wrong index register width", name)));
+        }
+        encode_op(Op {
+            opcode: &[opcode],
+            reg: digit,
+            rm: Rm::Mem(memory),
+            evex: Some(Evex {
+                map: 2,
+                pp: 1,
+                wide: element_wide,
+                ll: 2,
+                mask,
+                tuple: Tuple::Fixed(if element_wide { 8 } else { 4 }),
+                ..Evex::default()
+            }),
+            ..Op::default()
+        })
     }
 
     /// An AVX-512 operation. The table entry fixes the prefix fields and the
@@ -1114,10 +1455,18 @@ impl X86_64Encoder {
         if entry.has(MEMSRC) && !source_is_memory {
             return Err(bad(format!("{} requires a memory source", entry.name)));
         }
+        let reversed = entry.has(STORE);
+        if reversed && source_is_memory {
+            return Err(bad(format!("{} requires a register source", entry.name)));
+        }
         let store = (destination_is_memory && entry.form == VexForm::Rm)
             .then(|| evex_store(entry.name))
             .flatten();
-        if destination_is_memory && entry.form != VexForm::ExtractImm && store.is_none() {
+        if destination_is_memory
+            && entry.form != VexForm::ExtractImm
+            && store.is_none()
+            && !reversed
+        {
             return Err(bad(format!(
                 "{} requires a register destination",
                 entry.name
@@ -1172,7 +1521,7 @@ impl X86_64Encoder {
                 .or(mask_dst)
                 .unwrap_or(0)
         };
-        if entry.form == VexForm::ExtractImm || store.is_some() {
+        if entry.form == VexForm::ExtractImm || store.is_some() || reversed {
             reg = source_reg.map_or(0, |(number, _)| number);
             rm = if destination_is_memory {
                 Rm::Mem(self.parse_mem(destination)?)
@@ -1797,6 +2146,22 @@ impl InstructionEncoder for X86_64Encoder {
             }
             name if gather(name).is_some() => {
                 let enc = self.encode_gather(name, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            name if scatter(name).is_some() => {
+                let enc = self.encode_scatter(name, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            name if vsib_prefetch(name).is_some() => {
+                let enc = self.encode_vsib_prefetch(name, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            name if kmask(name).is_some() => {
+                let enc = self.encode_kmask(name, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            name if sized_convert(name).is_some() => {
+                let enc = self.encode_sized_convert(name, &inst.operands)?;
                 code = self.emit(enc);
             }
             name if is_evex_mnemonic(name) && self.needs_evex(name, &inst.operands) => {
@@ -3005,6 +3370,22 @@ impl InstructionEncoder for X86_64Encoder {
             // The scalar moves merge from a second source between registers
             // and address memory in two operands.
             "vmovss" | "vmovsd" | "vmovhps" | "vmovlps" | "vmovhpd" | "vmovlpd" => {
+                let scalar = matches!(opcode.as_str(), "vmovss" | "vmovsd");
+                if scalar && self.scalar_move_needs_evex(&inst.operands) {
+                    let enc = self.encode_evex_scalar_move(&opcode, &inst.operands)?;
+                    code = self.emit(enc);
+                    self.position += code.len();
+                    return Ok(code);
+                }
+                if scalar
+                    && inst.operands.len() == 2
+                    && !inst.operands.iter().any(|op| self.is_memory(op))
+                {
+                    return Err(RasError::EncodingError(format!(
+                        "{} between registers names a merge source",
+                        opcode
+                    )));
+                }
                 let (pp, load) = match opcode.as_str() {
                     "vmovss" => (2u8, 0x10u8),
                     "vmovsd" => (3, 0x10),
@@ -3491,6 +3872,7 @@ impl Vex {
 
 /// One AVX-512 form. `lens` is a bit per legal vector length and `flags`
 /// records which decorators the form accepts.
+#[derive(Clone, Copy)]
 struct EvexEntry {
     name: &'static str,
     map: u8,
@@ -3685,6 +4067,145 @@ fn gather(name: &str) -> Option<(bool, bool, u8)> {
     };
     let opcode = if integer { 0x90 } else { 0x92 } + u8::from(index_wide);
     Some((index_wide, element_wide, opcode))
+}
+
+/// The operand shape of an opmask instruction.
+#[derive(Clone, Copy, PartialEq)]
+enum KForm {
+    /// `op k, k`, with the source in `r/m`.
+    Unary,
+    /// `op k, k, k`, with the middle operand in `vvvv` and `L` set.
+    Binary,
+    /// `op $imm, k, k`.
+    Shift,
+    /// `kmov`, which also reaches general registers and memory.
+    Move,
+}
+
+/// `W` and `pp` for an opmask element-size suffix.
+fn kmask_width(suffix: &str) -> Option<(bool, u8)> {
+    match suffix {
+        "b" => Some((false, 1)),
+        "w" => Some((false, 0)),
+        "d" => Some((true, 1)),
+        "q" => Some((true, 0)),
+        _ => None,
+    }
+}
+
+/// An opmask instruction, as `(map, pp, W, opcode, form)`.
+fn kmask(name: &str) -> Option<(u8, u8, bool, u8, KForm)> {
+    let rest = name.strip_prefix('k')?;
+    if let Some(suffix) = rest.strip_prefix("unpck") {
+        let (wide, pp) = match suffix {
+            "bw" => (false, 1),
+            "wd" => (false, 0),
+            "dq" => (true, 0),
+            _ => return None,
+        };
+        return Some((1, pp, wide, 0x4b, KForm::Binary));
+    }
+    for (stem, opcode) in [("shiftr", 0x30u8), ("shiftl", 0x32)] {
+        if let Some(suffix) = rest.strip_prefix(stem) {
+            let (wide, high) = match suffix {
+                "b" => (false, false),
+                "w" => (true, false),
+                "d" => (false, true),
+                "q" => (true, true),
+                _ => return None,
+            };
+            return Some((3, 1, wide, opcode + u8::from(high), KForm::Shift));
+        }
+    }
+    let (stem, suffix) = rest.split_at(rest.len().checked_sub(1)?);
+    let (wide, pp) = kmask_width(suffix)?;
+    let (opcode, form) = match stem {
+        "mov" => (0x90, KForm::Move),
+        "and" => (0x41, KForm::Binary),
+        "andn" => (0x42, KForm::Binary),
+        "not" => (0x44, KForm::Unary),
+        "or" => (0x45, KForm::Binary),
+        "xnor" => (0x46, KForm::Binary),
+        "xor" => (0x47, KForm::Binary),
+        "add" => (0x4a, KForm::Binary),
+        "ortest" => (0x98, KForm::Unary),
+        "test" => (0x99, KForm::Unary),
+        _ => return None,
+    };
+    Some((1, pp, wide, opcode, form))
+}
+
+/// `W`, `pp` and the general-register width `kmov` uses when it crosses
+/// between an opmask and a general register, which differ from the fields the
+/// register and memory forms use.
+fn kmov_transfer(suffix: &str) -> Option<(bool, u8, u8)> {
+    match suffix {
+        "b" => Some((false, 1, 32)),
+        "w" => Some((false, 0, 32)),
+        "d" => Some((false, 3, 32)),
+        "q" => Some((true, 3, 64)),
+        _ => None,
+    }
+}
+
+/// A VSIB scatter, as `(64-bit index, 64-bit element, opcode byte)`. The
+/// mnemonic spells the index size first and the scattered element second.
+fn scatter(name: &str) -> Option<(bool, bool, u8)> {
+    let rest = name.strip_prefix('v')?;
+    let (integer, rest) = match rest.strip_prefix("pscatter") {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix("scatter")?),
+    };
+    let (index_wide, rest) = match rest.strip_prefix('d') {
+        Some(rest) => (false, rest),
+        None => (true, rest.strip_prefix('q')?),
+    };
+    let element_wide = match (integer, rest) {
+        (true, "d") | (false, "ps") => false,
+        (true, "q") | (false, "pd") => true,
+        _ => return None,
+    };
+    let opcode = if integer { 0xa0 } else { 0xa2 } + u8::from(index_wide);
+    Some((index_wide, element_wide, opcode))
+}
+
+/// A VSIB prefetch, as `(64-bit index, 64-bit element, opcode byte, modrm
+/// digit)`. These touch no vector register, so the hint rides in `reg`.
+fn vsib_prefetch(name: &str) -> Option<(bool, bool, u8, u8)> {
+    let rest = name.strip_prefix('v')?;
+    let (digit, rest) = match rest.strip_prefix("gatherpf") {
+        Some(rest) => (1u8, rest),
+        None => (5, rest.strip_prefix("scatterpf")?),
+    };
+    let (hint, rest) = match rest.strip_prefix('0') {
+        Some(rest) => (0u8, rest),
+        None => (1, rest.strip_prefix('1')?),
+    };
+    let (index_wide, rest) = match rest.strip_prefix('d') {
+        Some(rest) => (false, rest),
+        None => (true, rest.strip_prefix('q')?),
+    };
+    let element_wide = match rest {
+        "ps" => false,
+        "pd" => true,
+        _ => return None,
+    };
+    Some((
+        index_wide,
+        element_wide,
+        0xc6 + u8::from(index_wide),
+        digit + hint,
+    ))
+}
+
+/// A `vcvtpd2ps`-style convert whose mnemonic spells its source width, as the
+/// unsuffixed mnemonic and the vector length that spelling pins.
+fn sized_convert(name: &str) -> Option<(&str, u8)> {
+    let (base, length) = match name.strip_suffix('x') {
+        Some(base) => (base, 0),
+        None => (name.strip_suffix('y')?, 1),
+    };
+    matches!(base, "vcvtpd2ps" | "vcvtpd2dq" | "vcvttpd2dq").then_some((base, length))
 }
 
 /// Whether a mnemonic has a VEX spelling for this operand shape, which
