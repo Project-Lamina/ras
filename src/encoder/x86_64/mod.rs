@@ -5,6 +5,9 @@ use crate::{
     error::RasError,
 };
 
+mod evex_table;
+use evex_table::{BCST, EVEX_TABLE, KDST, MASK, MEMSRC, ROUND, SAE, ZERO};
+
 pub struct X86_64Encoder {
     position: usize,
     rip_fixup: Option<RipFixup>,
@@ -42,8 +45,25 @@ impl X86_64Encoder {
     }
 
     fn parse_mem(&self, op: &str) -> Result<Mem, RasError> {
+        self.parse_mem_mode(op, false)
+    }
+
+    fn parse_mem_mode(&self, op: &str, vsib: bool) -> Result<Mem, RasError> {
         let invalid = || RasError::EncodingError(format!("Invalid memory operand: {}", op));
         let mut text = op.trim();
+        let mut broadcast = None;
+        if let Some(open) = text.rfind("{1to") {
+            let count = text[open + 4..]
+                .strip_suffix('}')
+                .and_then(|digits| digits.parse::<u8>().ok())
+                .filter(|count| matches!(count, 2 | 4 | 8 | 16 | 32 | 64))
+                .ok_or_else(invalid)?;
+            broadcast = Some(count);
+            text = text[..open].trim_end();
+        }
+        if text.contains('{') {
+            return Err(invalid());
+        }
         let fs = match text.strip_prefix("%fs:") {
             Some(rest) => {
                 text = rest;
@@ -65,6 +85,8 @@ impl X86_64Encoder {
             label: None,
             base: None,
             index: None,
+            vindex: None,
+            broadcast: None,
             rip: false,
             tls: None,
         };
@@ -79,6 +101,7 @@ impl X86_64Encoder {
                 }
             }
         }
+        mem.broadcast = broadcast;
         if let Some(inner) = inner {
             let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
             let (base, index) = match parts.as_slice() {
@@ -99,9 +122,6 @@ impl X86_64Encoder {
                 mem.base = Some(reg.num);
             }
             if let Some((index, scale)) = index {
-                let reg = gpr(index)
-                    .filter(|g| g.width == 64 && !g.high && g.num != 4)
-                    .ok_or_else(invalid)?;
                 let scale_bits = match scale {
                     "1" => 0,
                     "2" => 1,
@@ -109,7 +129,26 @@ impl X86_64Encoder {
                     "8" => 3,
                     _ => return Err(invalid()),
                 };
-                mem.index = Some((reg.num, scale_bits));
+                match parse_vreg(index) {
+                    Some((number, len)) if vsib => {
+                        if mem.rip {
+                            return Err(invalid());
+                        }
+                        mem.vindex = Some((number, scale_bits, len));
+                    }
+                    Some(_) => {
+                        return Err(RasError::EncodingError(format!(
+                            "Vector index is not allowed here: {}",
+                            op
+                        )));
+                    }
+                    None => {
+                        let reg = gpr(index)
+                            .filter(|g| g.width == 64 && !g.high && g.num != 4)
+                            .ok_or_else(invalid)?;
+                        mem.index = Some((reg.num, scale_bits));
+                    }
+                }
             }
         }
         match mem.tls {
@@ -141,6 +180,54 @@ impl X86_64Encoder {
     fn emit(&mut self, encoded: Encoded) -> Vec<u8> {
         self.rip_fixup = encoded.rip;
         encoded.bytes
+    }
+
+    /// Whether the operands force the AVX-512 encoding: a `zmm`, a register
+    /// above 15, an opmask destination, any decorator, or a mnemonic with no
+    /// VEX spelling for this operand shape.
+    fn needs_evex(&self, name: &str, operands: &[String]) -> bool {
+        let is_imm = operands
+            .iter()
+            .find(|op| rounding_decorator(op).is_none())
+            .is_some_and(|op| op.trim().starts_with('$'));
+        if !vex_form_exists(name, is_imm) {
+            return true;
+        }
+        if operands
+            .last()
+            .and_then(|op| split_mask(op).ok())
+            .is_some_and(|(base, _, _)| mask_register(base).is_some())
+        {
+            return true;
+        }
+        if broadcast_from_general(name).is_some()
+            && operands.first().is_some_and(|op| gpr(op).is_some())
+        {
+            return true;
+        }
+        if packed_evex(name, is_imm).is_some_and(|entry| entry.form == VexForm::ShiftImm)
+            && operands.get(1).is_some_and(|op| self.is_memory(op))
+        {
+            return true;
+        }
+        if let Some(entry) = packed_evex(name, is_imm)
+            && entry.dst_shift > 0
+            && operands.first().is_some_and(|op| self.is_memory(op))
+            && operands
+                .last()
+                .and_then(|op| parse_vreg(op))
+                .is_some_and(|(_, len)| len >= 1)
+        {
+            return true;
+        }
+        operands.iter().any(|op| {
+            let op = op.trim();
+            op.contains('{')
+                || parse_vreg(op).is_some_and(|(number, len)| number >= 16 || len == 2)
+                || self
+                    .parse_mem_mode(op, true)
+                    .is_ok_and(|mem| mem.vindex.is_some_and(|(number, _, _)| number >= 16))
+        })
     }
 
     fn is_memory(&self, op: &str) -> bool {
@@ -683,51 +770,456 @@ impl X86_64Encoder {
         })
     }
 
-    /// An EVEX three-operand instruction, written `op src2, src1, dst`, with
-    /// register operands only. EVEX scales disp8 by the access size, which
-    /// this encoder does not model, so memory operands are refused.
-    fn encode_evex_rrm(
+    /// An MMX operation. The encodings are the SSE ones without the `66`
+    /// prefix, over the eight `%mm` registers, which carry no extension bit.
+    fn encode_mmx(&self, name: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let mmx_rm = |op: &str| -> Result<Rm, RasError> {
+            let op = op.trim();
+            match mmx_register(op) {
+                Some(number) => Ok(Rm::Reg(number)),
+                None if self.is_memory(op) => Ok(Rm::Mem(self.parse_mem(op)?)),
+                None => Err(bad(format!("Expected an MMX or memory operand: {}", op))),
+            }
+        };
+        let mmx = |op: &str| -> Result<u8, RasError> {
+            mmx_register(op).ok_or_else(|| bad(format!("Expected an MMX register: {}", op)))
+        };
+        let two = || -> Result<(&String, &String), RasError> {
+            match operands {
+                [source, destination] => Ok((source, destination)),
+                _ => Err(bad(format!("{} requires 2 operands", name))),
+            }
+        };
+        if matches!(name, "movq" | "movd") {
+            let (source, destination) = two()?;
+            let (source, destination) = (source.trim(), destination.trim());
+            let wide = name == "movq";
+            let load = mmx_register(destination).is_some();
+            let (other, reg) = if load {
+                (source, mmx(destination)?)
+            } else {
+                (destination, mmx(source)?)
+            };
+            if wide && (mmx_register(other).is_some() || self.is_memory(other)) {
+                return encode_op(Op {
+                    opcode: &[0x0f, if load { 0x6f } else { 0x7f }],
+                    reg,
+                    rm: mmx_rm(other)?,
+                    ..Op::default()
+                });
+            }
+            let (rm, gpr) = self.parse_rm(other, false)?;
+            if let Some(gpr) = gpr
+                && !matches!(gpr.width, 32 | 64)
+            {
+                return Err(bad(format!("{}: operand widths do not match", name)));
+            }
+            return encode_op(Op {
+                opcode: &[0x0f, if load { 0x6e } else { 0x7e }],
+                reg,
+                rm,
+                wide: gpr.is_some_and(|gpr| gpr.width == 64),
+                ..Op::default()
+            });
+        }
+        if let Some((prefix, opcode, to_mmx)) = mmx_convert(name) {
+            let (source, destination) = two()?;
+            let (reg, rm) = if to_mmx {
+                (mmx(destination)?, self.parse_rm(source, true)?.0)
+            } else {
+                let reg = parse_xmm(destination)
+                    .ok_or_else(|| bad(format!("{} writes an xmm register", name)))?;
+                (reg, mmx_rm(source)?)
+            };
+            return encode_op(Op {
+                legacy: prefix_bytes(prefix),
+                opcode: &[0x0f, opcode],
+                reg,
+                rm,
+                ..Op::default()
+            });
+        }
+        match name {
+            "pmovmskb" => {
+                let (source, destination) = two()?;
+                let reg = gpr(destination)
+                    .filter(|reg| matches!(reg.width, 32 | 64) && !reg.high)
+                    .ok_or_else(|| bad("pmovmskb writes a general register".into()))?;
+                encode_op(Op {
+                    opcode: &[0x0f, 0xd7],
+                    reg: reg.num,
+                    rm: Rm::Reg(mmx(source)?),
+                    ..Op::default()
+                })
+            }
+            "maskmovq" => {
+                let (source, destination) = two()?;
+                encode_op(Op {
+                    opcode: &[0x0f, 0xf7],
+                    reg: mmx(destination)?,
+                    rm: Rm::Reg(mmx(source)?),
+                    ..Op::default()
+                })
+            }
+            "movntq" => {
+                let (source, destination) = two()?;
+                if !self.is_memory(destination) {
+                    return Err(bad("movntq stores to memory".into()));
+                }
+                encode_op(Op {
+                    opcode: &[0x0f, 0xe7],
+                    reg: mmx(source)?,
+                    rm: Rm::Mem(self.parse_mem(destination)?),
+                    ..Op::default()
+                })
+            }
+            "pextrw" | "pinsrw" => {
+                let [immediate, other, vector] = operands else {
+                    return Err(bad(format!("{} requires 3 operands", name)));
+                };
+                let immediate = immediate_byte(immediate)?;
+                let insert = name == "pinsrw";
+                let (reg, rm) = if insert {
+                    let (rm, gpr) = self.parse_rm(other, false)?;
+                    if gpr.is_some_and(|gpr| !matches!(gpr.width, 32 | 64) || gpr.high) {
+                        return Err(bad("pinsrw reads a general register".into()));
+                    }
+                    (mmx(vector)?, rm)
+                } else {
+                    let reg = gpr(vector)
+                        .filter(|reg| matches!(reg.width, 32 | 64) && !reg.high)
+                        .ok_or_else(|| bad("pextrw writes a general register".into()))?;
+                    (reg.num, Rm::Reg(mmx(other)?))
+                };
+                encode_op(Op {
+                    opcode: &[0x0f, if insert { 0xc4 } else { 0xc5 }],
+                    reg,
+                    rm,
+                    imm: &[immediate],
+                    ..Op::default()
+                })
+            }
+            _ => {
+                if let [immediate, destination] = operands
+                    && immediate.trim().starts_with('$')
+                    && let Some((group, digit)) = packed_shift_imm(name)
+                    && mmx_packed(name).is_some()
+                {
+                    return encode_op(Op {
+                        opcode: &[0x0f, group],
+                        reg: digit,
+                        rm: Rm::Reg(mmx(destination)?),
+                        imm: &[immediate_byte(immediate)?],
+                        ..Op::default()
+                    });
+                }
+                if let [immediate, source, destination] = operands
+                    && let Some(entry) = (match name {
+                        "pshufw" => Some((1, 0x70)),
+                        "palignr" => packed_sse_imm(name).map(|(_, map, opcode)| (map, opcode)),
+                        _ => None,
+                    })
+                {
+                    return encode_op(Op {
+                        opcode: &escape(entry.0, entry.1),
+                        reg: mmx(destination)?,
+                        rm: mmx_rm(source)?,
+                        imm: &[immediate_byte(immediate)?],
+                        ..Op::default()
+                    });
+                }
+                let (map, opcode) = mmx_packed(name)
+                    .ok_or_else(|| bad(format!("Unsupported MMX operation: {}", name)))?;
+                let (source, destination) = two()?;
+                encode_op(Op {
+                    opcode: &escape(map, opcode),
+                    reg: mmx(destination)?,
+                    rm: mmx_rm(source)?,
+                    ..Op::default()
+                })
+            }
+        }
+    }
+
+    /// A VSIB gather. The AVX2 spelling carries its mask in a vector register
+    /// named first; the AVX-512 spelling drops that operand and takes an
+    /// opmask on the destination instead.
+    fn encode_gather(&self, name: &str, operands: &[String]) -> Result<Encoded, RasError> {
+        let bad = |message: String| RasError::EncodingError(message);
+        let (index_wide, element_wide, opcode) =
+            gather(name).ok_or_else(|| bad(format!("Unsupported instruction: {}", name)))?;
+        let index_shift = u8::from(!index_wide && element_wide);
+        let element_shift = u8::from(index_wide && !element_wide);
+        let (mask_operand, memory, destination) = match operands {
+            [memory, destination] => (None, memory, destination),
+            [mask, memory, destination] => (Some(mask), memory, destination),
+            _ => return Err(bad(format!("{} requires 2 or 3 operands", name))),
+        };
+        let memory = self.parse_mem_mode(memory, true)?;
+        let (index, _, index_len) = memory
+            .vindex
+            .ok_or_else(|| bad(format!("{} requires a vector index", name)))?;
+        if memory.broadcast.is_some() || memory.fs || memory.label.is_some() {
+            return Err(bad(format!("{} takes a plain base and vector index", name)));
+        }
+        let (destination, mask, zeroing) = split_mask(destination)?;
+        if zeroing {
+            return Err(bad(format!("{} takes no zeroing mask", name)));
+        }
+        let (number, element_len) = parse_vreg(destination)
+            .ok_or_else(|| bad(format!("{} writes a vector register", name)))?;
+        let evex = mask_operand.is_none();
+        if evex == (mask == 0) {
+            return Err(bad(format!(
+                "{} takes either a vector mask operand or an opmask",
+                name
+            )));
+        }
+        let vector_mask = mask_operand
+            .map(|mask| {
+                parse_vector(mask)
+                    .ok_or_else(|| bad(format!("{} masks with a vector register", name)))
+            })
+            .transpose()?;
+        let widest = if evex { 2 } else { 1 };
+        let length = (0..=widest)
+            .find(|length: &u8| {
+                index_len == length.saturating_sub(index_shift)
+                    && element_len == length.saturating_sub(element_shift)
+                    && vector_mask.is_none_or(|(_, wide)| wide == (element_len == 1))
+            })
+            .ok_or_else(|| bad(format!("{}: operand sizes do not match", name)))?;
+        if !evex && (index >= 16 || number >= 16) {
+            return Err(bad(format!("{}: registers above 15 need an opmask", name)));
+        }
+        let rm = Rm::Mem(memory);
+        if evex {
+            encode_op(Op {
+                opcode: &[opcode],
+                reg: number,
+                rm,
+                evex: Some(Evex {
+                    map: 2,
+                    pp: 1,
+                    wide: element_wide,
+                    ll: length,
+                    mask,
+                    tuple: Tuple::Fixed(if element_wide { 8 } else { 4 }),
+                    ..Evex::default()
+                }),
+                ..Op::default()
+            })
+        } else {
+            encode_op(Op {
+                opcode: &[opcode],
+                reg: number,
+                rm,
+                vex: Some(Vex {
+                    map: 2,
+                    pp: 1,
+                    wide: element_wide,
+                    len256: length == 1,
+                    vvvv: vector_mask.map_or(0, |(number, _)| number),
+                }),
+                ..Op::default()
+            })
+        }
+    }
+
+    /// An AVX-512 operation. The table entry fixes the prefix fields and the
+    /// operand shape; the operands supply the vector length, the opmask and
+    /// the broadcast, rounding and zeroing decorators.
+    fn encode_evex_packed(
         &self,
-        map: u8,
-        pp: u8,
-        wide: bool,
-        opcode: u8,
+        entry: &EvexEntry,
         operands: &[String],
     ) -> Result<Encoded, RasError> {
-        let [rm, first, reg] = operands else {
-            return Err(RasError::EncodingError(
-                "EVEX arithmetic requires 3 operands".into(),
-            ));
-        };
-        let (rm, rm_wide) = self.parse_vector_rm(rm)?;
-        if matches!(rm, Rm::Mem(_)) {
-            return Err(RasError::EncodingError(
-                "EVEX memory operands are not encoded".into(),
-            ));
+        let bad = |message: String| RasError::EncodingError(message);
+        let mut rest: Vec<&str> = operands.iter().map(|op| op.trim()).collect();
+        let mut rounding = None;
+        if let Some(index) = rest.iter().position(|op| rounding_decorator(op).is_some()) {
+            let (bits, sae_only) = rounding_decorator(rest[index]).unwrap_or((0, false));
+            let allowed = if sae_only {
+                entry.has(SAE) || entry.has(ROUND)
+            } else {
+                entry.has(ROUND)
+            };
+            if !allowed {
+                return Err(bad(format!("{} takes no rounding control", entry.name)));
+            }
+            rounding = Some(bits);
+            rest.remove(index);
         }
-        let (first, first_wide) = parse_vector(first.trim()).ok_or_else(|| {
-            RasError::EncodingError(
-                "EVEX arithmetic: first source must be a vector register".into(),
-            )
-        })?;
-        let (reg, reg_wide) = parse_vector(reg.trim()).ok_or_else(|| {
-            RasError::EncodingError("EVEX arithmetic: destination must be a vector register".into())
-        })?;
-        if rm_wide != first_wide || first_wide != reg_wide {
-            return Err(RasError::EncodingError(
-                "EVEX arithmetic: operand widths differ".into(),
-            ));
+        let expected = match entry.form {
+            VexForm::Rm => 2,
+            VexForm::Nds | VexForm::RmImm | VexForm::ExtractImm | VexForm::ShiftImm => 3,
+            VexForm::NdsImm => 4,
+            VexForm::Is4 => return Err(bad(format!("Unsupported form for {}", entry.name))),
+        };
+        if rest.len() != expected {
+            return Err(bad(format!(
+                "{} requires {} operands",
+                entry.name, expected
+            )));
+        }
+        let mut imm = Vec::new();
+        if entry.takes_imm() {
+            imm.push(immediate_byte(rest[0])?);
+            rest.remove(0);
+        }
+        let shift_group = entry.form == VexForm::ShiftImm;
+        let nds = matches!(entry.form, VexForm::Nds | VexForm::NdsImm);
+        let source = rest[0];
+        let destination = *rest.last().unwrap_or(&source);
+        let (destination, mask, zeroing) = split_mask(destination)?;
+        if mask != 0 && !entry.has(MASK) {
+            return Err(bad(format!("{} takes no write mask", entry.name)));
+        }
+        if zeroing && !entry.has(ZERO) {
+            return Err(bad(format!("{} takes no zeroing mask", entry.name)));
+        }
+        let vector = |text: &str| -> Result<(u8, u8), RasError> {
+            parse_vreg(text).ok_or_else(|| bad(format!("Expected a vector register: {}", text)))
+        };
+        if let Some((opcode, width, wide)) = broadcast_from_general(entry.name)
+            && let Some(register) = gpr(source)
+        {
+            if register.width != width || register.high {
+                return Err(bad(format!(
+                    "{} reads a {}-bit register",
+                    entry.name, width
+                )));
+            }
+            let (number, length) = vector(destination)?;
+            return encode_op(Op {
+                opcode: &[opcode],
+                reg: number,
+                rm: Rm::Reg(register.num),
+                evex: Some(Evex {
+                    map: 2,
+                    pp: 1,
+                    wide,
+                    ll: length,
+                    mask,
+                    zeroing,
+                    tuple: entry.tuple,
+                    ..Evex::default()
+                }),
+                ..Op::default()
+            });
+        }
+        let source_is_memory = self.is_memory(source);
+        let destination_is_memory = self.is_memory(destination);
+        if entry.has(MEMSRC) && !source_is_memory {
+            return Err(bad(format!("{} requires a memory source", entry.name)));
+        }
+        let store = (destination_is_memory && entry.form == VexForm::Rm)
+            .then(|| evex_store(entry.name))
+            .flatten();
+        if destination_is_memory && entry.form != VexForm::ExtractImm && store.is_none() {
+            return Err(bad(format!(
+                "{} requires a register destination",
+                entry.name
+            )));
+        }
+        if destination_is_memory && zeroing {
+            return Err(bad("{z} requires a register destination".into()));
+        }
+        let source_reg = (!source_is_memory).then(|| vector(source)).transpose()?;
+        let destination_reg = if entry.has(KDST) || destination_is_memory {
+            None
+        } else {
+            Some(vector(destination)?)
+        };
+        let first = if shift_group {
+            destination_reg
+        } else {
+            nds.then(|| vector(rest[1])).transpose()?
+        };
+        let mask_dst = entry
+            .has(KDST)
+            .then(|| {
+                mask_register(destination)
+                    .ok_or_else(|| bad(format!("{} writes an opmask register", entry.name)))
+            })
+            .transpose()?;
+        let count = source_is_memory
+            .then(|| self.parse_mem(source).ok().and_then(|mem| mem.broadcast))
+            .flatten();
+        let element: u16 = if entry.wide { 8 } else { 4 };
+        let fits = |length: u8| {
+            let want_src = length.saturating_sub(entry.src_shift);
+            let want_dst = length.saturating_sub(entry.dst_shift);
+            count.is_none_or(|count| u16::from(count) == (16u16 << length) / element)
+                && source_reg.is_none_or(|(_, len)| len == want_src)
+                && destination_reg.is_none_or(|(_, len)| len == want_dst)
+                && first.is_none_or(|(_, len)| len == want_dst)
+        };
+        let length = (0..3)
+            .find(|length| entry.lens & (1 << length) != 0 && fits(*length))
+            .ok_or_else(|| bad(format!("{}: operand sizes do not match", entry.name)))?;
+        let mut rm = if source_is_memory {
+            Rm::Mem(self.parse_mem(source)?)
+        } else {
+            Rm::Reg(source_reg.map_or(0, |(number, _)| number))
+        };
+        let mut reg = if shift_group {
+            entry.digit
+        } else {
+            destination_reg
+                .map(|(number, _)| number)
+                .or(mask_dst)
+                .unwrap_or(0)
+        };
+        if entry.form == VexForm::ExtractImm || store.is_some() {
+            reg = source_reg.map_or(0, |(number, _)| number);
+            rm = if destination_is_memory {
+                Rm::Mem(self.parse_mem(destination)?)
+            } else {
+                Rm::Reg(vector(destination)?.0)
+            };
+        }
+        if let Rm::Mem(memory) = &rm
+            && let Some(count) = memory.broadcast
+        {
+            if !entry.has(BCST) {
+                return Err(bad(format!("{} takes no broadcast", entry.name)));
+            }
+            let want = (16u16 << length) / if entry.wide { 8 } else { 4 };
+            if u16::from(count) != want {
+                return Err(bad(format!(
+                    "{} broadcasts {} elements here",
+                    entry.name, want
+                )));
+            }
+        }
+        let broadcast_memory = matches!(&rm, Rm::Mem(memory) if memory.broadcast.is_some());
+        if rounding.is_some() && (source_is_memory || destination_is_memory) {
+            return Err(bad("Rounding control requires register operands".into()));
+        }
+        let widest = 7 - entry.lens.leading_zeros() as u8;
+        if rounding.is_some() && length != widest {
+            return Err(bad(format!(
+                "{} takes rounding control only at its widest form",
+                entry.name
+            )));
         }
         encode_op(Op {
-            opcode: &[opcode],
+            opcode: &[store.unwrap_or(entry.opcode)],
             reg,
             rm,
+            imm: &imm,
             evex: Some(Evex {
-                map,
-                pp,
-                wide,
-                vvvv: first,
-                ll: u8::from(first_wide),
+                map: entry.map,
+                pp: entry.pp,
+                wide: entry.wide,
+                vvvv: first.map_or(0, |(number, _)| number),
+                ll: rounding.unwrap_or(length),
+                mask,
+                zeroing,
+                broadcast: rounding.is_some() || broadcast_memory,
+                tuple: entry.tuple,
             }),
             ..Op::default()
         })
@@ -811,6 +1303,11 @@ impl X86_64Encoder {
             VexForm::Rm => 2,
             VexForm::Nds | VexForm::RmImm | VexForm::ExtractImm => 3,
             VexForm::NdsImm | VexForm::Is4 => 4,
+            VexForm::ShiftImm => {
+                return Err(RasError::EncodingError(
+                    "VEX shift groups are encoded separately".into(),
+                ));
+            }
         };
         if operands.len() != expected {
             return Err(RasError::EncodingError(format!(
@@ -1278,6 +1775,42 @@ impl InstructionEncoder for X86_64Encoder {
         }
 
         match opcode.as_str() {
+            "emms" | "femms" => {
+                if !inst.operands.is_empty() {
+                    return Err(RasError::EncodingError(format!(
+                        "{} takes no operands",
+                        opcode
+                    )));
+                }
+                code.extend_from_slice(if opcode == "emms" {
+                    &[0x0f, 0x77]
+                } else {
+                    &[0x0f, 0x0e]
+                });
+            }
+            name if mmx_convert(name).is_some()
+                || (mmx_mnemonic(name)
+                    && inst.operands.iter().any(|op| mmx_register(op).is_some())) =>
+            {
+                let enc = self.encode_mmx(name, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            name if gather(name).is_some() => {
+                let enc = self.encode_gather(name, &inst.operands)?;
+                code = self.emit(enc);
+            }
+            name if is_evex_mnemonic(name) && self.needs_evex(name, &inst.operands) => {
+                let is_imm = inst
+                    .operands
+                    .iter()
+                    .find(|op| rounding_decorator(op).is_none())
+                    .is_some_and(|op| op.trim().starts_with('$'));
+                let entry = packed_evex(name, is_imm).ok_or_else(|| {
+                    RasError::EncodingError(format!("Unsupported form of {}", name))
+                })?;
+                let enc = self.encode_evex_packed(entry, &inst.operands)?;
+                code = self.emit(enc);
+            }
             "movq" | "mov" => {
                 if inst.operands.len() != 2 {
                     return Err(RasError::EncodingError(
@@ -2287,6 +2820,14 @@ impl InstructionEncoder for X86_64Encoder {
                                 name
                             )));
                         }
+                        if matches!(name, "vcvtpd2ps" | "vcvtpd2dq" | "vcvttpd2dq")
+                            && inst.operands.first().is_some_and(|op| self.is_memory(op))
+                        {
+                            return Err(RasError::EncodingError(format!(
+                                "{} needs an explicit operand size for a memory source",
+                                name
+                            )));
+                        }
                         if matches!(name, "vlddqu" | "vmovntdqa")
                             && !inst.operands.first().is_some_and(|op| self.is_memory(op))
                         {
@@ -2707,10 +3248,6 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_bmi2_shift(&opcode, &inst.operands)?;
                 code = self.emit(enc);
             }
-            "vpmullq" => {
-                let enc = self.encode_evex_rrm(2, 1, true, 0x40, &inst.operands)?;
-                code = self.emit(enc);
-            }
             // AVX2 per-lane shifts: VEX.128/256.66.0F38.W0/W1 45/46/47 /r.
             "vpsllvd" | "vpsllvq" | "vpsrlvd" | "vpsrlvq" | "vpsravd" => {
                 let op = match opcode.as_str() {
@@ -2872,6 +3409,8 @@ struct Mem {
     label: Option<String>,
     base: Option<u8>,
     index: Option<(u8, u8)>,
+    vindex: Option<(u8, u8, u8)>,
+    broadcast: Option<u8>,
     rip: bool,
     tls: Option<TlsModel>,
 }
@@ -2950,9 +3489,309 @@ impl Vex {
     }
 }
 
-/// The EVEX prefix fields for a register-only 128- or 256-bit instruction.
-/// `ll` is the vector length: 0 for 128 bits, 1 for 256. Registers stay below
-/// 16, so the R' and V' extension bits are always clear.
+/// One AVX-512 form. `lens` is a bit per legal vector length and `flags`
+/// records which decorators the form accepts.
+struct EvexEntry {
+    name: &'static str,
+    map: u8,
+    pp: u8,
+    wide: bool,
+    opcode: u8,
+    digit: u8,
+    form: VexForm,
+    tuple: Tuple,
+    flags: u8,
+    lens: u8,
+    src_shift: u8,
+    dst_shift: u8,
+}
+
+impl EvexEntry {
+    fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn takes_imm(&self) -> bool {
+        matches!(
+            self.form,
+            VexForm::RmImm | VexForm::NdsImm | VexForm::ExtractImm | VexForm::ShiftImm
+        )
+    }
+}
+
+/// The AVX-512 form of a mnemonic. A handful of mnemonics name both an
+/// immediate and a register-controlled operation, so the spelling of the
+/// first operand picks between them.
+fn packed_evex(name: &str, is_imm: bool) -> Option<&'static EvexEntry> {
+    let start = EVEX_TABLE.partition_point(|entry| entry.name < name);
+    EVEX_TABLE[start..]
+        .iter()
+        .take_while(|entry| entry.name == name)
+        .find(|entry| entry.takes_imm() == is_imm)
+}
+
+/// Whether a mnemonic has any AVX-512 form at all.
+fn is_evex_mnemonic(name: &str) -> bool {
+    let start = EVEX_TABLE.partition_point(|entry| entry.name < name);
+    EVEX_TABLE
+        .get(start)
+        .is_some_and(|entry| entry.name == name)
+}
+
+/// The MMX operations written `op mm/m64, mm`. These keep the SSE opcode and
+/// drop the `66` prefix; the operations that only ever existed at 128 bits
+/// are absent.
+const MMX_PACKED: &[&str] = &[
+    "packssdw",
+    "packsswb",
+    "packuswb",
+    "paddb",
+    "paddd",
+    "paddq",
+    "paddsb",
+    "paddsw",
+    "paddusb",
+    "paddusw",
+    "paddw",
+    "pand",
+    "pandn",
+    "pavgb",
+    "pavgw",
+    "pcmpeqb",
+    "pcmpeqd",
+    "pcmpeqw",
+    "pcmpgtb",
+    "pcmpgtd",
+    "pcmpgtw",
+    "pmaddwd",
+    "pmaxsw",
+    "pmaxub",
+    "pminsw",
+    "pminub",
+    "pmulhuw",
+    "pmulhw",
+    "pmullw",
+    "pmuludq",
+    "por",
+    "psadbw",
+    "pslld",
+    "psllq",
+    "psllw",
+    "psrad",
+    "psraw",
+    "psrld",
+    "psrlq",
+    "psrlw",
+    "psubb",
+    "psubd",
+    "psubq",
+    "psubsb",
+    "psubsw",
+    "psubusb",
+    "psubusw",
+    "psubw",
+    "punpckhbw",
+    "punpckhdq",
+    "punpckhwd",
+    "punpcklbw",
+    "punpckldq",
+    "punpcklwd",
+    "pxor",
+    "pabsb",
+    "pabsd",
+    "pabsw",
+    "phaddd",
+    "phaddsw",
+    "phaddw",
+    "phsubd",
+    "phsubsw",
+    "phsubw",
+    "pmaddubsw",
+    "pmulhrsw",
+    "pshufb",
+    "psignb",
+    "psignd",
+    "psignw",
+];
+
+/// An MMX operation written `op mm/m64, mm`, as `(opcode map, opcode byte)`.
+fn mmx_packed(name: &str) -> Option<(u8, u8)> {
+    if !MMX_PACKED.contains(&name) {
+        return None;
+    }
+    packed_sse(name).map(|(_, map, opcode)| (map, opcode))
+}
+
+/// The MMX conversions between a vector register and an MMX register, as
+/// `(legacy prefix, opcode, the MMX register is the destination)`.
+fn mmx_convert(name: &str) -> Option<(u8, u8, bool)> {
+    match name {
+        "cvtpi2ps" => Some((0, 0x2a, false)),
+        "cvtps2pi" => Some((0, 0x2d, true)),
+        "cvttps2pi" => Some((0, 0x2c, true)),
+        "cvtpi2pd" => Some((0x66, 0x2a, false)),
+        "cvtpd2pi" => Some((0x66, 0x2d, true)),
+        "cvttpd2pi" => Some((0x66, 0x2c, true)),
+        _ => None,
+    }
+}
+
+/// Whether a mnemonic has any MMX form.
+fn mmx_mnemonic(name: &str) -> bool {
+    mmx_packed(name).is_some()
+        || mmx_convert(name).is_some()
+        || matches!(
+            name,
+            "movq"
+                | "movd"
+                | "pshufw"
+                | "palignr"
+                | "pmovmskb"
+                | "maskmovq"
+                | "movntq"
+                | "pextrw"
+                | "pinsrw"
+        )
+}
+
+/// The AVX-512 broadcasts that take their source in a general register, as
+/// `(opcode, register width, W)`.
+fn broadcast_from_general(name: &str) -> Option<(u8, u8, bool)> {
+    match name {
+        "vpbroadcastb" => Some((0x7a, 32, false)),
+        "vpbroadcastw" => Some((0x7b, 32, false)),
+        "vpbroadcastd" => Some((0x7c, 32, false)),
+        "vpbroadcastq" => Some((0x7c, 64, true)),
+        _ => None,
+    }
+}
+
+/// A VSIB gather, as `(64-bit index, 64-bit element, opcode byte)`. The
+/// mnemonic spells the index size first and the gathered element second.
+fn gather(name: &str) -> Option<(bool, bool, u8)> {
+    let rest = name.strip_prefix('v')?;
+    let (integer, rest) = match rest.strip_prefix("pgather") {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix("gather")?),
+    };
+    let (index_wide, rest) = match rest.strip_prefix('d') {
+        Some(rest) => (false, rest),
+        None => (true, rest.strip_prefix('q')?),
+    };
+    let element_wide = match (integer, rest) {
+        (true, "d") | (false, "ps") => false,
+        (true, "q") | (false, "pd") => true,
+        _ => return None,
+    };
+    let opcode = if integer { 0x90 } else { 0x92 } + u8::from(index_wide);
+    Some((index_wide, element_wide, opcode))
+}
+
+/// Whether a mnemonic has a VEX spelling for this operand shape, which
+/// decides whether operands that do not demand EVEX may still take it.
+fn vex_form_exists(name: &str, is_imm: bool) -> bool {
+    if packed_vex_permil(name, is_imm).is_some() {
+        return true;
+    }
+    if let Some((_, _, _, _, form)) = packed_vex(name)
+        && matches!(form, VexForm::RmImm | VexForm::NdsImm | VexForm::ExtractImm) == is_imm
+    {
+        return true;
+    }
+    if is_imm {
+        return vex_shift_imm(name).is_some();
+    }
+    fma(name).is_some()
+        || mask_move(name).is_some()
+        || matches!(
+            name,
+            "vmovaps"
+                | "vmovups"
+                | "vmovapd"
+                | "vmovupd"
+                | "vmovdqa"
+                | "vmovdqu"
+                | "vpsllvd"
+                | "vpsllvq"
+                | "vpsrlvd"
+                | "vpsrlvq"
+                | "vpsravd"
+        )
+}
+
+/// The store opcode of an AVX-512 move, for the spelling that names memory
+/// as the destination.
+fn evex_store(name: &str) -> Option<u8> {
+    match name {
+        "vmovaps" | "vmovapd" => Some(0x29),
+        "vmovups" | "vmovupd" => Some(0x11),
+        "vmovdqa32" | "vmovdqa64" | "vmovdqu8" | "vmovdqu16" | "vmovdqu32" | "vmovdqu64" => {
+            Some(0x7f)
+        }
+        _ => None,
+    }
+}
+
+/// An `{er}` or `{sae}` operand, as the `L'L` bits it writes and whether it
+/// suppresses exceptions only.
+fn rounding_decorator(op: &str) -> Option<(u8, bool)> {
+    match op.trim() {
+        "{rn-sae}" => Some((0, false)),
+        "{rd-sae}" => Some((1, false)),
+        "{ru-sae}" => Some((2, false)),
+        "{rz-sae}" => Some((3, false)),
+        "{sae}" => Some((0, true)),
+        _ => None,
+    }
+}
+
+/// A destination split from its `{%k}` and `{z}` decorators.
+fn split_mask(op: &str) -> Result<(&str, u8, bool), RasError> {
+    let mut base = op.trim();
+    let mut zeroing = false;
+    if let Some(rest) = base.strip_suffix("{z}") {
+        zeroing = true;
+        base = rest.trim_end();
+    }
+    let mut mask = 0;
+    if base.ends_with('}') {
+        let open = base
+            .rfind('{')
+            .ok_or_else(|| RasError::EncodingError(format!("Malformed decorator: {}", op)))?;
+        mask = mask_register(&base[open + 1..base.len() - 1]).ok_or_else(|| {
+            RasError::EncodingError(format!("Expected an opmask register: {}", op))
+        })?;
+        if mask == 0 {
+            return Err(RasError::EncodingError(
+                "%k0 cannot be used as a write mask".into(),
+            ));
+        }
+        base = base[..open].trim_end();
+    }
+    if zeroing && mask == 0 {
+        return Err(RasError::EncodingError("{z} requires a write mask".into()));
+    }
+    if base.contains('{') && !base.contains("{1to") {
+        return Err(RasError::EncodingError(format!(
+            "Malformed decorator: {}",
+            op
+        )));
+    }
+    Ok((base, mask, zeroing))
+}
+
+/// How an EVEX instruction scales a one-byte displacement. The scale is the
+/// size of the memory the instruction actually touches, which depends on the
+/// tuple type, the vector length and, for the broadcast forms, on W.
+#[derive(Clone, Copy, PartialEq)]
+enum Tuple {
+    Scaled(u8),
+    Fixed(u8),
+    Movddup,
+}
+
+/// The EVEX prefix fields. `ll` is the vector length, 0 for 128 bits through
+/// 2 for 512, or the rounding mode when `broadcast` carries `{er}`/`{sae}`.
 #[derive(Clone, Copy)]
 struct Evex {
     map: u8,
@@ -2960,20 +3799,68 @@ struct Evex {
     wide: bool,
     vvvv: u8,
     ll: u8,
+    mask: u8,
+    zeroing: bool,
+    broadcast: bool,
+    tuple: Tuple,
+}
+
+impl Default for Evex {
+    fn default() -> Self {
+        Self {
+            map: 1,
+            pp: 0,
+            wide: false,
+            vvvv: 0,
+            ll: 0,
+            mask: 0,
+            zeroing: false,
+            broadcast: false,
+            tuple: Tuple::Scaled(1),
+        }
+    }
 }
 
 impl Evex {
-    fn emit(self, reg: u8, rex_x: u8, rex_b: u8, bytes: &mut Vec<u8>) {
+    /// The displacement scale, `N` in the SDM's disp8*N.
+    fn disp_scale(self, broadcast: bool) -> i64 {
+        let vl: i64 = 16 << self.ll;
+        if broadcast {
+            return if self.wide { 8 } else { 4 };
+        }
+        match self.tuple {
+            Tuple::Scaled(divisor) => vl / i64::from(divisor),
+            Tuple::Fixed(size) => i64::from(size),
+            Tuple::Movddup => {
+                if self.ll == 0 {
+                    8
+                } else {
+                    vl
+                }
+            }
+        }
+    }
+
+    fn emit(self, reg: u8, rex_x: u8, rex_b: u8, v_high: u8, bytes: &mut Vec<u8>) {
+        let rex_r = (reg >> 3) & 1;
+        let r_prime = (reg >> 4) & 1;
+        let v_prime = ((self.vvvv >> 4) & 1) | v_high;
         bytes.push(0x62);
         bytes.push(
-            ((1 - ((reg >> 3) & 1)) << 7)
+            ((1 - rex_r) << 7)
                 | ((1 - rex_x) << 6)
                 | ((1 - rex_b) << 5)
-                | (1 << 4)
+                | ((1 - r_prime) << 4)
                 | self.map,
         );
         bytes.push((u8::from(self.wide) << 7) | ((!self.vvvv & 15) << 3) | 0b100 | self.pp);
-        bytes.push((self.ll << 5) | (1 << 3));
+        bytes.push(
+            (u8::from(self.zeroing) << 7)
+                | (self.ll << 5)
+                | (u8::from(self.broadcast) << 4)
+                | ((1 - v_prime) << 3)
+                | self.mask,
+        );
     }
 }
 
@@ -2981,14 +3868,23 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     let mut tail = Vec::new();
     let mut rex_x = 0;
     let mut rex_b = 0;
+    let mut v_high = 0;
     let reg_field = (op.reg & 7) << 3;
     let mut seg = false;
     let mut disp_field = None;
     let mut tls = None;
+    let mut broadcast = false;
     match &op.rm {
         Rm::Reg(number) => {
             tail.push(0xc0 | reg_field | (number & 7));
-            rex_b = number >> 3;
+            rex_b = (number >> 3) & 1;
+            if op.evex.is_some() {
+                rex_x = (number >> 4) & 1;
+            } else if number >> 3 > 1 {
+                return Err(RasError::EncodingError(
+                    "Register requires an EVEX encoding".into(),
+                ));
+            }
         }
         Rm::Mem(mem) if mem.rip => {
             tail.push(reg_field | 5);
@@ -2999,11 +3895,29 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
         Rm::Mem(mem) => {
             seg = mem.fs;
             tls = mem.tls;
-            if let Some((index, _)) = mem.index {
+            broadcast = mem.broadcast.is_some();
+            if let Some((index, _, _)) = mem.vindex {
+                rex_x = (index >> 3) & 1;
+                v_high = (index >> 4) & 1;
+                if v_high == 1 && op.evex.is_none() {
+                    return Err(RasError::EncodingError(
+                        "Vector index requires an EVEX encoding".into(),
+                    ));
+                }
+            } else if let Some((index, _)) = mem.index {
                 rex_x = index >> 3;
             }
-            let index_field = mem.index.map_or(4, |(index, _)| index & 7);
-            let scale = mem.index.map_or(0, |(_, bits)| bits);
+            let index_field = match (mem.vindex, mem.index) {
+                (Some((index, _, _)), _) => index & 7,
+                (None, Some((index, _))) => index & 7,
+                _ => 4,
+            };
+            let scale = match (mem.vindex, mem.index) {
+                (Some((_, bits, _)), _) => bits,
+                (None, Some((_, bits))) => bits,
+                _ => 0,
+            };
+            let scale_n = op.evex.map_or(1, |evex| evex.disp_scale(broadcast)).max(1);
             match mem.base {
                 None => {
                     tail.push(reg_field | 4);
@@ -3013,12 +3927,13 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
                 }
                 Some(base) => {
                     rex_b = base >> 3;
-                    let need_sib = mem.index.is_some() || base & 7 == 4;
+                    let need_sib = mem.index.is_some() || mem.vindex.is_some() || base & 7 == 4;
+                    let scaled = (mem.disp % scale_n == 0).then(|| mem.disp / scale_n);
                     let mode = if mem.tls.is_some() {
                         2
                     } else if mem.disp == 0 && base & 7 != 5 {
                         0
-                    } else if i8::try_from(mem.disp).is_ok() {
+                    } else if scaled.is_some_and(|value| i8::try_from(value).is_ok()) {
                         1
                     } else {
                         2
@@ -3029,7 +3944,7 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
                         tail.push((scale << 6) | (index_field << 3) | (base & 7));
                     }
                     match mode {
-                        1 => tail.push(mem.disp as u8),
+                        1 => tail.push(scaled.unwrap_or(mem.disp) as u8),
                         2 => {
                             disp_field = tls.map(|_| tail.len());
                             tail.extend_from_slice(&disp32(mem.disp)?);
@@ -3044,8 +3959,9 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     if seg {
         bytes.push(0x64);
     }
-    if let Some(evex) = op.evex {
-        evex.emit(op.reg, rex_x, rex_b, &mut bytes);
+    if let Some(mut evex) = op.evex {
+        evex.broadcast |= broadcast;
+        evex.emit(op.reg, rex_x, rex_b, v_high, &mut bytes);
     } else if let Some(vex) = op.vex {
         vex.emit(op.reg >> 3, rex_x, rex_b, &mut bytes);
     } else {
@@ -3081,6 +3997,7 @@ fn immediate_byte(operand: &str) -> Result<u8, RasError> {
         .map(parse_imm)
         .ok_or_else(|| RasError::EncodingError("Expected an immediate operand".into()))??;
     u8::try_from(value)
+        .or_else(|_| i8::try_from(value).map(|narrow| narrow as u8))
         .map_err(|_| RasError::EncodingError(format!("Immediate out of range: {}", value)))
 }
 
@@ -3100,6 +4017,9 @@ enum VexForm {
     /// `op $imm, src, dst` with the source in `reg` and the destination in
     /// `r/m`, as the 128-bit lane extracts are written.
     ExtractImm,
+    /// `op $imm, src, dst` with the source in `r/m`, the destination in
+    /// `vvvv` and a fixed digit in `reg`, as the shift groups are written.
+    ShiftImm,
 }
 
 /// Forms whose VEX encoding leaves `vvvv` unused, so the AT&T spelling keeps
@@ -3877,18 +4797,80 @@ fn parse_xmm(s: &str) -> Option<u8> {
 
 /// A vector register of either width, as its number and whether it is 256-bit.
 fn parse_vector(s: &str) -> Option<(u8, bool)> {
-    let s = s.trim_start_matches('%');
-    let (rest, len256) = match s.strip_prefix("ymm") {
-        Some(rest) => (rest, true),
-        None => (s.strip_prefix("xmm")?, false),
+    match parse_vreg(s) {
+        Some((n, len)) if n < 16 && len < 2 => Some((n, len == 1)),
+        _ => None,
+    }
+}
+
+/// Any vector register, as its number and its length class: 0 for `xmm`,
+/// 1 for `ymm`, 2 for `zmm`.
+fn parse_vreg(s: &str) -> Option<(u8, u8)> {
+    let s = s.trim().trim_start_matches('%');
+    let (rest, len) = if let Some(rest) = s.strip_prefix("zmm") {
+        (rest, 2u8)
+    } else if let Some(rest) = s.strip_prefix("ymm") {
+        (rest, 1)
+    } else {
+        (s.strip_prefix("xmm")?, 0)
     };
+    if rest.len() > 1 && rest.starts_with('0') {
+        return None;
+    }
     let n: u8 = rest.parse().ok()?;
-    if n < 16 { Some((n, len256)) } else { None }
+    if n < 32 { Some((n, len)) } else { None }
+}
+
+/// An opmask register `%k0` through `%k7`.
+fn mask_register(s: &str) -> Option<u8> {
+    let rest = s.trim().trim_start_matches('%').strip_prefix('k')?;
+    if rest.len() != 1 {
+        return None;
+    }
+    let n: u8 = rest.parse().ok()?;
+    if n < 8 { Some(n) } else { None }
+}
+
+/// An MMX register `%mm0` through `%mm7`.
+fn mmx_register(s: &str) -> Option<u8> {
+    let rest = s.trim().trim_start_matches('%').strip_prefix("mm")?;
+    if rest.len() != 1 {
+        return None;
+    }
+    let n: u8 = rest.parse().ok()?;
+    if n < 8 { Some(n) } else { None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evex_table_is_searchable() {
+        assert!(
+            EVEX_TABLE
+                .windows(2)
+                .all(|pair| pair[0].name <= pair[1].name),
+            "EVEX_TABLE must be sorted by mnemonic"
+        );
+        for (index, entry) in EVEX_TABLE.iter().enumerate() {
+            assert!(entry.lens != 0, "{} has no vector length", entry.name);
+            assert!(
+                !EVEX_TABLE[index + 1..]
+                    .iter()
+                    .take_while(|other| other.name == entry.name)
+                    .any(|other| other.takes_imm() == entry.takes_imm()),
+                "{} is listed twice for the same operand shape",
+                entry.name
+            );
+            assert_eq!(
+                packed_evex(entry.name, entry.takes_imm()).map(|found| found.opcode),
+                Some(entry.opcode),
+                "{} is not reachable",
+                entry.name
+            );
+        }
+    }
 
     /// Expected bytes come from GNU as.
     #[test]
