@@ -87,6 +87,8 @@ pub trait ObjectWriter {
 
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_SECTION_HEADER_SIZE: usize = 64;
+const ELF32_HEADER_SIZE: usize = 52;
+const ELF32_SECTION_HEADER_SIZE: usize = 40;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ET_REL: u16 = 1;
 const EM_X86_64: u16 = 62;
@@ -103,6 +105,8 @@ const SHF_INFO_LINK: u64 = 0x40;
 const SHF_TLS: u64 = 0x400;
 const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
+const ELF32_SYM_SIZE: u64 = 16;
+const ELF32_RELA_SIZE: u64 = 12;
 const STB_GLOBAL: u8 = 1;
 const STT_TLS: u8 = 6;
 
@@ -118,46 +122,47 @@ fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     }
 }
 
-fn write_elf64_header_with_shnum<W: Write>(
+fn write_elf_header_with_shnum<W: Write>(
     w: &mut W,
+    class32: bool,
     e_machine: u16,
     e_shnum: u16,
     e_shstrndx: u16,
 ) -> Result<(), RasError> {
+    let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
     let mut e_ident = [0u8; 16];
     e_ident[0..4].copy_from_slice(&ELF_MAGIC);
-    e_ident[4] = 2;
+    e_ident[4] = if class32 { 1 } else { 2 };
     e_ident[5] = 1;
     e_ident[6] = 1;
-    w.write_all(&e_ident)
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&ET_REL.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&e_machine.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&1u32.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u64.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u64.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&(ELF64_HEADER_SIZE as u64).to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
+    w.write_all(&e_ident).map_err(map)?;
+    w.write_all(&ET_REL.to_le_bytes()).map_err(map)?;
+    w.write_all(&e_machine.to_le_bytes()).map_err(map)?;
+    w.write_all(&1u32.to_le_bytes()).map_err(map)?;
+    let (header_size, shdr_size) = if class32 {
+        (ELF32_HEADER_SIZE, ELF32_SECTION_HEADER_SIZE)
+    } else {
+        (ELF64_HEADER_SIZE, ELF64_SECTION_HEADER_SIZE)
+    };
+    if class32 {
+        for value in [0u32, 0, header_size as u32] {
+            w.write_all(&value.to_le_bytes()).map_err(map)?;
+        }
+    } else {
+        for value in [0u64, 0, header_size as u64] {
+            w.write_all(&value.to_le_bytes()).map_err(map)?;
+        }
+    }
     let e_flags: u32 = if e_machine == EM_PPC64 { 2 } else { 0 };
-    w.write_all(&e_flags.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&64u16.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u16.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&0u16.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&64u16.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&e_shnum.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
-    w.write_all(&e_shstrndx.to_le_bytes())
-        .map_err(|e| RasError::ObjectError(format!("ELF write: {}", e)))?;
+    w.write_all(&e_flags.to_le_bytes()).map_err(map)?;
+    w.write_all(&(header_size as u16).to_le_bytes())
+        .map_err(map)?;
+    w.write_all(&0u16.to_le_bytes()).map_err(map)?;
+    w.write_all(&0u16.to_le_bytes()).map_err(map)?;
+    w.write_all(&(shdr_size as u16).to_le_bytes())
+        .map_err(map)?;
+    w.write_all(&e_shnum.to_le_bytes()).map_err(map)?;
+    w.write_all(&e_shstrndx.to_le_bytes()).map_err(map)?;
     Ok(())
 }
 
@@ -176,22 +181,36 @@ struct Elf64SectionHeader {
     entsize: u64,
 }
 
-fn write_elf64_section_header_full<W: Write>(
+fn write_elf_section_header_full<W: Write>(
     w: &mut W,
+    class32: bool,
     header: &Elf64SectionHeader,
 ) -> Result<(), RasError> {
     let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
     w.write_all(&header.name.to_le_bytes()).map_err(map)?;
     w.write_all(&header.section_type.to_le_bytes())
         .map_err(map)?;
-    w.write_all(&header.flags.to_le_bytes()).map_err(map)?;
-    w.write_all(&0u64.to_le_bytes()).map_err(map)?; // sh_addr
-    w.write_all(&header.offset.to_le_bytes()).map_err(map)?;
-    w.write_all(&header.size.to_le_bytes()).map_err(map)?;
+    let wide = [header.flags, 0, header.offset, header.size];
+    if class32 {
+        for value in wide {
+            w.write_all(&(value as u32).to_le_bytes()).map_err(map)?;
+        }
+    } else {
+        for value in wide {
+            w.write_all(&value.to_le_bytes()).map_err(map)?;
+        }
+    }
     w.write_all(&header.link.to_le_bytes()).map_err(map)?;
     w.write_all(&header.info.to_le_bytes()).map_err(map)?;
-    w.write_all(&header.addralign.to_le_bytes()).map_err(map)?;
-    w.write_all(&header.entsize.to_le_bytes()).map_err(map)?;
+    if class32 {
+        w.write_all(&(header.addralign as u32).to_le_bytes())
+            .map_err(map)?;
+        w.write_all(&(header.entsize as u32).to_le_bytes())
+            .map_err(map)?;
+    } else {
+        w.write_all(&header.addralign.to_le_bytes()).map_err(map)?;
+        w.write_all(&header.entsize.to_le_bytes()).map_err(map)?;
+    }
     Ok(())
 }
 
@@ -232,23 +251,28 @@ fn elf_visibility(attributes: &crate::parser::SymbolAttributes) -> u8 {
     }
 }
 
-fn write_elf64_symbol<W: Write>(
+fn write_elf_symbol<W: Write>(
     w: &mut W,
+    class32: bool,
     name_offset: u32,
-    bind: u8,
-    sym_type: u8,
+    info: u8,
     visibility: u8,
     section_index: u16,
     value: u64,
 ) -> Result<(), RasError> {
     let map = |e: std::io::Error| RasError::ObjectError(format!("ELF write: {}", e));
     w.write_all(&name_offset.to_le_bytes()).map_err(map)?;
-    w.write_all(&[(bind << 4) | (sym_type & 0xf)])
-        .map_err(map)?;
-    w.write_all(&[visibility]).map_err(map)?;
-    w.write_all(&section_index.to_le_bytes()).map_err(map)?;
-    w.write_all(&value.to_le_bytes()).map_err(map)?;
-    w.write_all(&0u64.to_le_bytes()).map_err(map)?; // st_size
+    if class32 {
+        w.write_all(&(value as u32).to_le_bytes()).map_err(map)?;
+        w.write_all(&0u32.to_le_bytes()).map_err(map)?;
+        w.write_all(&[info, visibility]).map_err(map)?;
+        w.write_all(&section_index.to_le_bytes()).map_err(map)?;
+    } else {
+        w.write_all(&[info, visibility]).map_err(map)?;
+        w.write_all(&section_index.to_le_bytes()).map_err(map)?;
+        w.write_all(&value.to_le_bytes()).map_err(map)?;
+        w.write_all(&0u64.to_le_bytes()).map_err(map)?;
+    }
     Ok(())
 }
 
@@ -270,6 +294,18 @@ impl ObjectWriter for ElfWriter {
     fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
         let machine = elf64_e_machine(req.target_arch)
             .ok_or_else(|| RasError::ObjectError("Unsupported ELF architecture".into()))?;
+        let class32 = matches!(req.target_arch, TargetArchitecture::Riscv32);
+        let sym_size = if class32 {
+            ELF32_SYM_SIZE
+        } else {
+            ELF64_SYM_SIZE
+        };
+        let rela_size = if class32 {
+            ELF32_RELA_SIZE
+        } else {
+            ELF64_RELA_SIZE
+        };
+        let table_align = if class32 { 4 } else { 8 };
         let mut sections = req.sections.to_vec();
         if sections.is_empty() {
             sections.push(Section {
@@ -325,7 +361,7 @@ impl ObjectWriter for ElfWriter {
             })
             .collect();
         let mut strtab = vec![0];
-        let mut symtab = vec![0; ELF64_SYM_SIZE as usize];
+        let mut symtab = vec![0; sym_size as usize];
         let mut sym_indices = std::collections::HashMap::new();
         let mut object_symbols = req.symbols.to_vec();
         for section in &sections {
@@ -395,9 +431,9 @@ impl ObjectWriter for ElfWriter {
                     RasError::ObjectError(format!("Unknown relocation section: {}", reloc.symbol))
                 })?
                 + 1;
-            let index = symtab.len() / ELF64_SYM_SIZE as usize;
+            let index = symtab.len() / sym_size as usize;
             section_symbols.insert(reloc.symbol.as_str(), index as u32);
-            write_elf64_symbol(&mut symtab, 0, 0, 3, 0, section as u16, 0)?;
+            write_elf_symbol(&mut symtab, class32, 0, 3, 0, section as u16, 0)?;
         }
         for reloc in req.relocations {
             let Some(symbol) = omitted.get(reloc.symbol.as_str()) else {
@@ -417,16 +453,16 @@ impl ObjectWriter for ElfWriter {
                     RasError::ObjectError(format!("Unknown symbol section: {}", symbol.section))
                 })?
                 + 1;
-            let index = symtab.len() / ELF64_SYM_SIZE as usize;
+            let index = symtab.len() / sym_size as usize;
             section_symbols.insert(symbol.section.as_str(), index as u32);
-            write_elf64_symbol(&mut symtab, 0, 0, 3, 0, section as u16, 0)?;
+            write_elf_symbol(&mut symtab, class32, 0, 3, 0, section as u16, 0)?;
         }
         let mut defined: Vec<_> = object_symbols
             .iter()
             .filter(|s| !omitted.contains_key(s.name.as_str()))
             .collect();
         defined.sort_by_key(|s| s.global || s.attributes.weak);
-        let first_global = (symtab.len() / ELF64_SYM_SIZE as usize) as u32
+        let first_global = (symtab.len() / sym_size as usize) as u32
             + defined
                 .iter()
                 .filter(|s| !s.global && !s.attributes.weak)
@@ -437,7 +473,7 @@ impl ObjectWriter for ElfWriter {
             .map(|s| s.name.as_str())
             .collect();
         for sym in defined {
-            let index = symtab.len() / ELF64_SYM_SIZE as usize;
+            let index = symtab.len() / sym_size as usize;
             sym_indices.insert(sym.name.as_str(), index as u32);
             let name = strtab.len() as u32;
             strtab.extend_from_slice(sym.name.as_bytes());
@@ -457,19 +493,20 @@ impl ObjectWriter for ElfWriter {
                     })?
                     + 1
             };
-            write_elf64_symbol(
+            write_elf_symbol(
                 &mut symtab,
+                class32,
                 name,
-                if sym.attributes.weak {
+                (if sym.attributes.weak {
                     2
                 } else {
                     u8::from(sym.global)
-                },
-                if tls_sections.contains(sym.section.as_str()) {
-                    STT_TLS
-                } else {
-                    sym.attributes.symbol_type
-                },
+                } << 4)
+                    | (if tls_sections.contains(sym.section.as_str()) {
+                        STT_TLS
+                    } else {
+                        sym.attributes.symbol_type
+                    } & 0xf),
                 elf_visibility(&sym.attributes)
                     | elf_local_entry(&sym.attributes, req.target_arch)?,
                 section as u16,
@@ -492,12 +529,12 @@ impl ObjectWriter for ElfWriter {
             {
                 sym_indices.insert(
                     reloc.symbol.as_str(),
-                    (symtab.len() / ELF64_SYM_SIZE as usize) as u32,
+                    (symtab.len() / sym_size as usize) as u32,
                 );
                 let name = strtab.len() as u32;
                 strtab.extend_from_slice(reloc.symbol.as_bytes());
                 strtab.push(0);
-                write_elf64_symbol(&mut symtab, name, STB_GLOBAL, 0, 0, 0, 0)?;
+                write_elf_symbol(&mut symtab, class32, name, STB_GLOBAL << 4, 0, 0, 0)?;
             }
         }
         let mut groups: std::collections::BTreeMap<&str, Vec<u32>> =
@@ -511,7 +548,11 @@ impl ObjectWriter for ElfWriter {
         for (i, section) in sections.iter().enumerate() {
             let mut bytes = Vec::new();
             for r in req.relocations.iter().filter(|r| r.section == section.name) {
-                bytes.extend_from_slice(&(r.offset as u64).to_le_bytes());
+                if class32 {
+                    bytes.extend_from_slice(&(r.offset as u32).to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&(r.offset as u64).to_le_bytes());
+                }
                 let (index, addend) = if r.section_symbol {
                     (section_symbols[r.symbol.as_str()], r.addend)
                 } else if let Some(symbol) = omitted.get(r.symbol.as_str()) {
@@ -522,9 +563,18 @@ impl ObjectWriter for ElfWriter {
                 } else {
                     (sym_indices[r.symbol.as_str()], r.addend)
                 };
-                let info = (u64::from(index) << 32) | u64::from(r.kind);
-                bytes.extend_from_slice(&info.to_le_bytes());
-                bytes.extend_from_slice(&addend.to_le_bytes());
+                if class32 {
+                    let info = (index << 8) | (r.kind & 0xff);
+                    bytes.extend_from_slice(&info.to_le_bytes());
+                    let addend = i32::try_from(addend).map_err(|_| {
+                        RasError::ObjectError(format!("Relocation addend {addend} is not 32-bit"))
+                    })?;
+                    bytes.extend_from_slice(&addend.to_le_bytes());
+                } else {
+                    let info = (u64::from(index) << 32) | u64::from(r.kind);
+                    bytes.extend_from_slice(&info.to_le_bytes());
+                    bytes.extend_from_slice(&addend.to_le_bytes());
+                }
             }
             if !bytes.is_empty() {
                 if let Some(signature) = &section.group {
@@ -540,8 +590,8 @@ impl ObjectWriter for ElfWriter {
                     section_type: SHT_RELA,
                     flags: SHF_INFO_LINK | if section.group.is_some() { 0x200 } else { 0 },
                     info: (i + 1) as u32,
-                    addralign: 8,
-                    entsize: ELF64_RELA_SIZE,
+                    addralign: table_align,
+                    entsize: rela_size,
                     ..Default::default()
                 });
             }
@@ -549,7 +599,8 @@ impl ObjectWriter for ElfWriter {
         let mut group_sections = Vec::new();
         for (signature, members) in groups {
             if !req.symbols.iter().any(|s| s.name == signature) {
-                let offset = sym_indices[signature] as usize * ELF64_SYM_SIZE as usize + 6;
+                let offset = sym_indices[signature] as usize * sym_size as usize
+                    + if class32 { 14 } else { 6 };
                 symtab[offset..offset + 2]
                     .copy_from_slice(&((headers.len() + 1) as u16).to_le_bytes());
             }
@@ -581,8 +632,8 @@ impl ObjectWriter for ElfWriter {
             section_type: SHT_SYMTAB,
             link: (symtab_index + 1) as u32,
             info: first_global,
-            addralign: 8,
-            entsize: ELF64_SYM_SIZE,
+            addralign: table_align,
+            entsize: sym_size,
             ..Default::default()
         });
         names.push(".strtab".into());
@@ -613,7 +664,12 @@ impl ObjectWriter for ElfWriter {
                 + 1;
         }
         data.push(shstrtab);
-        let mut offset = ELF64_HEADER_SIZE + (headers.len() + 1) * ELF64_SECTION_HEADER_SIZE;
+        let (header_size, shdr_size) = if class32 {
+            (ELF32_HEADER_SIZE, ELF32_SECTION_HEADER_SIZE)
+        } else {
+            (ELF64_HEADER_SIZE, ELF64_SECTION_HEADER_SIZE)
+        };
+        let mut offset = header_size + (headers.len() + 1) * shdr_size;
         let mut payload = Vec::new();
         for (header, bytes) in headers.iter_mut().zip(data) {
             let padding = (header.addralign as usize - offset % header.addralign as usize)
@@ -628,15 +684,16 @@ impl ObjectWriter for ElfWriter {
             }
         }
         let mut f: Vec<u8> = Vec::new();
-        write_elf64_header_with_shnum(
+        write_elf_header_with_shnum(
             &mut f,
+            class32,
             machine,
             (headers.len() + 1) as u16,
             headers.len() as u16,
         )?;
-        write_elf64_section_header_full(&mut f, &Elf64SectionHeader::default())?;
+        write_elf_section_header_full(&mut f, class32, &Elf64SectionHeader::default())?;
         for header in headers {
-            write_elf64_section_header_full(&mut f, &header)?;
+            write_elf_section_header_full(&mut f, class32, &header)?;
         }
         f.write_all(&payload)
             .map_err(|e| RasError::ObjectError(e.to_string()))?;

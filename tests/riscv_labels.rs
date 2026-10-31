@@ -21,6 +21,39 @@ fn section(bytes: &[u8], wanted: &str) -> Vec<u8> {
     panic!("Missing {wanted}")
 }
 
+fn section32(bytes: &[u8], wanted: &str) -> Vec<u8> {
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let headers = u32_at(32);
+    let count = u16::from_le_bytes(bytes[48..50].try_into().unwrap()) as usize;
+    let strings = u16::from_le_bytes(bytes[50..52].try_into().unwrap()) as usize;
+    let names = &bytes[u32_at(headers + strings * 40 + 16)..];
+    let wanted = format!("{wanted}\0");
+    for i in 1..count {
+        let h = headers + i * 40;
+        let name = u32_at(h) as usize;
+        if names[name..].starts_with(wanted.as_bytes()) {
+            return bytes[u32_at(h + 16)..u32_at(h + 16) + u32_at(h + 20)].to_vec();
+        }
+    }
+    panic!("Missing {wanted}")
+}
+
+fn entsize32(bytes: &[u8], wanted: &str) -> u32 {
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let headers = u32_at(32) as usize;
+    let count = u16::from_le_bytes(bytes[48..50].try_into().unwrap()) as usize;
+    let strings = u16::from_le_bytes(bytes[50..52].try_into().unwrap()) as usize;
+    let names = &bytes[u32_at(headers + strings * 40 + 16) as usize..];
+    let wanted = format!("{wanted}\0");
+    for i in 1..count {
+        let h = headers + i * 40;
+        if names[u32_at(h) as usize..].starts_with(wanted.as_bytes()) {
+            return u32_at(h + 36);
+        }
+    }
+    panic!("Missing {wanted}")
+}
+
 fn assemble(name: &str, source: &str) -> Result<Vec<u8>, ras::error::RasError> {
     let tmp = TempDir::new("riscv_labels");
     let dir = tmp.path();
@@ -116,14 +149,84 @@ fn align_counts_powers_of_two_and_pads_text_with_nops() {
 }
 
 #[test]
-fn riscv32_object_output_is_refused_rather_than_written_as_elf64() {
+fn riscv32_object_output_is_elf32() {
     let tmp = TempDir::new("riscv32");
     let output = tmp.path().join("riscv32.o");
-    let result = Ras::new(TargetArchitecture::Riscv32, TargetOperatingSystem::Linux)
+    Ras::new(TargetArchitecture::Riscv32, TargetOperatingSystem::Linux)
         .unwrap()
-        .assemble(".text\n  ret\n", &output);
-    assert!(result.is_err());
-    assert!(!output.exists());
+        .assemble(
+            ".text\n.globl f\nf:\n  addi a0, a0, 1\n  call h\n  ret\n",
+            &output,
+        )
+        .expect("assemble");
+    let object = std::fs::read(&output).expect("read");
+    assert_eq!(&object[0..4], b"\x7fELF");
+    assert_eq!(object[4], 1, "ELFCLASS32");
+    assert_eq!(
+        u16::from_le_bytes([object[18], object[19]]),
+        243,
+        "EM_RISCV"
+    );
+    assert_eq!(u16::from_le_bytes([object[40], object[41]]), 52, "e_ehsize");
+    assert_eq!(
+        u16::from_le_bytes([object[46], object[47]]),
+        40,
+        "e_shentsize"
+    );
+    assert_eq!(
+        section32(&object, ".text"),
+        [
+            0x13, 0x05, 0x15, 0x00, 0x97, 0x00, 0x00, 0x00, 0xe7, 0x80, 0x00, 0x00, 0x67, 0x80,
+            0x00, 0x00,
+        ]
+    );
+    let relocations = section32(&object, ".rela.text");
+    assert_eq!(relocations.len(), 12, "one Elf32_Rela");
+    assert_eq!(entsize32(&object, ".rela.text"), 12, "sh_entsize");
+    assert_eq!(entsize32(&object, ".symtab"), 16, "sh_entsize");
+    assert_eq!(
+        u32::from_le_bytes([
+            relocations[0],
+            relocations[1],
+            relocations[2],
+            relocations[3]
+        ]),
+        4,
+        "r_offset"
+    );
+    let info = u32::from_le_bytes([
+        relocations[4],
+        relocations[5],
+        relocations[6],
+        relocations[7],
+    ]);
+    assert_eq!(info & 0xff, 19, "R_RISCV_CALL_PLT");
+    let symbol = info >> 8;
+    assert_ne!(symbol, 0, "symbol index");
+    let symbols = section32(&object, ".symtab");
+    assert_eq!(symbols.len() % 16, 0, "Elf32_Sym entries");
+    let strings = section32(&object, ".strtab");
+    let entry = &symbols[symbol as usize * 16..][..16];
+    let name = u32::from_le_bytes(entry[0..4].try_into().unwrap()) as usize;
+    let end = strings[name..].iter().position(|b| *b == 0).unwrap() + name;
+    assert_eq!(&strings[name..end], b"h");
+    assert_eq!(entry[12], 1 << 4, "STB_GLOBAL, STT_NOTYPE");
+    assert_eq!(
+        u16::from_le_bytes([entry[14], entry[15]]),
+        0,
+        "undefined section"
+    );
+    let f = (1..symbols.len() / 16)
+        .find(|i| {
+            let at = u32::from_le_bytes(symbols[i * 16..i * 16 + 4].try_into().unwrap()) as usize;
+            strings[at..].starts_with(b"f\0")
+        })
+        .expect("f");
+    assert_eq!(
+        u16::from_le_bytes([symbols[f * 16 + 14], symbols[f * 16 + 15]]),
+        1,
+        "f lives in .text"
+    );
 }
 
 #[test]
