@@ -1,5 +1,6 @@
 pub mod fixed;
 pub mod ldst_imm64;
+mod simd;
 
 use crate::{
     encoder::aarch64::fixed::*,
@@ -465,6 +466,9 @@ impl AArch64Encoder {
         let p = &inst.operands;
         if max_operands(op).is_some_and(|max| p.len() > max) {
             return Err(error(format!("Too many operands for {op}")));
+        }
+        if let Some(word) = simd::encode(op, p)? {
+            return Ok(word.to_le_bytes().to_vec());
         }
         let arg = |i: usize| {
             p.get(i)
@@ -1180,6 +1184,61 @@ mod exclusive_tests {
         assert_eq!(word("str", &["q0", "[x9]"]), 0x3D80_0120);
         assert_eq!(word("ldr", &["q1", "[x10, #16]"]), 0x3DC0_0541);
         assert_eq!(word("stp", &["q0", "q1", "[sp, #16]"]), 0xAD00_87E0);
+    }
+
+    #[test]
+    fn simd_lane_moves_match_arm_arm() {
+        assert_eq!(word("dup", &["v0.4s", "w12"]), 0x4E04_0D80);
+        assert_eq!(word("dup", &["v1.16b", "w0"]), 0x4E01_0C01);
+        assert_eq!(word("dup", &["v2.2d", "x3"]), 0x4E08_0C62);
+        assert_eq!(word("ins", &["v0.s[1]", "w10"]), 0x4E0C_1D40);
+        assert_eq!(word("ins", &["v0.s[3]", "w9"]), 0x4E1C_1D20);
+        assert_eq!(word("ins", &["v2.d[1]", "x3"]), 0x4E18_1C62);
+        assert_eq!(word("ins", &["v0.b[15]", "w1"]), 0x4E1F_1C20);
+        assert_eq!(word("umov", &["w11", "v0.s[0]"]), 0x0E04_3C0B);
+        assert_eq!(word("umov", &["w12", "v0.s[3]"]), 0x0E1C_3C0C);
+        assert_eq!(word("umov", &["x5", "v1.d[1]"]), 0x4E18_3C25);
+        assert_eq!(word("umov", &["w9", "v0.b[0]"]), 0x0E01_3C09);
+    }
+
+    #[test]
+    fn simd_arithmetic_matches_arm_arm() {
+        assert_eq!(word("add", &["v0.4s", "v0.4s", "v1.4s"]), 0x4EA1_8400);
+        assert_eq!(word("sub", &["v2.2d", "v3.2d", "v4.2d"]), 0x6EE4_8462);
+        assert_eq!(word("mul", &["v0.8h", "v1.8h", "v2.8h"]), 0x4E62_9C20);
+        assert_eq!(word("and", &["v0.16b", "v1.16b", "v2.16b"]), 0x4E22_1C20);
+        assert_eq!(word("eor", &["v3.8b", "v4.8b", "v5.8b"]), 0x2E25_1C83);
+        assert_eq!(word("fmul", &["v0.4s", "v0.4s", "v1.4s"]), 0x6E21_DC00);
+        assert_eq!(word("fmul", &["v2.2d", "v3.2d", "v4.2d"]), 0x6E64_DC62);
+    }
+
+    #[test]
+    fn simd_rejects_unencodable_shapes() {
+        let refused = [
+            ("dup", &["v0.4s", "x1"][..]),
+            ("dup", &["v0.2d", "w1"]),
+            ("dup", &["v0.4s", "sp"]),
+            ("ins", &["v0.s[4]", "w0"]),
+            ("ins", &["v0.d[0]", "w0"]),
+            ("ins", &["v0.s[0]", "v1.s[0]"]),
+            ("umov", &["w0", "v0.d[0]"]),
+            ("umov", &["x0", "v0.s[0]"]),
+            ("add", &["v0.4s", "v1.2s", "v2.4s"]),
+            ("mul", &["v0.2d", "v1.2d", "v2.2d"]),
+            ("and", &["v0.8h", "v1.8h", "v2.8h"]),
+            ("fmul", &["v0.8b", "v1.8b", "v2.8b"]),
+            ("add", &["v0.4s", "v1.4s"]),
+        ];
+        for (op, operands) in refused {
+            let inst = ParsedInstruction {
+                opcode: op.to_string(),
+                operands: operands.iter().map(|s| s.to_string()).collect(),
+            };
+            assert!(
+                AArch64Encoder::new().encode_instruction(&inst).is_err(),
+                "{op} {operands:?}"
+            );
+        }
     }
 
     #[test]
