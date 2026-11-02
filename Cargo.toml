@@ -45,8 +45,3 @@ required-features = ["encoder"]
 default = []
 encoder = ["lamina-mir"]
 nightly = ["lamina-platform/nightly", "lamina-codegen/nightly", "lamina-mir?/nightly"]
-
-[patch.crates-io]
-lamina-platform = { path = "../lamina/lamina-platform" }
-lamina-mir = { path = "../lamina/lamina-mir" }
-lamina-codegen = { path = "../lamina/lamina-codegen" }
