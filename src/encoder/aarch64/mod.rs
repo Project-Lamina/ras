@@ -448,8 +448,8 @@ fn max_operands(op: &str) -> Option<usize> {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
         "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
         "mov" | "uxtb" | "sxtw" | "fmov" | "cset" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => 2,
-        "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" | "fdiv" | "fadd" | "fsub" | "lsl"
-        | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => 3,
+        "movz" | "movk" | "mul" | "smulh" | "umulh" | "sdiv" | "udiv" | "fmul" | "fdiv"
+        | "fadd" | "fsub" | "lsl" | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => 3,
         "csel" | "csinv" | "msub" | "sbfx" | "ubfx" => 4,
         _ => return None,
     })
@@ -617,6 +617,18 @@ impl AArch64Encoder {
                     _ => 0x1ac0_0800,
                 };
                 base | (if wide { 0x8000_0000 } else { 0 }) | (rm << 16) | (rn << 5) | rd
+            }
+            "smulh" | "umulh" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
+                if !wide {
+                    return Err(error(format!("{op} requires 64-bit registers")));
+                }
+                let base = if op == "smulh" {
+                    0x9b40_7c00
+                } else {
+                    0x9bc0_7c00
+                };
+                base | (rm << 16) | (rn << 5) | rd
             }
             "msub" => {
                 let ([rd, rn, rm, ra], wide) = gpr_regs::<4>(p)?;
@@ -1147,6 +1159,17 @@ mod exclusive_tests {
         assert_eq!(word("fneg", &["s0", "s1"]), 0x1E21_4020);
         assert_eq!(word("fcvt", &["d0", "s0"]), 0x1E22_C000);
         assert_eq!(word("fcvt", &["s0", "d0"]), 0x1E62_4000);
+    }
+
+    #[test]
+    fn high_multiply_matches_arm_arm() {
+        assert_eq!(word("smulh", &["x0", "x1", "x2"]), 0x9B42_7C20);
+        assert_eq!(word("umulh", &["x3", "x4", "x5"]), 0x9BC5_7C83);
+        let narrow = ParsedInstruction {
+            opcode: "smulh".to_string(),
+            operands: vec!["w0".to_string(), "w1".to_string(), "w2".to_string()],
+        };
+        assert!(AArch64Encoder::new().encode_instruction(&narrow).is_err());
     }
 
     #[test]
