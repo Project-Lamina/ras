@@ -186,12 +186,11 @@ fn branches_to_global_same_section_labels_are_relocated() {
 fn assemble_bytes(asm: &str) -> Result<Vec<u8>, String> {
     let tmp = TempDir::new("aarch64_words");
     let output = tmp.path().join("aarch64_words.o");
-    let result = Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+    Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
         .unwrap()
         .assemble(asm, &output)
         .map_err(|e| e.to_string())
-        .and_then(|()| std::fs::read(&output).map_err(|e| e.to_string()));
-    result
+        .and_then(|()| std::fs::read(&output).map_err(|e| e.to_string()))
 }
 
 fn assemble_words(asm: &str) -> Result<Vec<u32>, String> {

@@ -30,7 +30,7 @@ fn section32(bytes: &[u8], wanted: &str) -> Vec<u8> {
     let wanted = format!("{wanted}\0");
     for i in 1..count {
         let h = headers + i * 40;
-        let name = u32_at(h) as usize;
+        let name = u32_at(h);
         if names[name..].starts_with(wanted.as_bytes()) {
             return bytes[u32_at(h + 16)..u32_at(h + 16) + u32_at(h + 20)].to_vec();
         }

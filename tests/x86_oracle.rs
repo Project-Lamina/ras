@@ -172,11 +172,10 @@ fn oracle(asm: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
         .unwrap()
         .assemble(asm, &output)
         .unwrap();
-    let bytes = (
+    (
         std::fs::read(output).unwrap(),
         std::fs::read(reference).unwrap(),
-    );
-    bytes
+    )
 }
 
 fn section<'a>(bytes: &'a [u8], name: &str) -> &'a [u8] {
@@ -201,7 +200,9 @@ fn relocations(bytes: &[u8], name: &str) -> Vec<(u64, u32, String, i64)> {
     let symbols = section(bytes, ".symtab");
     let strings = section(bytes, ".strtab");
     section(bytes, name)
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .map(|entry| {
             let info = at(entry, 8);
             let symbol = &symbols[(info >> 32) as usize * 24..];

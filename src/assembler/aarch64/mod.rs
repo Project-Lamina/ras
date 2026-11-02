@@ -1495,7 +1495,9 @@ mod aarch64_jit_tail_call_tests {
         let module = fifteen_arg_tail_module();
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
         let words: Vec<u32> = code
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .collect();
         let tail = words
@@ -1553,7 +1555,9 @@ mod aarch64_jit_tail_call_tests {
             .expect("assembler");
         let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
         let words: Vec<u32> = code
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .collect();
         let bl = words

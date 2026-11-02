@@ -50,8 +50,10 @@ impl Object {
         let symbols = self.section(".symtab");
         let strings = self.contents(u32_at(self.header(symbols), 40) as usize);
         self.contents(symbols)
-            .chunks_exact(24)
-            .map(|s| (string(strings, u32_at(s, 0) as usize), s))
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .map(|s| (string(strings, u32_at(s, 0) as usize), s.as_slice()))
             .collect()
     }
 
@@ -66,7 +68,9 @@ impl Object {
     fn relocations(&self, section: &str) -> Vec<(u64, u32, String, i64)> {
         let symbols = self.symbols();
         self.contents(self.section(section))
-            .chunks_exact(24)
+            .as_chunks::<24>()
+            .0
+            .iter()
             .map(|r| {
                 let info = u64_at(r, 8);
                 (
@@ -88,7 +92,9 @@ impl Object {
         assert_eq!(u64_at(header, 56), 4);
         let words: Vec<_> = self
             .contents(group)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|w| u32_at(w, 0))
             .collect();
         assert_eq!(words[0], 1);
@@ -373,7 +379,9 @@ fn temporary_symbols_resolve_without_leaking_internal_labels() {
         let symbols = object.symbols();
         object
             .contents(object.section(".rela.data"))
-            .chunks_exact(24)
+            .as_chunks::<24>()
+            .0
+            .iter()
             .map(|r| {
                 let info = u64_at(r, 8);
                 let symbol = symbols[(info >> 32) as usize].1;

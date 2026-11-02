@@ -51,7 +51,7 @@ fn sections_keep_contents_symbols_and_relocations() {
         &[0x48, 0x8d, 5, 0, 0, 0, 0, 0xc3]
     );
     let symbols = contents(section(".symtab").1);
-    assert!(symbols.chunks_exact(24).any(|s| {
+    assert!(symbols.as_chunks::<24>().0.iter().any(|s| {
         u16::from_le_bytes(s[6..8].try_into().unwrap()) as usize == rodata_index
             && s[4] >> 4 == 1
             && u64_at(s, 8) == 0
@@ -171,7 +171,7 @@ fn numeric_labels_and_deferred_data_match_gas() {
                 let start = u64_at(&bytes, h + 24) as usize;
                 let mut data = bytes[start..start + u64_at(&bytes, h + 32) as usize].to_vec();
                 if name == b".rela.data" {
-                    for reloc in data.chunks_exact_mut(24) {
+                    for reloc in data.as_chunks_mut::<24>().0 {
                         reloc[12..16].fill(0);
                     }
                 }
@@ -184,7 +184,9 @@ fn numeric_labels_and_deferred_data_match_gas() {
                 let start = u64_at(&bytes, h + 24) as usize;
                 let symbols = &bytes[start..start + u64_at(&bytes, h + 32) as usize];
                 let globals: Vec<_> = symbols
-                    .chunks_exact(24)
+                    .as_chunks::<24>()
+                    .0
+                    .iter()
                     .filter(|sym| sym[4] >> 4 == 1)
                     .collect();
                 assert_eq!(globals.len(), 1);

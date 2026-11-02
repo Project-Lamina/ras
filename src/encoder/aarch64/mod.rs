@@ -379,11 +379,11 @@ fn mov_immediate_words(value: u64, wide: bool, rd: u32) -> Vec<u32> {
         let base = if invert { 0x1280_0000 } else { 0x5280_0000 };
         return vec![base | sf | rd];
     }
-    if words.len() > 1 {
-        if let Some((n, immr, imms)) = logical_immediate(value, wide) {
-            let base = if wide { 0xb200_0000 } else { 0x3200_0000 };
-            return vec![base | (n << 22) | (immr << 16) | (imms << 10) | (31 << 5) | rd];
-        }
+    if words.len() > 1
+        && let Some((n, immr, imms)) = logical_immediate(value, wide)
+    {
+        let base = if wide { 0xb200_0000 } else { 0x3200_0000 };
+        return vec![base | (n << 22) | (immr << 16) | (imms << 10) | (31 << 5) | rd];
     }
     words
 }

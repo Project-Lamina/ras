@@ -28,8 +28,8 @@ fn text(bytes: &[u8]) -> &[u8] {
 /// Run the RV64I subset that `li` expands into and report `a0`.
 fn evaluate(text: &[u8]) -> i64 {
     let mut regs = [0i64; 32];
-    for word in text.chunks_exact(4) {
-        let word = u32::from_le_bytes(word.try_into().unwrap());
+    for word in text.as_chunks::<4>().0.iter() {
+        let word = u32::from_le_bytes(*word);
         let rd = ((word >> 7) & 31) as usize;
         let rs1 = regs[((word >> 15) & 31) as usize];
         let shamt = (word >> 20) & 63;
@@ -120,8 +120,7 @@ fn assemble_riscv(name: &str, asm: &str) -> Vec<u8> {
         .unwrap()
         .assemble(asm, &output)
         .unwrap();
-    let bytes = std::fs::read(&output).unwrap();
-    bytes
+    std::fs::read(&output).unwrap()
 }
 
 fn clang_riscv(name: &str, asm: &str, extra: &[&str]) -> Vec<u8> {
@@ -143,8 +142,7 @@ fn clang_riscv(name: &str, asm: &str, extra: &[&str]) -> Vec<u8> {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let bytes = std::fs::read(&reference).unwrap();
-    bytes
+    std::fs::read(&reference).unwrap()
 }
 
 /// R_RISCV_RELAX hints only matter to linker relaxation, which ras does not emit.
