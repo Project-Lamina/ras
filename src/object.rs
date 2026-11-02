@@ -1067,7 +1067,10 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
                 let mut n_desc = 0;
                 if ext {
                     n_type |= N_EXT;
-                    if sym.attributes.hidden || sym.attributes.internal_visibility {
+                    if sym.attributes.hidden
+                        || sym.attributes.internal_visibility
+                        || sym.attributes.private_extern
+                    {
                         n_type |= N_PEXT;
                     }
                     if sym.attributes.weak {
@@ -2016,6 +2019,13 @@ mod tests {
     }
 
     fn macho_symbol_names(buf: &[u8]) -> Vec<String> {
+        macho_nlists(buf)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn macho_nlists(buf: &[u8]) -> Vec<(String, u8)> {
         let symtab = (0..le32(buf, 16))
             .scan(32usize, |off, _| {
                 let at = *off;
@@ -2031,7 +2041,8 @@ mod tests {
             .map(|i| {
                 let start = stroff + le32(buf, symoff + 16 * i) as usize;
                 let len = buf[start..].iter().position(|&b| b == 0).expect("nul");
-                String::from_utf8_lossy(&buf[start..start + len]).into_owned()
+                let name = String::from_utf8_lossy(&buf[start..start + len]).into_owned();
+                (name, buf[symoff + 16 * i + 4])
             })
             .collect()
     }
@@ -2054,6 +2065,51 @@ mod tests {
         (0..nreloc)
             .map(|i| (le32(buf, reloff + 8 * i), le32(buf, reloff + 8 * i + 4)))
             .collect()
+    }
+
+    #[test]
+    fn macho_arm64_page_symbol_operands_relocate_adrp_and_add() {
+        let source = ".text\n.globl _f\n_f:\nadrp x0, _fmt@PAGE\nadd x0, x0, _fmt@PAGEOFF\nret\n";
+        let mut ras = crate::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS)
+            .expect("ras");
+        let buf = ras.assemble_to_bytes(source).expect("assemble");
+
+        let text = macho_section_bytes(&buf, 0);
+        assert_eq!(
+            &text[0..4],
+            &0x9000_0000u32.to_le_bytes(),
+            "adrp keeps a zero immediate"
+        );
+        assert_eq!(
+            &text[4..8],
+            &0x9100_0000u32.to_le_bytes(),
+            "add keeps a zero immediate"
+        );
+
+        let relocs: Vec<(u32, u32)> = macho_reloc_entries(&buf, 0)
+            .into_iter()
+            .map(|(addr, info)| {
+                assert_eq!(info >> 27 & 1, 1, "undefined _fmt is extern");
+                (addr, info >> 28)
+            })
+            .collect();
+        assert_eq!(
+            relocs,
+            [(0, ARM64_RELOC_PAGE21), (4, ARM64_RELOC_PAGEOFF12)]
+        );
+    }
+
+    #[test]
+    fn macho_private_extern_sets_private_external_nlist_bit() {
+        let source = ".text\n.globl _f\n.private_extern _f\n_f:\nret\n";
+        let mut ras = crate::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS)
+            .expect("ras");
+        let buf = ras.assemble_to_bytes(source).expect("assemble");
+        let (_, n_type) = macho_nlists(&buf)
+            .into_iter()
+            .find(|(name, _)| name == "_f")
+            .expect("_f in symbol table");
+        assert_eq!(n_type & (N_EXT | N_PEXT), N_EXT | N_PEXT);
     }
 
     #[test]

@@ -1212,17 +1212,19 @@ impl RasAssembler {
                             })
                         } else if opcode == "add"
                             && operands.len() == 3
-                            && operands[2].starts_with(":lo12:")
+                            && (operands[2].starts_with(":lo12:")
+                                || operands[2].ends_with("@PAGEOFF"))
                         {
-                            let (symbol, addend) = split_addend(&operands[2][6..])?;
+                            let operand = operands[2].as_str();
+                            let page_offset = operand.strip_prefix(":lo12:").unwrap_or(operand);
+                            let (symbol, addend) = split_addend(page_offset)?;
+                            let (rd, wide) = crate::encoder::aarch64::gpr(&operands[0])?;
+                            let (rn, _) = crate::encoder::aarch64::gpr(&operands[1])?;
                             Some(PatchPoint::AArch64 {
                                 offset: current_offset,
                                 target: symbol.to_string(),
                                 addend,
-                                word: 0x9100_0000
-                                    | (u32::from(crate::encoder::aarch64::register(&operands[1])?)
-                                        << 5)
-                                    | u32::from(crate::encoder::aarch64::register(&operands[0])?),
+                                word: if wide { 0x9100_0000 } else { 0x1100_0000 } | (rn << 5) | rd,
                                 bits: 0,
                                 kind: 277,
                                 relocate: true,

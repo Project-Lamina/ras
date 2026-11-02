@@ -74,6 +74,7 @@ pub struct SymbolAttributes {
     pub weak: bool,
     pub global: bool,
     pub hidden: bool,
+    pub private_extern: bool,
     pub internal_visibility: bool,
     pub protected: bool,
     pub local: bool,
@@ -321,11 +322,15 @@ impl AssemblyParser {
                     Vec::new()
                 };
                 let name = if parts[0] == ".section" {
-                    fields
+                    let segment = fields
                         .first()
                         .map(|field| field.trim_matches('"'))
                         .filter(|field| !field.is_empty())
-                        .ok_or_else(|| RasError::ParseError(".section requires a name".into()))?
+                        .ok_or_else(|| RasError::ParseError(".section requires a name".into()))?;
+                    fields
+                        .get(1)
+                        .and_then(|section| macho_section_alias(segment, section))
+                        .unwrap_or(segment)
                 } else {
                     parts[0]
                 };
@@ -449,6 +454,20 @@ impl AssemblyParser {
                     }
                     symbol_name(name)?;
                     self.attributes.entry(name.into()).or_default().hidden = true;
+                }
+            }
+            ".private_extern" => {
+                for name in line[parts[0].len()..].split(',').map(str::trim) {
+                    if name.is_empty() {
+                        return Err(RasError::ParseError(
+                            ".private_extern requires symbol".into(),
+                        ));
+                    }
+                    symbol_name(name)?;
+                    self.attributes
+                        .entry(name.into())
+                        .or_default()
+                        .private_extern = true;
                 }
             }
             ".weak" => {
@@ -998,6 +1017,17 @@ fn split_fields(text: &str) -> Vec<&str> {
     fields
 }
 
+/// The gas name of a Mach-O `segment,section` pair that the assembler also knows by name.
+fn macho_section_alias(segment: &str, section: &str) -> Option<&'static str> {
+    Some(match (segment, section) {
+        ("__TEXT", "__text") => ".text",
+        ("__TEXT", "__const") => ".rodata",
+        ("__DATA", "__data") => ".data",
+        ("__DATA", "__bss") => ".bss",
+        _ => return None,
+    })
+}
+
 fn split_operands(text: &str) -> Vec<String> {
     let mut operands = Vec::new();
     let mut depth = 0usize;
@@ -1195,6 +1225,17 @@ mod tests {
         assert_eq!(asm.sections[1].name, ".data");
         assert!(asm.sections[1].flags.write);
         assert!(!asm.sections[1].flags.exec);
+    }
+
+    #[test]
+    fn macho_segment_section_pairs_map_to_gas_sections() {
+        let asm =
+            parse(".section __DATA,__data\nvar:\n.section __TEXT,__const\n.section __DATA,__bss");
+        assert_eq!(asm.sections[0].name, ".data");
+        assert!(asm.sections[0].flags.write);
+        assert_eq!(asm.symbols[0].section, ".data");
+        assert_eq!(asm.sections[1].name, ".rodata");
+        assert_eq!(asm.sections[2].name, ".bss");
     }
 
     #[test]
