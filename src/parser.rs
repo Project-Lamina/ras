@@ -513,10 +513,13 @@ impl AssemblyParser {
                         .private_extern = true;
                 }
             }
-            ".weak" => {
+            ".weak" | ".weak_definition" | ".weak_reference" => {
                 for name in line[parts[0].len()..].split(',').map(str::trim) {
                     if name.is_empty() {
-                        return Err(RasError::ParseError(".weak requires symbol".into()));
+                        return Err(RasError::ParseError(format!(
+                            "{} requires symbol",
+                            parts[0]
+                        )));
                     }
                     symbol_name(name)?;
                     self.attributes.entry(name.into()).or_default().weak = true;

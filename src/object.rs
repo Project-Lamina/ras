@@ -2396,6 +2396,37 @@ mod tests {
     }
 
     #[test]
+    fn macho_weak_directives_set_the_weak_definition_bit() {
+        for directive in [".weak", ".weak_definition"] {
+            let source = format!(".text\n.globl _f\n{directive} _f\n_f:\nret\n");
+            let mut ras =
+                crate::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS)
+                    .expect("ras");
+            let buf = ras.assemble_to_bytes(&source).expect("assemble");
+            let symtab = (0..le32(&buf, 16))
+                .scan(32usize, |off, _| {
+                    let at = *off;
+                    *off += le32(&buf, at + 4) as usize;
+                    Some(at)
+                })
+                .find(|&at| le32(&buf, at) == LC_SYMTAB)
+                .expect("LC_SYMTAB");
+            let symoff = le32(&buf, symtab + 8) as usize;
+            let nsyms = le32(&buf, symtab + 12) as usize;
+            let stroff = le32(&buf, symtab + 16) as usize;
+            let weak = (0..nsyms)
+                .find(|i| {
+                    let start = stroff + le32(&buf, symoff + 16 * i) as usize;
+                    let end = buf[start..].iter().position(|&b| b == 0).unwrap() + start;
+                    &buf[start..end] == b"_f"
+                })
+                .map(|i| u16::from_le_bytes([buf[symoff + 16 * i + 6], buf[symoff + 16 * i + 7]]))
+                .expect("_f in symbol table");
+            assert_eq!(weak & N_WEAK_DEF, N_WEAK_DEF, "{directive}");
+        }
+    }
+
+    #[test]
     fn macho_private_extern_sets_private_external_nlist_bit() {
         let source = ".text\n.globl _f\n.private_extern _f\n_f:\nret\n";
         let mut ras = crate::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS)
