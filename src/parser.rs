@@ -15,6 +15,7 @@ pub struct Section {
     pub flags: SectionFlags,
     pub data: Vec<u8>,
     pub alignment: usize,
+    pub macho: Option<MachOSectionType>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,14 @@ pub struct SectionFlags {
     pub exec: bool,
     pub write: bool,
     pub tls: bool,
+}
+
+/// Mach-O section type and attributes, as written in the `.section` directive.
+/// `kind` is the low byte of `S_*` section flags and `attributes` the high bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachOSectionType {
+    pub kind: u32,
+    pub attributes: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -324,19 +333,39 @@ impl AssemblyParser {
                 } else {
                     Vec::new()
                 };
-                let name = if parts[0] == ".section" {
+                let (name, macho) = if parts[0] == ".section" {
                     let segment = fields
                         .first()
                         .map(|field| field.trim_matches('"'))
                         .filter(|field| !field.is_empty())
                         .ok_or_else(|| RasError::ParseError(".section requires a name".into()))?;
-                    fields
+                    match fields
                         .get(1)
-                        .and_then(|section| macho_section_alias(segment, section))
-                        .unwrap_or(segment)
+                        .filter(|section| segment.starts_with("__") && !section.starts_with('"'))
+                    {
+                        Some(section) => {
+                            let spec = macho_section_type(&fields[2..])?;
+                            match macho_builtin_section(segment, section) {
+                                Some((alias, builtin)) => {
+                                    if !fields[2..].is_empty()
+                                        && (spec.kind != builtin.kind
+                                            || spec.attributes & !builtin.attributes != 0)
+                                    {
+                                        return Err(RasError::ParseError(format!(
+                                            "Mach-O section {segment},{section} is built in with a different type or attributes"
+                                        )));
+                                    }
+                                    (alias.to_string(), None)
+                                }
+                                None => (format!("{segment},{section}"), Some(spec)),
+                            }
+                        }
+                        None => (segment.to_string(), None),
+                    }
                 } else {
-                    parts[0]
+                    (parts[0].to_string(), None)
                 };
+                let name = name.as_str();
                 let explicit = fields
                     .get(1)
                     .filter(|field| field.starts_with('"'))
@@ -346,7 +375,15 @@ impl AssemblyParser {
                 }
                 self.current_section = name.to_string();
                 self.lines.push(Line::Section(name.to_string()));
-                if !self.sections.iter().any(|s| s.name == name) {
+                if let Some(existing) = self.sections.iter().find(|s| s.name == name) {
+                    if macho.is_some() && existing.macho != macho {
+                        return Err(RasError::ParseError(format!(
+                            "Mach-O section {name} redeclared with a different type or attributes"
+                        )));
+                    }
+                } else {
+                    let macho_exec = macho
+                        .is_some_and(|spec| spec.attributes & MACHO_PURE_OR_SOME_INSTRUCTIONS != 0);
                     self.sections.push(Section {
                         group: if explicit.is_some_and(|f| f.contains('G')) {
                             if fields.len() != 5 || fields[4] != "comdat" || fields[3].is_empty() {
@@ -364,9 +401,11 @@ impl AssemblyParser {
                                 !name.starts_with(".debug") && name != ".note.GNU-stack",
                                 |f| f.contains('a'),
                             ),
-                            exec: explicit.map_or(name == ".text", |f| f.contains('x')),
+                            exec: explicit
+                                .map_or(name == ".text" || macho_exec, |f| f.contains('x')),
                             write: explicit.map_or(
-                                matches!(name, ".data" | ".bss" | ".tdata" | ".tbss"),
+                                matches!(name, ".data" | ".bss" | ".tdata" | ".tbss")
+                                    || name.starts_with("__DATA,"),
                                 |f| f.contains('w'),
                             ),
                             tls: explicit
@@ -374,6 +413,7 @@ impl AssemblyParser {
                         },
                         data: Vec::new(),
                         alignment: 1,
+                        macho,
                     });
                 }
             }
@@ -1038,15 +1078,66 @@ fn split_fields(text: &str) -> Vec<&str> {
     fields
 }
 
-/// The gas name of a Mach-O `segment,section` pair that the assembler also knows by name.
-fn macho_section_alias(segment: &str, section: &str) -> Option<&'static str> {
+const MACHO_PURE_OR_SOME_INSTRUCTIONS: u32 = 0x8000_0000 | 0x0000_0400;
+
+/// The gas name and Mach-O type of a `segment,section` pair that the assembler also knows by name.
+fn macho_builtin_section(segment: &str, section: &str) -> Option<(&'static str, MachOSectionType)> {
+    let regular = |attributes| MachOSectionType {
+        kind: 0,
+        attributes,
+    };
     Some(match (segment, section) {
-        ("__TEXT", "__text") => ".text",
-        ("__TEXT", "__const") => ".rodata",
-        ("__DATA", "__data") => ".data",
-        ("__DATA", "__bss") => ".bss",
+        ("__TEXT", "__text") => (".text", regular(MACHO_PURE_OR_SOME_INSTRUCTIONS)),
+        ("__TEXT", "__const") => (".rodata", regular(0)),
+        ("__DATA", "__data") => (".data", regular(0)),
+        ("__DATA", "__bss") => (
+            ".bss",
+            MachOSectionType {
+                kind: 0x1,
+                attributes: 0,
+            },
+        ),
         _ => return None,
     })
+}
+
+/// The Mach-O type and attributes named by the optional fields after `segment,section`.
+fn macho_section_type(fields: &[String]) -> Result<MachOSectionType, RasError> {
+    if fields.len() > 2 {
+        return Err(RasError::ParseError(
+            "Mach-O .section takes at most a type and attributes".into(),
+        ));
+    }
+    let kind = match fields.first().map_or("regular", String::as_str) {
+        "regular" => 0x0,
+        "zerofill" => 0x1,
+        "thread_local_regular" => 0x11,
+        "thread_local_zerofill" => 0x12,
+        "thread_local_variables" => 0x13,
+        other => {
+            return Err(RasError::ParseError(format!(
+                "unsupported Mach-O section type {other}"
+            )));
+        }
+    };
+    let mut attributes = 0;
+    for attribute in fields
+        .get(1)
+        .map_or("", String::as_str)
+        .split('+')
+        .filter(|a| !a.is_empty())
+    {
+        attributes |= match attribute {
+            "pure_instructions" => 0x8000_0000,
+            "some_instructions" => 0x0000_0400,
+            other => {
+                return Err(RasError::ParseError(format!(
+                    "unsupported Mach-O section attribute {other}"
+                )));
+            }
+        };
+    }
+    Ok(MachOSectionType { kind, attributes })
 }
 
 fn split_operands(text: &str) -> Vec<String> {
@@ -1352,5 +1443,57 @@ mod tests {
                 .parse(".loc 1 2 3 is_stmt 2\n")
                 .is_err()
         );
+    }
+
+    fn macho_parse(src: &str) -> Result<ParsedAssembly, RasError> {
+        AssemblyParser::new().parse(src)
+    }
+
+    #[test]
+    fn macho_custom_sections_take_segment_section_name_and_type() {
+        let asm = parse(
+            ".section __TEXT,__custom\n.section __DATA,__thread_vars,thread_local_variables\n.section __DATA,__thread_data,thread_local_regular\n.section __DATA,__thread_bss,thread_local_zerofill\n.section __DATA,__x,regular,pure_instructions",
+        );
+        let find = |name: &str| {
+            asm.sections
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("section {name} missing"))
+        };
+        assert_eq!(find("__TEXT,__custom").macho.unwrap().kind, 0);
+        assert_eq!(find("__DATA,__thread_vars").macho.unwrap().kind, 0x13);
+        assert_eq!(find("__DATA,__thread_data").macho.unwrap().kind, 0x11);
+        assert_eq!(find("__DATA,__thread_bss").macho.unwrap().kind, 0x12);
+        let custom = find("__DATA,__x").macho.unwrap();
+        assert_eq!(custom.attributes, 0x8000_0000);
+        assert!(find("__DATA,__x").flags.write);
+        assert!(find("__DATA,__x").flags.exec);
+    }
+
+    #[test]
+    fn macho_builtin_pairs_accept_their_own_type_and_keep_gas_names() {
+        let asm = parse(
+            ".section __TEXT,__text,regular,pure_instructions\n.section __DATA,__bss,zerofill\n.section __DATA,__data,regular",
+        );
+        assert_eq!(asm.sections[0].name, ".text");
+        assert_eq!(asm.sections[1].name, ".bss");
+        assert_eq!(asm.sections[2].name, ".data");
+        assert!(asm.sections.iter().all(|s| s.macho.is_none()));
+    }
+
+    #[test]
+    fn macho_section_types_are_checked() {
+        let err = |src: &str| match macho_parse(src) {
+            Ok(_) => panic!("accepted {src}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err(".section __DATA,__bss,regular").contains("built in"));
+        assert!(
+            err(".section __TEXT,__text,regular,some_instructions+pure_instructions+debug")
+                .contains("attribute")
+        );
+        assert!(err(".section __DATA,__x,bogus").contains("section type bogus"));
+        assert!(err(".section __DATA,__x\n.section __DATA,__x,zerofill").contains("redeclared"));
+        assert!(macho_parse(".section __DATA,__x\n.section __DATA,__x").is_ok());
     }
 }

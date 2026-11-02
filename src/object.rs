@@ -292,6 +292,28 @@ impl ElfWriter {
 
 impl ObjectWriter for ElfWriter {
     fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+        if req.target_arch == TargetArchitecture::X86_64
+            && let Some(r) = req.relocations.iter().find(|r| r.kind == X86_64_SECREL32)
+        {
+            return Err(RasError::ObjectError(format!(
+                "x86_64 @SECREL32 for {} is only supported in COFF objects",
+                r.symbol
+            )));
+        }
+        if req.target_arch == TargetArchitecture::Aarch64
+            && let Some(r) = req.relocations.iter().find(|r| matches!(r.kind, 313 | 314))
+        {
+            return Err(RasError::ObjectError(format!(
+                "arm64 @TLVP relocation for {} is only supported in Mach-O objects",
+                r.symbol
+            )));
+        }
+        if let Some(s) = req.sections.iter().find(|s| s.macho.is_some()) {
+            return Err(RasError::ObjectError(format!(
+                "Mach-O section {} cannot be written to an ELF object",
+                s.name
+            )));
+        }
         let machine = elf64_e_machine(req.target_arch)
             .ok_or_else(|| RasError::ObjectError("Unsupported ELF architecture".into()))?;
         let class32 = matches!(req.target_arch, TargetArchitecture::Riscv32);
@@ -319,6 +341,7 @@ impl ObjectWriter for ElfWriter {
                 },
                 data: req.code.to_vec(),
                 alignment: 1,
+                macho: None,
             });
         }
         if req.target_arch == TargetArchitecture::X86_64 {
@@ -335,6 +358,7 @@ impl ObjectWriter for ElfWriter {
                         },
                         data: Vec::new(),
                         alignment: 1,
+                        macho: None,
                     });
                 }
             }
@@ -715,6 +739,7 @@ const CPU_SUBTYPE_X86_64_ALL: u32 = 3;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
 const S_ZEROFILL: u32 = 0x1;
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
 const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
 const N_UNDF: u8 = 0x0;
@@ -737,11 +762,17 @@ const ARM64_RELOC_UNSIGNED: u32 = 0;
 const ARM64_RELOC_BRANCH26: u32 = 2;
 const ARM64_RELOC_PAGE21: u32 = 3;
 const ARM64_RELOC_PAGEOFF12: u32 = 4;
+const ARM64_RELOC_TLVP_LOAD_PAGE21: u32 = 8;
+const ARM64_RELOC_TLVP_LOAD_PAGEOFF12: u32 = 9;
 const ARM64_RELOC_ADDEND: u32 = 10;
 
 const NLIST_GROUP_LOCAL: u8 = 0;
 const NLIST_GROUP_EXTDEF: u8 = 1;
 const NLIST_GROUP_UNDEF: u8 = 2;
+
+fn macho_is_zerofill(flags: u32) -> bool {
+    matches!(flags & 0xff, S_ZEROFILL | S_THREAD_LOCAL_ZEROFILL)
+}
 
 fn macho_section_kind(name: &str) -> Option<(&'static str, &'static str, u32)> {
     match name {
@@ -782,6 +813,8 @@ fn arm64_reloc_spec(kind: u32) -> Result<MachORelocSpec, RasError> {
         282 | 283 => Ok(spec(ARM64_RELOC_BRANCH26, 2, true)),
         275 => Ok(spec(ARM64_RELOC_PAGE21, 2, true)),
         277 => Ok(spec(ARM64_RELOC_PAGEOFF12, 2, false)),
+        313 => Ok(spec(ARM64_RELOC_TLVP_LOAD_PAGE21, 2, true)),
+        314 => Ok(spec(ARM64_RELOC_TLVP_LOAD_PAGEOFF12, 2, false)),
         _ => Err(RasError::ObjectError(format!(
             "arm64 relocation kind {kind} has no Mach-O equivalent"
         ))),
@@ -856,8 +889,8 @@ struct MachONlist {
 }
 
 struct MachOSection {
-    segment: &'static str,
-    name: &'static str,
+    segment: String,
+    name: String,
     flags: u32,
     align: u64,
     addr: u64,
@@ -867,7 +900,7 @@ struct MachOSection {
 
 impl MachOSection {
     fn is_zerofill(&self) -> bool {
-        self.flags & 0xff == S_ZEROFILL
+        macho_is_zerofill(self.flags)
     }
 }
 
@@ -933,6 +966,7 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
             },
             data: req.code.to_vec(),
             alignment: 1,
+            macho: None,
         });
     }
 
@@ -940,12 +974,33 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
     let mut section_ord: HashMap<&str, usize> = HashMap::new();
     let mut addr = 0u64;
     for s in &source {
-        let (segment, name, flags) = macho_section_kind(&s.name).ok_or_else(|| {
-            RasError::ObjectError(format!(
-                "Mach-O has no section for {}; supported sections are .text, .rodata, .data and .bss",
-                s.name
-            ))
-        })?;
+        let (segment, name, flags) = match &s.macho {
+            Some(section_type) => {
+                let (segment, name) = s.name.split_once(',').ok_or_else(|| {
+                    RasError::ObjectError(format!("Mach-O section {} has no segment", s.name))
+                })?;
+                if segment.is_empty() || name.is_empty() || segment.len() > 16 || name.len() > 16 {
+                    return Err(RasError::ObjectError(format!(
+                        "Mach-O section name {} needs a non-empty segment and section of at most 16 bytes each",
+                        s.name
+                    )));
+                }
+                (
+                    segment.to_string(),
+                    name.to_string(),
+                    section_type.kind | section_type.attributes,
+                )
+            }
+            None => {
+                let (segment, name, flags) = macho_section_kind(&s.name).ok_or_else(|| {
+                    RasError::ObjectError(format!(
+                        "Mach-O has no section for {}; write Mach-O sections as segment,section",
+                        s.name
+                    ))
+                })?;
+                (segment.to_string(), name.to_string(), flags)
+            }
+        };
         if s.group.is_some() {
             return Err(RasError::ObjectError(format!(
                 "Mach-O has no section groups; {} is in a comdat group",
@@ -959,7 +1014,7 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
             )));
         }
         let align = s.alignment as u64;
-        let zerofill = flags & 0xff == S_ZEROFILL;
+        let zerofill = macho_is_zerofill(flags);
         if zerofill && s.data.iter().any(|&b| b != 0) {
             return Err(RasError::ObjectError(format!(
                 "{} holds initialized bytes but Mach-O zero-fill sections cannot",
@@ -1311,8 +1366,8 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
     put_u32(&mut out, sections.len() as u32);
     put_u32(&mut out, 0);
     for (i, sec) in sections.iter().enumerate() {
-        put_name16(&mut out, sec.name);
-        put_name16(&mut out, sec.segment);
+        put_name16(&mut out, &sec.name);
+        put_name16(&mut out, &sec.segment);
         out.extend_from_slice(&sec.addr.to_le_bytes());
         out.extend_from_slice(&(sec.data.len() as u64).to_le_bytes());
         put_u32(&mut out, file_offsets[i] as u32);
@@ -1396,6 +1451,8 @@ impl ObjectWriter for MachOWriter {
     }
 }
 
+pub(crate) const X86_64_SECREL32: u32 = 270;
+
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -1413,6 +1470,7 @@ const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 const IMAGE_REL_AMD64_ADDR64: u16 = 1;
 const IMAGE_REL_AMD64_ADDR32: u16 = 2;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
+const IMAGE_REL_AMD64_SECREL: u16 = 0x000E;
 
 const COFF_SECTION_HEADER_SIZE: usize = 40;
 const COFF_SYMBOL_SIZE: usize = 18;
@@ -1454,6 +1512,7 @@ fn coff_reloc_type(kind: u32, symbol: &str) -> Result<(u16, usize), RasError> {
     match kind {
         1 => Ok((IMAGE_REL_AMD64_ADDR64, 8)),
         10 | 11 => Ok((IMAGE_REL_AMD64_ADDR32, 4)),
+        X86_64_SECREL32 => Ok((IMAGE_REL_AMD64_SECREL, 4)),
         12 | 14 => Err(RasError::ObjectError(format!(
             "x86_64 relocation kind {kind} for {symbol} has no COFF equivalent"
         ))),
@@ -1536,6 +1595,23 @@ impl ObjectWriter for CoffWriter {
                 r.kind, r.symbol
             )));
         }
+        if let Some(s) = req.sections.iter().find(|s| s.macho.is_some()) {
+            return Err(RasError::ObjectError(format!(
+                "Mach-O section {} cannot be written to a COFF object",
+                s.name
+            )));
+        }
+        for r in relocations.iter().filter(|r| r.kind == X86_64_SECREL32) {
+            if let Some(sym) = req.symbols.iter().find(|s| s.name == r.symbol)
+                && !sym.section.is_empty()
+                && !sym.section.starts_with(".tls")
+            {
+                return Err(RasError::ObjectError(format!(
+                    "@SECREL32 target {} is in {}, not a .tls section",
+                    r.symbol, sym.section
+                )));
+            }
+        }
 
         let default_sections;
         let sections: &[Section] = if req.sections.is_empty() {
@@ -1550,6 +1626,7 @@ impl ObjectWriter for CoffWriter {
                 },
                 data: req.code.to_vec(),
                 alignment: 16,
+                macho: None,
             }];
             &default_sections
         } else {
@@ -1831,6 +1908,7 @@ mod tests {
             name: ".text".to_string(),
             data: code.to_vec(),
             alignment: 1,
+            macho: None,
             flags: SectionFlags {
                 alloc: true,
                 exec: true,
@@ -1866,6 +1944,7 @@ mod tests {
             name: ".text".to_string(),
             data: code.to_vec(),
             alignment: 1,
+            macho: None,
             flags: SectionFlags {
                 alloc: true,
                 exec: true,
@@ -1937,6 +2016,7 @@ mod tests {
             },
             data: if nobits { vec![0; 8] } else { vec![1; 8] },
             alignment: 8,
+            macho: None,
         };
         let symbol = |name: &str, global: bool, section: &str| ObjectSymbol {
             name: name.into(),
@@ -2000,6 +2080,7 @@ mod tests {
             },
             data: vec![0x90; 4],
             alignment: 1,
+            macho: None,
         };
         let debug_line = Section {
             group: None,
@@ -2012,6 +2093,7 @@ mod tests {
             },
             data: vec![0; 8],
             alignment: 1,
+            macho: None,
         };
         let relocations = [ExternalReloc {
             offset: 0,
@@ -2070,6 +2152,7 @@ mod tests {
             },
             data,
             alignment: 16,
+            macho: None,
         }
     }
 
@@ -2217,6 +2300,7 @@ mod tests {
             },
             data,
             alignment: 4,
+            macho: None,
         }
     }
 
@@ -2616,6 +2700,7 @@ mod tests {
             },
             data,
             alignment: 16,
+            macho: None,
         }
     }
 
@@ -2784,5 +2869,267 @@ mod tests {
         assert_eq!(obj.symbols[symidx as usize].name, "main");
         assert_eq!(obj.symbols[symidx as usize].section, 1);
         assert_eq!(&data.data[..8], &8u64.to_le_bytes());
+    }
+
+    #[test]
+    fn coff_secrel32_relocates_against_tls_symbol_with_type_0e() {
+        let text = vec![0x8b, 0x80, 0, 0, 0, 0, 0xc3];
+        let sections = [
+            coff_section(".text", true, false, text),
+            coff_section(".tls$x", false, true, vec![0; 8]),
+        ];
+        let symbols = [
+            coff_symbol("main", true, ".text", 0),
+            coff_symbol("_x", true, ".tls$x", 4),
+        ];
+        let relocations = [coff_reloc(".text", 2, "_x", X86_64_SECREL32, 8)];
+        let buf = coff_object(&sections, &symbols, &relocations);
+        let obj = coff_parse(&buf);
+
+        let text = &obj.sections[0];
+        assert_eq!(text.relocs.len(), 1);
+        let (offset, symbol, ty) = text.relocs[0];
+        assert_eq!(offset, 2);
+        assert_eq!(ty, IMAGE_REL_AMD64_SECREL);
+        assert_eq!(ty, 0x000e);
+        let target = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == "_x")
+            .expect("_x symbol") as u32;
+        assert_eq!(symbol, target);
+        let tls_index = obj
+            .sections
+            .iter()
+            .position(|s| s.name == ".tls$x")
+            .expect(".tls$x section") as i16
+            + 1;
+        assert_eq!(obj.symbols[target as usize].section, tls_index);
+        assert_eq!(obj.symbols[target as usize].value, 4);
+        assert_eq!(&text.data[2..6], &8i32.to_le_bytes());
+    }
+
+    #[test]
+    fn coff_secrel32_refuses_targets_outside_tls_sections() {
+        let sections = [
+            coff_section(".text", true, false, vec![0x8b, 0x80, 0, 0, 0, 0]),
+            coff_section(".data", false, true, vec![0; 4]),
+        ];
+        let symbols = [coff_symbol("_y", true, ".data", 0)];
+        let relocations = [coff_reloc(".text", 2, "_y", X86_64_SECREL32, 0)];
+        let opts = ObjectWriteOptions::default();
+        let err = CoffWriter::new()
+            .object_bytes(&ObjectWriteRequest {
+                code: &sections[0].data,
+                sections: &sections,
+                symbols: &symbols,
+                relocations: &relocations,
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Windows,
+                opts: &opts,
+            })
+            .expect_err("non-TLS SECREL target");
+        assert!(err.to_string().contains("not a .tls section"), "{err}");
+    }
+
+    #[test]
+    fn elf_rejects_secrel32_relocations() {
+        let sections = [coff_section(
+            ".text",
+            true,
+            false,
+            vec![0x8b, 0x80, 0, 0, 0, 0],
+        )];
+        let relocations = [coff_reloc(".text", 2, "_x", X86_64_SECREL32, 0)];
+        let opts = ObjectWriteOptions::default();
+        let err = ElfWriter::new()
+            .object_bytes(&ObjectWriteRequest {
+                code: &sections[0].data,
+                sections: &sections,
+                symbols: &[],
+                relocations: &relocations,
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Linux,
+                opts: &opts,
+            })
+            .expect_err("SECREL in ELF");
+        assert!(err.to_string().contains("only supported in COFF"), "{err}");
+    }
+
+    fn macho_custom_section(name: &str, kind: u32, attributes: u32, data: Vec<u8>) -> Section {
+        Section {
+            name: name.into(),
+            macho: Some(crate::parser::MachOSectionType { kind, attributes }),
+            ..macho_text_section(data)
+        }
+    }
+
+    fn macho_section_name(buf: &[u8], section: usize) -> String {
+        let base = macho_section_header(section);
+        let name = &buf[base..base + 16];
+        String::from_utf8(name.iter().copied().take_while(|&b| b != 0).collect()).unwrap()
+    }
+
+    #[test]
+    fn macho_arbitrary_segment_sections_keep_name_and_type() {
+        let sections = [
+            macho_text_section(vec![0x90]),
+            macho_custom_section("__TEXT,__custom", 0, 0x8000_0000, vec![0xc3]),
+            macho_custom_section("__DATA,__x", 0, 0, vec![1, 2, 3, 4]),
+            macho_custom_section("__DATA,__thread_vars", 0x13, 0, vec![0; 24]),
+            macho_custom_section("__DATA,__thread_data", 0x11, 0, vec![7; 8]),
+            macho_custom_section("__DATA,__thread_bss", 0x12, 0, vec![0; 8]),
+        ];
+        let buf = macho_object(&sections, &[], &[]).expect("write");
+        let names: Vec<String> = (0..sections.len())
+            .map(|i| macho_section_name(&buf, i))
+            .collect();
+        assert_eq!(names[1], "__custom");
+        assert_eq!(names[2], "__x");
+        assert_eq!(names[3], "__thread_vars");
+        assert_eq!(names[4], "__thread_data");
+        assert_eq!(names[5], "__thread_bss");
+        let segment = |i: usize| {
+            let base = macho_section_header(i);
+            String::from_utf8(
+                buf[base + 16..base + 32]
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b != 0)
+                    .collect(),
+            )
+            .unwrap()
+        };
+        assert_eq!(segment(1), "__TEXT");
+        assert_eq!(segment(3), "__DATA");
+        let flags = |i: usize| le32(&buf, macho_section_header(i) + 64);
+        assert_eq!(flags(1), 0x8000_0000);
+        assert_eq!(flags(3), 0x13);
+        assert_eq!(flags(4), 0x11);
+        assert_eq!(flags(5), 0x12);
+        assert_eq!(macho_section_bytes(&buf, 2), &[1, 2, 3, 4]);
+        assert_eq!(macho_section_bytes(&buf, 4), &[7; 8]);
+    }
+
+    #[test]
+    fn macho_custom_sections_refuse_bad_names_and_nonzero_zerofill() {
+        let long = macho_custom_section("__DATA,__this_name_is_too_long", 0, 0, vec![1]);
+        let err = macho_object(&[macho_text_section(vec![]), long], &[], &[]).expect_err("long");
+        assert!(err.to_string().contains("16 bytes"), "{err}");
+
+        let bare = macho_custom_section("__DATA", 0, 0, vec![1]);
+        let err = macho_object(&[macho_text_section(vec![]), bare], &[], &[]).expect_err("bare");
+        assert!(
+            err.to_string().contains("segment,section") || err.to_string().contains("no segment"),
+            "{err}"
+        );
+
+        let tls_bss = macho_custom_section("__DATA,__thread_bss", 0x12, 0, vec![0, 1]);
+        let err = macho_object(&[macho_text_section(vec![]), tls_bss], &[], &[]).expect_err("tlv");
+        assert!(err.to_string().contains("zero-fill"), "{err}");
+    }
+
+    fn macho_reloc_fields(buf: &[u8], section: usize) -> Vec<(u32, u32, u32, u32, u32, u32)> {
+        macho_reloc_entries(buf, section)
+            .into_iter()
+            .map(|(addr, info)| {
+                (
+                    addr,
+                    info & 0x00ff_ffff,
+                    info >> 24 & 1,
+                    info >> 25 & 3,
+                    info >> 27 & 1,
+                    info >> 28,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macho_arm64_tlvp_operands_emit_tlvp_load_relocations() {
+        let source = ".text\n.globl _f\n_f:\nadrp x0, _x@TLVPPAGE\nldr x1, [x0, _x@TLVPPAGEOFF]\nadd x2, x0, _x@TLVPPAGEOFF\nret\n";
+        let mut ras = crate::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS)
+            .expect("ras");
+        let buf = ras.assemble_to_bytes(source).expect("assemble");
+
+        let text = macho_section_bytes(&buf, 0);
+        assert_eq!(
+            &text[0..4],
+            &0x9000_0000u32.to_le_bytes(),
+            "adrp x0, zero page"
+        );
+        assert_eq!(&text[4..8], &0xf940_0001u32.to_le_bytes(), "ldr x1, [x0]");
+        assert_eq!(
+            &text[8..12],
+            &0x9100_0002u32.to_le_bytes(),
+            "add x2, x0, #0"
+        );
+        let relocs = macho_reloc_fields(&buf, 0);
+        assert_eq!(relocs.len(), 3);
+        assert_eq!(
+            relocs[0],
+            (0, relocs[0].1, 1, 2, 1, ARM64_RELOC_TLVP_LOAD_PAGE21)
+        );
+        assert_eq!(
+            relocs[1],
+            (4, relocs[0].1, 0, 2, 1, ARM64_RELOC_TLVP_LOAD_PAGEOFF12)
+        );
+        assert_eq!(
+            relocs[2],
+            (8, relocs[0].1, 0, 2, 1, ARM64_RELOC_TLVP_LOAD_PAGEOFF12)
+        );
+        assert_eq!(ARM64_RELOC_TLVP_LOAD_PAGE21, 8);
+        assert_eq!(ARM64_RELOC_TLVP_LOAD_PAGEOFF12, 9);
+    }
+
+    #[test]
+    fn macho_arm64_tlvp_is_refused_outside_mach_o() {
+        let source = ".text\nadrp x0, _x@TLVPPAGE\nret\n";
+        let mut ras = crate::Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+            .expect("ras");
+        let err = ras.assemble_to_bytes(source).expect_err("ELF TLVP");
+        assert!(
+            err.to_string().contains("only supported in Mach-O"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn macho_thread_sections_carry_tlv_types_and_descriptor_relocations() {
+        let source = ".section __DATA,__thread_vars,thread_local_variables\n_x:\n.quad __tlv_bootstrap\n.quad 0\n.quad _store\n.section __DATA,__thread_data,thread_local_regular\n_store:\n.quad 42\n.section __DATA,__thread_bss,thread_local_zerofill\n_b:\n.zero 8\n";
+        let mut ras =
+            crate::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::MacOS).expect("ras");
+        let buf = ras.assemble_to_bytes(source).expect("assemble");
+
+        let index_of = |name: &str| {
+            (0..le32(&buf, 32 + 64) as usize)
+                .find(|&i| macho_section_name(&buf, i) == name)
+                .unwrap_or_else(|| panic!("section {name} missing"))
+        };
+        let vars = index_of("__thread_vars");
+        let data = index_of("__thread_data");
+        let bss = index_of("__thread_bss");
+        let flags = |i: usize| le32(&buf, macho_section_header(i) + 64);
+        assert_eq!(flags(vars), 0x13, "S_THREAD_LOCAL_VARIABLES");
+        assert_eq!(flags(data), 0x11, "S_THREAD_LOCAL_REGULAR");
+        assert_eq!(flags(bss), 0x12, "S_THREAD_LOCAL_ZEROFILL");
+        assert_eq!(macho_section_bytes(&buf, data), &42u64.to_le_bytes());
+        assert_eq!(
+            le32(&buf, macho_section_header(bss) + 40),
+            8,
+            "zero-fill size"
+        );
+
+        let relocs = macho_reloc_fields(&buf, vars);
+        assert_eq!(relocs.len(), 2);
+        assert_eq!(relocs[0].0, 0, "descriptor thunk at +0");
+        assert_eq!(relocs[0].3, 3, "8-byte length");
+        assert_eq!(relocs[0].2, 0, "not pc-relative");
+        assert_eq!(relocs[0].4, 1, "extern to __tlv_bootstrap");
+        assert_eq!(relocs[0].5, X86_64_RELOC_UNSIGNED);
+        assert_eq!(relocs[1].0, 16, "storage pointer at +16");
+        assert_eq!(relocs[1].3, 3);
+        assert_eq!(relocs[1].2, 0);
+        assert_eq!(relocs[1].5, X86_64_RELOC_UNSIGNED);
     }
 }

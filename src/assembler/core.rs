@@ -18,7 +18,7 @@ use crate::{
     error::RasError,
     object::{
         ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
-        object_writer_for_os,
+        X86_64_SECREL32, object_writer_for_os,
     },
     parser::{AssemblyParser, DataExpression, Line, parse_data_expression},
     target::{ObjectFormat, object_format_for_os, unsupported_target_hint},
@@ -321,6 +321,7 @@ impl RasAssembler {
                     },
                     data: Vec::new(),
                     alignment: 1,
+                    macho: None,
                 },
             );
         }
@@ -527,6 +528,7 @@ impl RasAssembler {
                             },
                             data: Vec::new(),
                             alignment: 1,
+                            macho: None,
                         });
                     }
                     let section = sections.iter_mut().find(|s| s.name == ".bss").unwrap();
@@ -1163,7 +1165,10 @@ impl RasAssembler {
                                         operands[1]
                                     )));
                                 }
-                                None => (operands[1].as_str(), 275),
+                                None => match operands[1].strip_suffix("@TLVPPAGE") {
+                                    Some(symbol) => (symbol, 313),
+                                    None => (operands[1].as_str(), 275),
+                                },
                             };
                             let (symbol, addend) = split_addend(page)?;
                             Some(PatchPoint::AArch64 {
@@ -1213,10 +1218,14 @@ impl RasAssembler {
                         } else if opcode == "add"
                             && operands.len() == 3
                             && (operands[2].starts_with(":lo12:")
-                                || operands[2].ends_with("@PAGEOFF"))
+                                || operands[2].ends_with("@PAGEOFF")
+                                || operands[2].ends_with("@TLVPPAGEOFF"))
                         {
                             let operand = operands[2].as_str();
-                            let page_offset = operand.strip_prefix(":lo12:").unwrap_or(operand);
+                            let (page_offset, kind) = match operand.strip_suffix("@TLVPPAGEOFF") {
+                                Some(symbol) => (symbol, 314),
+                                None => (operand.strip_prefix(":lo12:").unwrap_or(operand), 277),
+                            };
                             let (symbol, addend) = split_addend(page_offset)?;
                             let (rd, wide) = crate::encoder::aarch64::gpr(&operands[0])?;
                             let (rn, _) = crate::encoder::aarch64::gpr(&operands[1])?;
@@ -1226,7 +1235,34 @@ impl RasAssembler {
                                 addend,
                                 word: if wide { 0x9100_0000 } else { 0x1100_0000 } | (rn << 5) | rd,
                                 bits: 0,
-                                kind: 277,
+                                kind,
+                                relocate: true,
+                            })
+                        } else if opcode == "ldr"
+                            && operands.len() == 3
+                            && operands[1].starts_with('[')
+                            && operands[2].ends_with("@TLVPPAGEOFF]")
+                        {
+                            let symbol = operands[2]
+                                .strip_suffix(']')
+                                .and_then(|s| s.strip_suffix("@TLVPPAGEOFF"))
+                                .unwrap_or_default();
+                            let (base, base_wide) =
+                                crate::encoder::aarch64::gpr(&operands[1][1..])?;
+                            let (rt, rt_wide) = crate::encoder::aarch64::gpr(&operands[0])?;
+                            if !base_wide || !rt_wide {
+                                return Err(RasError::EncodingError(
+                                    "Relocated ldr takes 64-bit registers".into(),
+                                ));
+                            }
+                            let (symbol, addend) = split_addend(symbol)?;
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: symbol.to_string(),
+                                addend,
+                                word: 0xf940_0000 | (base << 5) | rt,
+                                bits: 0,
+                                kind: 314,
                                 relocate: true,
                             })
                         } else {
@@ -2435,6 +2471,7 @@ fn rip_relative_patch(
         let (kind, addend) = match model {
             TlsModel::InitialExec => (R_X86_64_GOTTPOFF, addend - (4 + fixup.trailing as i64)),
             TlsModel::LocalExec => (R_X86_64_TPOFF32, addend),
+            TlsModel::SecRel => (X86_64_SECREL32, addend),
         };
         return Some(PatchPoint::X86Tls {
             offset: offset + fixup.disp_offset,

@@ -366,6 +366,7 @@ fn section(name: &str, data: Vec<u8>) -> Section {
         },
         data,
         alignment: 1,
+        macho: None,
     }
 }
 

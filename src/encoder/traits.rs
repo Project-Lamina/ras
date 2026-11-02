@@ -7,6 +7,7 @@ use crate::error::RasError;
 pub enum TlsModel {
     InitialExec,
     LocalExec,
+    SecRel,
 }
 
 /// Displacement field of a memory operand whose value the linker fills in: a
