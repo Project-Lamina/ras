@@ -1,6 +1,7 @@
 pub mod fixed;
 pub mod ldst_imm64;
 mod simd;
+mod sysreg;
 
 use crate::{
     encoder::aarch64::fixed::*,
@@ -177,7 +178,7 @@ fn encode_add_sub(op: &str, p: &[String]) -> Result<u32, RasError> {
         "cmp" => 0x6000_0000,
         "sub" => 0x4000_0000,
         "subs" => 0x6000_0000,
-        "cmn" => 0x2000_0000,
+        "cmn" | "adds" => 0x2000_0000,
         _ => 0,
     };
     let src = p[rn_index + 1].as_str();
@@ -298,9 +299,9 @@ fn logical_immediate(value: u64, wide: bool) -> Option<(u32, u32, u32)> {
 }
 
 fn encode_logical(op: &str, p: &[String]) -> Result<u32, RasError> {
-    let flag_setting = op == "ands" || op == "tst";
+    let flag_setting = matches!(op, "ands" | "bics" | "tst");
     let rn_index = usize::from(op != "tst");
-    let (min, max) = if op == "tst" { (2, 2) } else { (3, 3) };
+    let (min, max) = if op == "tst" { (2, 3) } else { (3, 4) };
     if !(min..=max).contains(&p.len()) {
         return Err(error(format!("Wrong operand count for {op}")));
     }
@@ -318,6 +319,9 @@ fn encode_logical(op: &str, p: &[String]) -> Result<u32, RasError> {
     let (base_imm, base_reg) = match op {
         "and" | "ands" | "tst" => (0x1200_0000u32, 0x0a00_0000u32),
         "orr" => (0x3200_0000, 0x2a00_0000),
+        "bic" | "bics" => (0, 0x0a20_0000),
+        "orn" => (0, 0x2a20_0000),
+        "eon" => (0, 0x4a20_0000),
         _ => (0x5200_0000, 0x4a00_0000),
     };
     let base_imm = if wide {
@@ -333,6 +337,9 @@ fn encode_logical(op: &str, p: &[String]) -> Result<u32, RasError> {
     let flags_imm = if flag_setting { 0x6000_0000 } else { 0 };
     let flags_reg = if flag_setting { 0x6000_0000 } else { 0 };
     if src.starts_with('#') {
+        if matches!(op, "bic" | "bics" | "orn" | "eon") {
+            return Err(error(format!("{op} has no immediate form")));
+        }
         let value = immediate(src)?;
         if !wide && !(-(1 << 31)..=u32::MAX as i64).contains(&value) {
             return Err(error(format!(
@@ -347,12 +354,8 @@ fn encode_logical(op: &str, p: &[String]) -> Result<u32, RasError> {
     if rm_wide != wide || is_stack_pointer(src) {
         return Err(error(format!("Invalid register operand for {op}")));
     }
-    if p.get(rn_index + 2).is_some() {
-        return Err(error(format!(
-            "Shifted logical operands are not supported for {op}"
-        )));
-    }
-    Ok(base_reg | flags_reg | (rm << 16) | (rn << 5) | rd)
+    let (kind, amount) = shifted_register(p.get(rn_index + 2).map(|s| s.trim()), wide)?;
+    Ok(base_reg | flags_reg | (kind << 22) | (rm << 16) | (amount << 10) | (rn << 5) | rd)
 }
 
 /// Moves `value` into `rd` with one `movz` or `movn`, a bitmask `orr` from the zero register,
@@ -389,6 +392,15 @@ fn mov_immediate_words(value: u64, wide: bool, rd: u32) -> Vec<u32> {
         return vec![base | (n << 22) | (immr << 16) | (imms << 10) | (31 << 5) | rd];
     }
     words
+}
+
+/// The condition for an alias that inverts its operand, which is never AL or NV.
+fn inverted_condition(text: &str) -> Result<u32, RasError> {
+    let cond = condition(text)?;
+    if cond >= 14 {
+        return Err(error(format!("Condition {text} is invalid here")));
+    }
+    Ok(cond ^ 1)
 }
 
 fn sf_of(wide: bool) -> u32 {
@@ -448,10 +460,13 @@ fn max_operands(op: &str) -> Option<usize> {
     Some(match op {
         "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" => 0,
         "ret" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "dmb" | "udf" => 1,
-        "mov" | "uxtb" | "sxtw" | "fmov" | "cset" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => 2,
+        "mov" | "uxtb" | "uxth" | "sxtw" | "fmov" | "cset" | "csetm" | "scvtf" | "ucvtf"
+        | "fcvtzs" | "fcvtzu" | "mrs" | "msr" | "ngc" | "ngcs" => 2,
         "movz" | "movk" | "mul" | "smulh" | "umulh" | "sdiv" | "udiv" | "fmul" | "fdiv"
-        | "fadd" | "fsub" | "lsl" | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => 3,
-        "csel" | "csinv" | "msub" | "sbfx" | "ubfx" => 4,
+        | "fadd" | "fsub" | "lsl" | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv"
+        | "smull" | "umull" | "mvn" | "cinc" | "cinv" | "cneg" => 3,
+        "csel" | "csinc" | "csinv" | "csneg" | "msub" | "madd" | "sbfx" | "ubfx" | "sbfiz"
+        | "ubfiz" | "bfi" | "bfxil" | "extr" | "smaddl" | "umaddl" => 4,
         _ => return None,
     })
 }
@@ -611,8 +626,67 @@ impl AArch64Encoder {
                     }
                 }
             }
-            "add" | "sub" | "subs" | "cmp" | "cmn" => encode_add_sub(op, p)?,
-            "and" | "orr" | "eor" | "ands" | "tst" => encode_logical(op, p)?,
+            "mrs" => sysreg::encode_mrs(p)?,
+            "msr" => sysreg::encode_msr(p)?,
+            "add" | "sub" | "subs" | "adds" | "cmp" | "cmn" => encode_add_sub(op, p)?,
+            "and" | "orr" | "eor" | "ands" | "tst" | "bic" | "bics" | "orn" | "eon" => {
+                encode_logical(op, p)?
+            }
+            "mvn" => {
+                let ([rd, rm], wide) = gpr_regs::<2>(p)?;
+                let (kind, amount) = shifted_register(p.get(2).map(|s| s.trim()), wide)?;
+                0x2a20_03e0 | sf_of(wide) | (kind << 22) | (rm << 16) | (amount << 10) | rd
+            }
+            "adc" | "adcs" | "sbc" | "sbcs" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
+                let base = match op {
+                    "adc" => 0x1a00_0000,
+                    "adcs" => 0x3a00_0000,
+                    "sbc" => 0x5a00_0000,
+                    _ => 0x7a00_0000,
+                };
+                base | sf_of(wide) | (rm << 16) | (rn << 5) | rd
+            }
+            "ngc" | "ngcs" => {
+                let ([rd, rm], wide) = gpr_regs::<2>(p)?;
+                let base = if op == "ngc" {
+                    0x5a00_03e0
+                } else {
+                    0x7a00_03e0
+                };
+                base | sf_of(wide) | (rm << 16) | rd
+            }
+            "madd" => {
+                let ([rd, rn, rm, ra], wide) = gpr_regs::<4>(p)?;
+                let base = if wide { 0x9b00_0000 } else { 0x1b00_0000 };
+                base | (rm << 16) | (ra << 10) | (rn << 5) | rd
+            }
+            "smaddl" | "umaddl" | "smull" | "umull" => {
+                let (rd, rd_wide) = gpr(arg(0)?)?;
+                let (rn, rn_wide) = gpr(arg(1)?)?;
+                let (rm, rm_wide) = gpr(arg(2)?)?;
+                let narrow_ok = [arg(0)?, arg(1)?, arg(2)?]
+                    .iter()
+                    .all(|reg| !is_stack_pointer(reg));
+                if !rd_wide || rn_wide || rm_wide || !narrow_ok {
+                    return Err(error(format!("{op} takes an x destination and w sources")));
+                }
+                let ra = if op.ends_with("addl") {
+                    let (ra, ra_wide) = gpr(arg(3)?)?;
+                    if !ra_wide || is_stack_pointer(arg(3)?) {
+                        return Err(error(format!("{op} takes an x accumulator")));
+                    }
+                    ra
+                } else {
+                    31
+                };
+                let base = if op.starts_with('s') {
+                    0x9b20_0000
+                } else {
+                    0x9ba0_0000
+                };
+                base | (rm << 16) | (ra << 10) | (rn << 5) | rd
+            }
             "mul" | "sdiv" | "udiv" => {
                 let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
                 let base = match op {
@@ -650,18 +724,49 @@ impl AArch64Encoder {
                 }
                 0x1a9f_07e0 | (if wide { 0x8000_0000 } else { 0 }) | ((cond ^ 1) << 12) | rd
             }
-            "csel" | "csinv" => {
+            "cinc" | "cinv" | "cneg" => {
+                let ([rd, rn], wide) = gpr_regs::<2>(p)?;
+                let base = match op {
+                    "cinc" => 0x1a80_0400,
+                    "cinv" => 0x5a80_0000,
+                    _ => 0x5a80_0400,
+                };
+                base | sf_of(wide)
+                    | (rn << 16)
+                    | (inverted_condition(arg(2)?)? << 12)
+                    | (rn << 5)
+                    | rd
+            }
+            "csetm" => {
+                let ([rd], wide) = gpr_regs::<1>(p)?;
+                0x5a80_0000
+                    | sf_of(wide)
+                    | (31 << 16)
+                    | (inverted_condition(arg(1)?)? << 12)
+                    | (31 << 5)
+                    | rd
+            }
+            "csel" | "csinc" | "csinv" | "csneg" => {
                 let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
-                let base = if op == "csel" {
-                    0x1a80_0000
-                } else {
-                    0x5a80_0000
+                let base = match op {
+                    "csel" => 0x1a80_0000,
+                    "csinc" => 0x1a80_0400,
+                    "csinv" => 0x5a80_0000,
+                    _ => 0x5a80_0400,
                 };
                 base | (if wide { 0x8000_0000 } else { 0 })
                     | (rm << 16)
                     | (condition(arg(3)?)? << 12)
                     | (rn << 5)
                     | rd
+            }
+            "uxth" => {
+                let (rd, rd_wide) = gpr(arg(0)?)?;
+                let (rn, rn_wide) = gpr(arg(1)?)?;
+                if rd_wide || rn_wide || is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
+                    return Err(error("uxth takes 32-bit registers"));
+                }
+                0x5300_3c00 | (rn << 5) | rd
             }
             "uxtb" => {
                 let (rd, _) = gpr(arg(0)?)?;
@@ -746,7 +851,7 @@ impl AArch64Encoder {
                     | (rn << 5)
                     | rd
             }
-            "sbfx" | "ubfx" => {
+            "sbfx" | "ubfx" | "sbfiz" | "ubfiz" | "bfi" | "bfxil" => {
                 let (rd, rd_wide) = gpr(arg(0)?)?;
                 let (rn, rn_wide) = gpr(arg(1)?)?;
                 if rd_wide != rn_wide || is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
@@ -758,17 +863,29 @@ impl AArch64Encoder {
                 if lsb < 0 || width < 1 || lsb + width > size {
                     return Err(error(format!("Bitfield out of range for {op}")));
                 }
-                let base = if op == "sbfx" {
-                    0x1300_0000
+                let insert = matches!(op, "sbfiz" | "ubfiz" | "bfi");
+                let (immr, imms) = if insert {
+                    ((size - lsb) % size, width - 1)
                 } else {
-                    0x5300_0000
+                    (lsb, lsb + width - 1)
+                };
+                let base = match op {
+                    "sbfx" | "sbfiz" => 0x1300_0000,
+                    "ubfx" | "ubfiz" => 0x5300_0000,
+                    _ => 0x3300_0000,
                 };
                 let n = if rd_wide { 0x8040_0000u32 } else { 0 };
-                base | n
-                    | ((lsb as u32) << 16)
-                    | (((lsb + width - 1) as u32) << 10)
-                    | (rn << 5)
-                    | rd
+                base | n | ((immr as u32) << 16) | ((imms as u32) << 10) | (rn << 5) | rd
+            }
+            "extr" => {
+                let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
+                let size = if wide { 64 } else { 32 };
+                let lsb = immediate(arg(3)?)?;
+                if !(0..size).contains(&lsb) {
+                    return Err(error(format!("extr lsb out of range: {lsb}")));
+                }
+                let base = if wide { 0x93c0_0000 } else { 0x1380_0000 };
+                base | (rm << 16) | ((lsb as u32) << 10) | (rn << 5) | rd
             }
             "fmov" => {
                 if is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
@@ -1249,5 +1366,110 @@ mod exclusive_tests {
         assert_eq!(word("neg", &["x0", "x1"]), 0xCB01_03E0);
         assert_eq!(word("cnt", &["v0.8b", "v1.8b"]), 0x0E20_5820);
         assert_eq!(word("addv", &["b0", "v1.8b"]), 0x0E31_B820);
+    }
+
+    /// The sysreg fields come from the ARM ARM (DDI 0487) system register table; the
+    /// MRS, MSR (register) and MSR (immediate) fixed bits are from the system instruction class.
+    #[test]
+    fn system_register_access_matches_arm_arm() {
+        assert_eq!(word("mrs", &["x9", "cntvct_el0"]), 0xD53B_E049);
+        assert_eq!(word("mrs", &["x9", "s3_3_c14_c0_2"]), 0xD53B_E049);
+        assert_eq!(word("mrs", &["x0", "nzcv"]), 0xD53B_4200);
+        assert_eq!(word("mrs", &["x3", "s3_1_c15_c2_6"]), 0xD539_F2C3);
+        assert_eq!(word("mrs", &["x4", "s2_0_c0_c0_0"]), 0xD530_0004);
+        assert_eq!(word("mrs", &["xzr", "midr_el1"]), 0xD538_001F);
+        assert_eq!(word("msr", &["tpidr_el0", "x1"]), 0xD51B_D041);
+        assert_eq!(word("msr", &["fpcr", "x2"]), 0xD51B_4402);
+        assert_eq!(word("msr", &["DAIF", "x2"]), 0xD51B_4222);
+        assert_eq!(word("msr", &["daifset", "#2"]), 0xD503_42DF);
+        assert_eq!(word("msr", &["daifclr", "#15"]), 0xD503_4FFF);
+        assert_eq!(word("msr", &["spsel", "#1"]), 0xD500_41BF);
+    }
+
+    #[test]
+    fn logical_add_carry_select_and_multiply_forms_match_arm_arm() {
+        assert_eq!(word("orn", &["x0", "x1", "x2"]), 0xAA22_0020);
+        assert_eq!(word("bic", &["w3", "w4", "w5", "lsl #2"]), 0x0A25_0883);
+        assert_eq!(word("bics", &["x0", "x1", "x2"]), 0xEA22_0020);
+        assert_eq!(word("eon", &["x0", "x1", "x2"]), 0xCA22_0020);
+        assert_eq!(word("mvn", &["x0", "x1"]), 0xAA21_03E0);
+        assert_eq!(word("mvn", &["w2", "w3", "asr #7"]), 0x2AA3_1FE2);
+        assert_eq!(word("and", &["w0", "w1", "w2", "lsl #4"]), 0x0A02_1020);
+        assert_eq!(word("adds", &["x0", "x1", "x2"]), 0xAB02_0020);
+        assert_eq!(word("adc", &["x0", "x1", "x2"]), 0x9A02_0020);
+        assert_eq!(word("adcs", &["w0", "w1", "w2"]), 0x3A02_0020);
+        assert_eq!(word("sbc", &["x0", "x1", "x2"]), 0xDA02_0020);
+        assert_eq!(word("sbcs", &["x0", "x1", "x2"]), 0xFA02_0020);
+        assert_eq!(word("ngc", &["x0", "x1"]), 0xDA01_03E0);
+        assert_eq!(word("csinc", &["x0", "x1", "x2", "eq"]), 0x9A82_0420);
+        assert_eq!(word("csneg", &["x0", "x1", "x2", "ne"]), 0xDA82_1420);
+        assert_eq!(word("cinc", &["x0", "x1", "eq"]), 0x9A81_1420);
+        assert_eq!(word("cinv", &["w0", "w1", "lt"]), 0x5A81_A020);
+        assert_eq!(word("cneg", &["x0", "x1", "hi"]), 0xDA81_9420);
+        assert_eq!(word("csetm", &["x0", "eq"]), 0xDA9F_13E0);
+        assert_eq!(word("madd", &["x0", "x1", "x2", "x3"]), 0x9B02_0C20);
+        assert_eq!(word("madd", &["w0", "w1", "w2", "w3"]), 0x1B02_0C20);
+        assert_eq!(word("smaddl", &["x0", "w1", "w2", "x3"]), 0x9B22_0C20);
+        assert_eq!(word("umaddl", &["x0", "w1", "w2", "x3"]), 0x9BA2_0C20);
+        assert_eq!(word("smull", &["x0", "w1", "w2"]), 0x9B22_7C20);
+        assert_eq!(word("umull", &["x0", "w1", "w2"]), 0x9BA2_7C20);
+    }
+
+    #[test]
+    fn bitfield_insert_extract_and_halfword_zero_extend_match_arm_arm() {
+        assert_eq!(word("bfi", &["x0", "x1", "#4", "#8"]), 0xB37C_1C20);
+        assert_eq!(word("bfxil", &["w2", "w3", "#5", "#3"]), 0x3305_1C62);
+        assert_eq!(word("ubfiz", &["x0", "x1", "#2", "#3"]), 0xD37E_0820);
+        assert_eq!(word("sbfiz", &["x0", "x1", "#4", "#8"]), 0x937C_1C20);
+        assert_eq!(word("sbfx", &["w0", "w1", "#3", "#4"]), 0x1303_1820);
+        assert_eq!(word("extr", &["x0", "x1", "x2", "#5"]), 0x93C2_1420);
+        assert_eq!(word("extr", &["w0", "w1", "w2", "#31"]), 0x1382_7C20);
+        assert_eq!(word("uxth", &["w0", "w1"]), 0x5300_3C20);
+    }
+
+    #[test]
+    fn system_register_and_operand_errors_are_refused() {
+        let refused = [
+            ("mrs", &["x0", "tpidr_el9"][..]),
+            ("mrs", &["x0", "s1_0_c0_c0_0"]),
+            ("mrs", &["x0", "s3_8_c0_c0_0"]),
+            ("mrs", &["x0", "s3_0_c16_c0_0"]),
+            ("mrs", &["x0", "s3_0_c0_c0"]),
+            ("mrs", &["x0", "s3_0_c0_0_0"]),
+            ("mrs", &["w0", "nzcv"]),
+            ("mrs", &["sp", "nzcv"]),
+            ("mrs", &["x0"]),
+            ("msr", &["nzcv", "w0"]),
+            ("msr", &["nzcv", "sp"]),
+            ("msr", &["daifset", "#16"]),
+            ("msr", &["daifset", "#-1"]),
+            ("msr", &["spsel", "#2"]),
+            ("msr", &["nzcv", "#1"]),
+            ("msr", &["daifset", "x0"]),
+            ("bic", &["x0", "x1", "#1"]),
+            ("orn", &["x0", "x1", "w2"]),
+            ("adc", &["x0", "x1", "w2"]),
+            ("cinc", &["x0", "x1", "al"]),
+            ("csetm", &["x0", "nv"]),
+            ("madd", &["x0", "x1", "x2", "w3"]),
+            ("smaddl", &["w0", "w1", "w2", "x3"]),
+            ("smull", &["x0", "sp", "w2"]),
+            ("extr", &["x0", "x1", "x2", "#64"]),
+            ("extr", &["w0", "w1", "w2", "#32"]),
+            ("bfi", &["x0", "x1", "#60", "#8"]),
+            ("bfxil", &["w0", "w1", "#30", "#4"]),
+            ("uxth", &["x0", "w1"]),
+            ("uxth", &["w0", "x1"]),
+        ];
+        for (op, operands) in refused {
+            let inst = ParsedInstruction {
+                opcode: op.to_string(),
+                operands: operands.iter().map(|s| s.to_string()).collect(),
+            };
+            assert!(
+                AArch64Encoder::new().encode_instruction(&inst).is_err(),
+                "{op} {operands:?}"
+            );
+        }
     }
 }
