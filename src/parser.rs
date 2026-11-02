@@ -109,6 +109,8 @@ pub struct AssemblyParser {
     attributes: HashMap<String, SymbolAttributes>,
     pending_globals: HashSet<String>,
     symbol_names: HashSet<String>,
+    /// Name of the symbol a `.def`/`.endef` block is currently describing.
+    coff_def: Option<String>,
     /// Darwin reads the third `.comm` operand and `.align` as log2 exponents.
     darwin: bool,
     line_comments: &'static [&'static str],
@@ -136,6 +138,7 @@ impl AssemblyParser {
             attributes: HashMap::new(),
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
+            coff_def: None,
             darwin: false,
             line_comments: &["#", "//"],
         }
@@ -601,6 +604,24 @@ impl AssemblyParser {
                     fill,
                     max_skip,
                 });
+            }
+            ".def" => {
+                let name = parts
+                    .get(1)
+                    .ok_or_else(|| RasError::ParseError("Invalid .def".into()))?;
+                self.coff_def = Some(symbol_name(name.trim_end_matches(';').trim())?.into());
+            }
+            ".scl" => {}
+            ".endef" => self.coff_def = None,
+            ".type" if self.coff_def.is_some() => {
+                let name = self.coff_def.clone().unwrap_or_default();
+                let value: u16 = parts
+                    .get(1)
+                    .and_then(|v| v.trim_end_matches(';').trim().parse().ok())
+                    .ok_or_else(|| RasError::ParseError("Invalid .type in .def".into()))?;
+                if value >> 4 == 2 {
+                    self.attributes.entry(name).or_default().symbol_type = 2;
+                }
             }
             ".type" => {
                 let (name, kind) = line[parts[0].len()..]

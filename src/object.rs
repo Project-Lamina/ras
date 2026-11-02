@@ -1664,17 +1664,28 @@ impl ObjectWriter for CoffWriter {
             ));
             nsyms += 1;
         }
+        let declared_function: std::collections::HashSet<&str> = req
+            .symbols
+            .iter()
+            .filter(|s| s.attributes.symbol_type == 2)
+            .map(|s| s.name.as_str())
+            .collect();
         for r in relocations.iter().filter(|r| !r.section_symbol) {
             if symbol_index.contains_key(r.symbol.as_str()) {
                 continue;
             }
+            let ty = if declared_function.contains(r.symbol.as_str()) {
+                IMAGE_SYM_DTYPE_FUNCTION
+            } else {
+                0
+            };
             symbol_index.insert(r.symbol.as_str(), nsyms);
             sym_bytes.extend_from_slice(&coff_symbol_entry(
                 &mut strtab,
                 &r.symbol,
                 0,
                 IMAGE_SYM_UNDEFINED,
-                0,
+                ty,
                 IMAGE_SYM_CLASS_EXTERNAL,
                 0,
             ));
@@ -2503,6 +2514,7 @@ mod tests {
         name: String,
         value: u32,
         section: i16,
+        typ: u16,
         class: u8,
     }
 
@@ -2575,6 +2587,7 @@ mod tests {
                 name: name_at(&buf[e..e + 8]),
                 value: u32_at(e + 8),
                 section: u16_at(e + 12) as i16,
+                typ: u16_at(e + 14),
                 class: buf[e + 16],
             });
             for _ in 0..aux {
@@ -2582,6 +2595,7 @@ mod tests {
                     name: String::new(),
                     value: 0,
                     section: 0,
+                    typ: 0,
                     class: 0,
                 });
             }
@@ -2726,6 +2740,30 @@ mod tests {
         assert_eq!(obj.symbols[symidx as usize].name, "ro");
         assert_eq!(&text.data[3..7], &[0, 0, 0, 0]);
         assert_eq!(&text.data[10..14], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn coff_undefined_function_symbols_carry_the_function_type() {
+        let sections = [coff_section(".text", true, false, vec![0; 16])];
+        let mut declared = coff_symbol("printf", true, "", 0);
+        declared.attributes.symbol_type = 2;
+        let symbols = [coff_symbol("main", true, ".text", 0), declared];
+        let relocations = [
+            coff_reloc(".text", 3, "printf", 4, 0),
+            coff_reloc(".text", 10, "datasym", 4, 0),
+        ];
+        let buf = coff_object(&sections, &symbols, &relocations);
+        let obj = coff_parse(&buf);
+
+        let kind = |want: &str| {
+            obj.symbols
+                .iter()
+                .find(|s| s.name == want)
+                .unwrap_or_else(|| panic!("{want} missing"))
+                .typ
+        };
+        assert_eq!(kind("printf") & 0xF0, IMAGE_SYM_DTYPE_FUNCTION);
+        assert_eq!(kind("datasym") & 0xF0, 0);
     }
 
     #[test]
