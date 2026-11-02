@@ -22,8 +22,8 @@ pub(crate) fn register(reg: &str) -> Result<u8, RasError> {
         "fp" => Ok(29),
         "lr" => Ok(30),
         _ => {
-            let fp = reg.starts_with(['s', 'd']);
-            reg.strip_prefix(['x', 'w', 's', 'd'])
+            let fp = reg.starts_with(['s', 'd', 'q']);
+            reg.strip_prefix(['x', 'w', 's', 'd', 'q'])
                 .and_then(|n| n.parse::<u8>().ok())
                 .filter(|n| *n < 31 || (fp && *n == 31))
                 .ok_or_else(|| error(format!("Invalid AArch64 register: {reg}")))
@@ -73,6 +73,7 @@ enum DataKind {
     X,
     S,
     D,
+    Q,
 }
 
 /// A load or store data register and its kind; a stack pointer is not a data register.
@@ -85,6 +86,7 @@ fn data_reg(reg: &str) -> Result<(u32, DataKind), RasError> {
         Some(b'x') => DataKind::X,
         Some(b's') => DataKind::S,
         Some(b'd') => DataKind::D,
+        Some(b'q') => DataKind::Q,
         _ => return Err(error(format!("Expected a load or store register: {reg}"))),
     };
     Ok((u32::from(register(reg)?), kind))
@@ -448,7 +450,7 @@ fn max_operands(op: &str) -> Option<usize> {
         "mov" | "uxtb" | "sxtw" | "fmov" | "cset" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => 2,
         "movz" | "movk" | "mul" | "sdiv" | "udiv" | "fmul" | "fdiv" | "fadd" | "fsub" | "lsl"
         | "lsr" | "asr" | "ror" | "lslv" | "lsrv" | "asrv" | "rorv" => 3,
-        "csel" | "msub" | "sbfx" | "ubfx" => 4,
+        "csel" | "csinv" | "msub" | "sbfx" | "ubfx" => 4,
         _ => return None,
     })
 }
@@ -632,10 +634,14 @@ impl AArch64Encoder {
                 }
                 0x1a9f_07e0 | (if wide { 0x8000_0000 } else { 0 }) | ((cond ^ 1) << 12) | rd
             }
-            "csel" => {
+            "csel" | "csinv" => {
                 let ([rd, rn, rm], wide) = gpr_regs::<3>(p)?;
-                0x1a80_0000
-                    | (if wide { 0x8000_0000 } else { 0 })
+                let base = if op == "csel" {
+                    0x1a80_0000
+                } else {
+                    0x5a80_0000
+                };
+                base | (if wide { 0x8000_0000 } else { 0 })
                     | (rm << 16)
                     | (condition(arg(3)?)? << 12)
                     | (rn << 5)
@@ -896,6 +902,7 @@ impl AArch64Encoder {
                         DataKind::X => (8, 0x8000_0000),
                         DataKind::S => (4, 0x0400_0000),
                         DataKind::D => (8, 0x4400_0000),
+                        DataKind::Q => (16, 0x8400_0000),
                     };
                     if offset % scale != 0 || !(-64..=63).contains(&(offset / scale)) {
                         return Err(error("Pair offset out of range"));
@@ -968,8 +975,10 @@ impl AArch64Encoder {
                         (false, DataKind::X) => (3, false),
                         (false, DataKind::S) => (2, true),
                         (false, DataKind::D) => (3, true),
+                        (false, DataKind::Q) => (0, true),
                     }
                 };
+                let scale = if kind == DataKind::Q { 4 } else { size };
                 let offset = match post_offset {
                     Some(text) => immediate(text)?,
                     None => fields.get(1).map_or(Ok(0), |s| immediate(s))?,
@@ -988,10 +997,12 @@ impl AArch64Encoder {
                 let scaled = !writeback
                     && !op.contains("ur")
                     && offset >= 0
-                    && offset % (1 << size) == 0
-                    && offset / (1 << size) <= 4095;
+                    && offset % (1 << scale) == 0
+                    && offset / (1 << scale) <= 4095;
                 let opc: u32 = if signed {
                     if kind == DataKind::X { 2 } else { 3 }
+                } else if kind == DataKind::Q {
+                    if load { 3 } else { 2 }
                 } else if load {
                     1
                 } else {
@@ -1009,7 +1020,7 @@ impl AArch64Encoder {
                         0
                     };
                 let imm = if scaled {
-                    ((offset >> size) as u32) << 10
+                    ((offset >> scale) as u32) << 10
                 } else {
                     if !(-256..=255).contains(&offset) {
                         return Err(error(format!("Load/store offset out of range: {offset}")));
@@ -1136,6 +1147,16 @@ mod exclusive_tests {
         assert_eq!(word("fneg", &["s0", "s1"]), 0x1E21_4020);
         assert_eq!(word("fcvt", &["d0", "s0"]), 0x1E22_C000);
         assert_eq!(word("fcvt", &["s0", "d0"]), 0x1E62_4000);
+    }
+
+    #[test]
+    fn csinv_and_quad_register_access_match_arm_arm() {
+        assert_eq!(word("csinv", &["w0", "w1", "w2", "eq"]), 0x5A82_0020);
+        assert_eq!(word("csinv", &["x0", "x0", "xzr", "cc"]), 0xDA9F_3000);
+        assert_eq!(word("ldr", &["q0", "[x9]"]), 0x3DC0_0120);
+        assert_eq!(word("str", &["q0", "[x9]"]), 0x3D80_0120);
+        assert_eq!(word("ldr", &["q1", "[x10, #16]"]), 0x3DC0_0541);
+        assert_eq!(word("stp", &["q0", "q1", "[sp, #16]"]), 0xAD00_87E0);
     }
 
     #[test]
