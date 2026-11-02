@@ -1396,6 +1396,117 @@ impl ObjectWriter for MachOWriter {
     }
 }
 
+const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+const IMAGE_SYM_UNDEFINED: i16 = 0;
+const IMAGE_SYM_ABSOLUTE: i16 = -1;
+const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+const IMAGE_SYM_CLASS_STATIC: u8 = 3;
+const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
+
+const IMAGE_REL_AMD64_ADDR64: u16 = 1;
+const IMAGE_REL_AMD64_ADDR32: u16 = 2;
+const IMAGE_REL_AMD64_REL32: u16 = 4;
+
+const COFF_SECTION_HEADER_SIZE: usize = 40;
+const COFF_SYMBOL_SIZE: usize = 18;
+const COFF_RELOC_SIZE: usize = 10;
+const COFF_RAW_ALIGN: usize = 16;
+
+fn coff_is_uninitialized(section: &Section) -> bool {
+    section.name == ".bss"
+}
+
+fn coff_align_bits(align: usize) -> Result<u32, RasError> {
+    if !align.is_power_of_two() || align > 8192 {
+        return Err(RasError::ObjectError(format!(
+            "COFF section alignment {align} is not a power of two up to 8192"
+        )));
+    }
+    Ok((align.trailing_zeros() + 1) << 20)
+}
+
+fn coff_section_characteristics(section: &Section) -> Result<u32, RasError> {
+    let mut flags = coff_align_bits(section.alignment.max(1))?;
+    if section.flags.exec {
+        flags |= IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    } else if coff_is_uninitialized(section) {
+        flags |= IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    } else {
+        flags |= IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        if section.flags.write {
+            flags |= IMAGE_SCN_MEM_WRITE;
+        }
+    }
+    if !section.flags.alloc {
+        flags |= IMAGE_SCN_MEM_DISCARDABLE;
+    }
+    Ok(flags)
+}
+
+fn coff_reloc_type(kind: u32, symbol: &str) -> Result<(u16, usize), RasError> {
+    match kind {
+        1 => Ok((IMAGE_REL_AMD64_ADDR64, 8)),
+        10 | 11 => Ok((IMAGE_REL_AMD64_ADDR32, 4)),
+        12 | 14 => Err(RasError::ObjectError(format!(
+            "x86_64 relocation kind {kind} for {symbol} has no COFF equivalent"
+        ))),
+        _ => Ok((IMAGE_REL_AMD64_REL32, 4)),
+    }
+}
+
+fn coff_symbol_entry(
+    strtab: &mut Vec<u8>,
+    name: &str,
+    value: u32,
+    section: i16,
+    ty: u16,
+    class: u8,
+    aux: u8,
+) -> [u8; COFF_SYMBOL_SIZE] {
+    let mut entry = [0u8; COFF_SYMBOL_SIZE];
+    let nb = name.as_bytes();
+    if nb.len() <= 8 {
+        entry[..nb.len()].copy_from_slice(nb);
+    } else {
+        let off = strtab.len() as u32;
+        entry[4..8].copy_from_slice(&off.to_le_bytes());
+        strtab.extend_from_slice(nb);
+        strtab.push(0);
+    }
+    entry[8..12].copy_from_slice(&value.to_le_bytes());
+    entry[12..14].copy_from_slice(&section.to_le_bytes());
+    entry[14..16].copy_from_slice(&ty.to_le_bytes());
+    entry[16] = class;
+    entry[17] = aux;
+    entry
+}
+
+fn coff_section_name(name: &str, strtab: &mut Vec<u8>) -> Result<[u8; 8], RasError> {
+    let mut out = [0u8; 8];
+    if name.len() <= 8 {
+        out[..name.len()].copy_from_slice(name.as_bytes());
+        return Ok(out);
+    }
+    let off = strtab.len();
+    strtab.extend_from_slice(name.as_bytes());
+    strtab.push(0);
+    let text = format!("/{off}");
+    if text.len() > 8 {
+        return Err(RasError::ObjectError(format!(
+            "COFF string table offset {off} does not fit a section name"
+        )));
+    }
+    out[..text.len()].copy_from_slice(text.as_bytes());
+    Ok(out)
+}
+
 pub struct CoffWriter;
 
 impl Default for CoffWriter {
@@ -1410,19 +1521,8 @@ impl CoffWriter {
     }
 }
 
-const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
-const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
-const IMAGE_SCN_ALIGN_16BYTES: u32 = 0x0050_0000;
-const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
-const IMAGE_SYM_CLASS_STATIC: u8 = 3;
-
-const IMAGE_REL_AMD64_REL32: u16 = 4;
-
 impl ObjectWriter for CoffWriter {
     fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
-        let code = req.code;
-        let symbols = req.symbols;
         let relocations = req.relocations;
         if req.target_arch != TargetArchitecture::X86_64 {
             return Err(RasError::ObjectError(format!(
@@ -1430,155 +1530,256 @@ impl ObjectWriter for CoffWriter {
                 req.target_arch
             )));
         }
-
-        let mut extern_names: Vec<String> = Vec::new();
-        for r in relocations {
-            if !extern_names.contains(&r.symbol) {
-                extern_names.push(r.symbol.clone());
-            }
-        }
-
-        let exported: Vec<&ObjectSymbol> = symbols
-            .iter()
-            .filter(|s| s.global && !s.name.starts_with(".L"))
-            .collect();
-
-        // Symbol index layout: 0 = .text section, 1..=exported, then extern symbols.
-        let mut strtab: Vec<u8> = vec![0u8; 4]; // size placeholder
-        let mut sym_bytes: Vec<u8> = Vec::new();
-
-        let push_sym = |sym_bytes: &mut Vec<u8>,
-                        strtab: &mut Vec<u8>,
-                        name: &str,
-                        value: u32,
-                        section: i16,
-                        ty: u16,
-                        storage: u8| {
-            let mut entry = [0u8; 18];
-            let nb = name.as_bytes();
-            if nb.len() <= 8 {
-                entry[..nb.len()].copy_from_slice(nb);
-            } else {
-                let off = strtab.len() as u32;
-                entry[4..8].copy_from_slice(&off.to_le_bytes());
-                strtab.extend_from_slice(nb);
-                strtab.push(0);
-            }
-            entry[8..12].copy_from_slice(&value.to_le_bytes());
-            entry[12..14].copy_from_slice(&section.to_le_bytes());
-            entry[14..16].copy_from_slice(&ty.to_le_bytes());
-            entry[16] = storage;
-            sym_bytes.extend_from_slice(&entry);
-        };
-
-        push_sym(
-            &mut sym_bytes,
-            &mut strtab,
-            ".text",
-            0,
-            1,
-            0,
-            IMAGE_SYM_CLASS_STATIC,
-        );
-        for sym in &exported {
-            push_sym(
-                &mut sym_bytes,
-                &mut strtab,
-                &sym.name,
-                sym.value as u32,
-                1,
-                0x20,
-                2, /* EXTERNAL */
-            );
-        }
-        let extern_base_idx = 1 + exported.len();
-        for name in &extern_names {
-            push_sym(&mut sym_bytes, &mut strtab, name, 0, 0, 0x20, 2);
-        }
-
-        let strtab_size = strtab.len() as u32;
-        strtab[0..4].copy_from_slice(&strtab_size.to_le_bytes());
-        let total_syms = (1 + exported.len() + extern_names.len()) as u32;
-
         if let Some(r) = relocations.iter().find(|r| matches!(r.kind, 18 | 22 | 23)) {
             return Err(RasError::ObjectError(format!(
                 "x86_64 TLS relocation kind {} for {} is only supported in ELF objects",
                 r.kind, r.symbol
             )));
         }
-        // Build COFF relocation entries (10 bytes each).
-        let mut reloc_bytes: Vec<u8> = Vec::new();
-        for r in relocations {
-            let sym_idx = extern_base_idx
-                + extern_names
-                    .iter()
-                    .position(|n| *n == r.symbol)
-                    .unwrap_or(0);
-            reloc_bytes.extend_from_slice(&(r.offset as u32).to_le_bytes()); // VirtualAddress
-            reloc_bytes.extend_from_slice(&(sym_idx as u32).to_le_bytes()); // SymbolTableIndex
-            reloc_bytes.extend_from_slice(&IMAGE_REL_AMD64_REL32.to_le_bytes()); // Type
-        }
-        let n_relocs = relocations.len() as u16;
 
-        let hdr_sz = 20usize;
-        let sec_hdr_sz = 40usize;
-        let align = 16usize;
-        let padded_len = (code.len().div_ceil(align) * align) as u32;
-        let raw_data_off = hdr_sz + sec_hdr_sz;
-        let reloc_off = raw_data_off + padded_len as usize;
-        let sym_off = reloc_off + reloc_bytes.len();
-
-        let text_name = b".text\0\0\0";
-        let sec_flags = IMAGE_SCN_CNT_CODE
-            | IMAGE_SCN_ALIGN_16BYTES
-            | IMAGE_SCN_MEM_EXECUTE
-            | IMAGE_SCN_MEM_READ;
-
-        let map = |e: std::io::Error| RasError::ObjectError(format!("COFF write: {}", e));
-        let mut f: Vec<u8> = Vec::new();
-
-        // COFF file header (20 bytes)
-        f.write_all(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes())
-            .map_err(map)?;
-        f.write_all(&1u16.to_le_bytes()).map_err(map)?;
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?;
-        f.write_all(&(sym_off as u32).to_le_bytes()).map_err(map)?;
-        f.write_all(&total_syms.to_le_bytes()).map_err(map)?;
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?;
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?;
-
-        // .text section header (40 bytes)
-        f.write_all(text_name).map_err(map)?;
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?; // VirtualSize
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?; // VirtualAddress
-        f.write_all(&padded_len.to_le_bytes()).map_err(map)?; // SizeOfRawData
-        f.write_all(&(raw_data_off as u32).to_le_bytes())
-            .map_err(map)?; // PointerToRawData
-        if n_relocs > 0 {
-            f.write_all(&(reloc_off as u32).to_le_bytes())
-                .map_err(map)?; // PointerToRelocations
+        let default_sections;
+        let sections: &[Section] = if req.sections.is_empty() {
+            default_sections = [Section {
+                group: None,
+                name: ".text".into(),
+                flags: crate::parser::SectionFlags {
+                    alloc: true,
+                    exec: true,
+                    write: false,
+                    tls: false,
+                },
+                data: req.code.to_vec(),
+                alignment: 16,
+            }];
+            &default_sections
         } else {
-            f.write_all(&0u32.to_le_bytes()).map_err(map)?;
+            req.sections
+        };
+        if sections.len() > u16::MAX as usize {
+            return Err(RasError::ObjectError(
+                "COFF object has too many sections".into(),
+            ));
         }
-        f.write_all(&0u32.to_le_bytes()).map_err(map)?; // PointerToLinenumbers
-        f.write_all(&n_relocs.to_le_bytes()).map_err(map)?; // NumberOfRelocations
-        f.write_all(&0u16.to_le_bytes()).map_err(map)?; // NumberOfLinenumbers
-        f.write_all(&sec_flags.to_le_bytes()).map_err(map)?; // Characteristics
-
-        f.write_all(code).map_err(map)?;
-        let pad = padded_len as usize - code.len();
-        if pad > 0 {
-            f.write_all(&vec![0u8; pad]).map_err(map)?;
-        }
-
-        if !reloc_bytes.is_empty() {
-            f.write_all(&reloc_bytes).map_err(map)?;
+        if let Some(s) = sections.iter().find(|s| s.group.is_some()) {
+            return Err(RasError::ObjectError(format!(
+                "COFF writer has no COMDAT groups; {} is in a group",
+                s.name
+            )));
         }
 
-        f.write_all(&sym_bytes).map_err(map)?;
-        f.write_all(&strtab).map_err(map)?;
+        let section_index: HashMap<&str, usize> = sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.as_str(), i))
+            .collect();
+        let mut reloc_counts = vec![0usize; sections.len()];
+        for r in relocations {
+            let si = *section_index.get(r.section.as_str()).ok_or_else(|| {
+                RasError::ObjectError(format!(
+                    "relocation in section {} which has no COFF section",
+                    r.section
+                ))
+            })?;
+            reloc_counts[si] += 1;
+            if reloc_counts[si] > u16::MAX as usize {
+                return Err(RasError::ObjectError(format!(
+                    "section {} has too many relocations for COFF",
+                    r.section
+                )));
+            }
+        }
 
-        Ok(f)
+        let mut strtab: Vec<u8> = vec![0u8; 4];
+        let mut sym_bytes: Vec<u8> = Vec::new();
+        let mut nsyms: u32 = 0;
+        let mut section_symbol: HashMap<&str, u32> = HashMap::new();
+        for (i, s) in sections.iter().enumerate() {
+            section_symbol.insert(s.name.as_str(), nsyms);
+            sym_bytes.extend_from_slice(&coff_symbol_entry(
+                &mut strtab,
+                &s.name,
+                0,
+                (i + 1) as i16,
+                0,
+                IMAGE_SYM_CLASS_STATIC,
+                1,
+            ));
+            let mut aux = [0u8; COFF_SYMBOL_SIZE];
+            aux[0..4].copy_from_slice(&(s.data.len() as u32).to_le_bytes());
+            aux[4..6].copy_from_slice(&(reloc_counts[i] as u16).to_le_bytes());
+            aux[12..14].copy_from_slice(&((i + 1) as u16).to_le_bytes());
+            sym_bytes.extend_from_slice(&aux);
+            nsyms += 2;
+        }
+
+        let referenced: std::collections::HashSet<&str> = relocations
+            .iter()
+            .filter(|r| !r.section_symbol)
+            .map(|r| r.symbol.as_str())
+            .collect();
+        let mut symbol_index: HashMap<&str, u32> = HashMap::new();
+        for sym in req.symbols {
+            let wanted = referenced.contains(sym.name.as_str())
+                || (!sym.attributes.internal && (sym.global || !sym.name.starts_with(".L")));
+            if !wanted || symbol_index.contains_key(sym.name.as_str()) {
+                continue;
+            }
+            let (section, value, ty) = match sym.section.as_str() {
+                "" => continue,
+                "*ABS*" => (IMAGE_SYM_ABSOLUTE, sym.value as u32, 0),
+                "*COM*" => (
+                    IMAGE_SYM_UNDEFINED,
+                    sym.attributes.common.map_or(0, |c| c.0) as u32,
+                    0,
+                ),
+                name => {
+                    let si = *section_index.get(name).ok_or_else(|| {
+                        RasError::ObjectError(format!(
+                            "symbol {} is in unknown section {name}",
+                            sym.name
+                        ))
+                    })?;
+                    let ty = if sections[si].flags.exec {
+                        IMAGE_SYM_DTYPE_FUNCTION
+                    } else {
+                        0
+                    };
+                    ((si + 1) as i16, sym.value as u32, ty)
+                }
+            };
+            let class = if sym.global || sym.section == "*COM*" {
+                IMAGE_SYM_CLASS_EXTERNAL
+            } else {
+                IMAGE_SYM_CLASS_STATIC
+            };
+            symbol_index.insert(sym.name.as_str(), nsyms);
+            sym_bytes.extend_from_slice(&coff_symbol_entry(
+                &mut strtab,
+                &sym.name,
+                value,
+                section,
+                ty,
+                class,
+                0,
+            ));
+            nsyms += 1;
+        }
+        for r in relocations.iter().filter(|r| !r.section_symbol) {
+            if symbol_index.contains_key(r.symbol.as_str()) {
+                continue;
+            }
+            symbol_index.insert(r.symbol.as_str(), nsyms);
+            sym_bytes.extend_from_slice(&coff_symbol_entry(
+                &mut strtab,
+                &r.symbol,
+                0,
+                IMAGE_SYM_UNDEFINED,
+                0,
+                IMAGE_SYM_CLASS_EXTERNAL,
+                0,
+            ));
+            nsyms += 1;
+        }
+
+        let mut data: Vec<Vec<u8>> = sections.iter().map(|s| s.data.clone()).collect();
+        let mut reloc_bytes: Vec<Vec<u8>> = vec![Vec::new(); sections.len()];
+        for r in relocations {
+            let si = section_index[r.section.as_str()];
+            let section = &sections[si];
+            let (ty, width) = coff_reloc_type(r.kind, &r.symbol)?;
+            let target = if r.section_symbol {
+                *section_symbol.get(r.symbol.as_str()).ok_or_else(|| {
+                    RasError::ObjectError(format!("Unknown relocation section: {}", r.symbol))
+                })?
+            } else {
+                symbol_index[r.symbol.as_str()]
+            };
+            if coff_is_uninitialized(section) {
+                return Err(RasError::ObjectError(format!(
+                    "relocation inside uninitialized section {}",
+                    section.name
+                )));
+            }
+            let bytes = data[si]
+                .get_mut(r.offset..r.offset + width)
+                .ok_or_else(|| {
+                    RasError::ObjectError(format!(
+                        "relocation at offset {} exceeds section {}",
+                        r.offset, section.name
+                    ))
+                })?;
+            let implicit = if width == 4 {
+                i32::from_le_bytes(bytes.try_into().unwrap()) as i64
+            } else {
+                i64::from_le_bytes(bytes.try_into().unwrap())
+            };
+            let adjust = if ty == IMAGE_REL_AMD64_REL32 { 4 } else { 0 };
+            let value = implicit + r.addend + adjust;
+            bytes.copy_from_slice(&value.to_le_bytes()[..width]);
+            reloc_bytes[si].extend_from_slice(&(r.offset as u32).to_le_bytes());
+            reloc_bytes[si].extend_from_slice(&target.to_le_bytes());
+            reloc_bytes[si].extend_from_slice(&ty.to_le_bytes());
+        }
+
+        let mut raw_ptr = vec![0u32; sections.len()];
+        let mut raw_size = vec![0u32; sections.len()];
+        let mut reloc_ptr = vec![0u32; sections.len()];
+        let mut cursor = 20 + COFF_SECTION_HEADER_SIZE * sections.len();
+        for (i, s) in sections.iter().enumerate() {
+            if coff_is_uninitialized(s) {
+                raw_size[i] = s.data.len() as u32;
+            } else if !s.data.is_empty() {
+                let padded = s.data.len().div_ceil(COFF_RAW_ALIGN) * COFF_RAW_ALIGN;
+                raw_ptr[i] = cursor as u32;
+                raw_size[i] = padded as u32;
+                cursor += padded;
+            }
+        }
+        for i in 0..sections.len() {
+            if reloc_counts[i] > 0 {
+                reloc_ptr[i] = cursor as u32;
+                cursor += COFF_RELOC_SIZE * reloc_counts[i];
+            }
+        }
+        let sym_ptr = cursor as u32;
+
+        let mut out: Vec<u8> = Vec::with_capacity(cursor + sym_bytes.len() + strtab.len());
+        out.extend_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        out.extend_from_slice(&(sections.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&sym_ptr.to_le_bytes());
+        out.extend_from_slice(&nsyms.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+
+        for (i, s) in sections.iter().enumerate() {
+            out.extend_from_slice(&coff_section_name(&s.name, &mut strtab)?);
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&raw_size[i].to_le_bytes());
+            out.extend_from_slice(&raw_ptr[i].to_le_bytes());
+            out.extend_from_slice(&reloc_ptr[i].to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(reloc_counts[i] as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&coff_section_characteristics(s)?.to_le_bytes());
+        }
+
+        for (i, _) in sections.iter().enumerate() {
+            if raw_ptr[i] != 0 {
+                out.extend_from_slice(&data[i]);
+                out.resize(raw_ptr[i] as usize + raw_size[i] as usize, 0);
+            }
+        }
+        for bytes in &reloc_bytes {
+            out.extend_from_slice(bytes);
+        }
+        out.extend_from_slice(&sym_bytes);
+        let strtab_size = strtab.len() as u32;
+        strtab[0..4].copy_from_slice(&strtab_size.to_le_bytes());
+        out.extend_from_slice(&strtab);
+
+        Ok(out)
     }
 }
 
@@ -2287,5 +2488,263 @@ mod tests {
         .expect("coff write");
         let buf = std::fs::read(&path).expect("read");
         assert_eq!(&buf[0..2], &IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+    }
+
+    struct CoffSection {
+        name: String,
+        raw_ptr: u32,
+        raw_size: u32,
+        characteristics: u32,
+        data: Vec<u8>,
+        relocs: Vec<(u32, u32, u16)>,
+    }
+
+    struct CoffSymbol {
+        name: String,
+        value: u32,
+        section: i16,
+        class: u8,
+    }
+
+    struct CoffFile {
+        sections: Vec<CoffSection>,
+        symbols: Vec<CoffSymbol>,
+    }
+
+    fn coff_parse(buf: &[u8]) -> CoffFile {
+        let u16_at = |at: usize| u16::from_le_bytes(buf[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        let nsections = u16_at(2) as usize;
+        let sym_ptr = u32_at(8) as usize;
+        let nsyms = u32_at(12) as usize;
+        let strtab = sym_ptr + nsyms * COFF_SYMBOL_SIZE;
+        let name_at = |raw: &[u8]| {
+            if raw[..4] == [0, 0, 0, 0] {
+                let off = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+                let end = buf[strtab + off..].iter().position(|&b| b == 0).unwrap();
+                String::from_utf8(buf[strtab + off..strtab + off + end].to_vec()).unwrap()
+            } else {
+                String::from_utf8(raw.iter().copied().take_while(|&b| b != 0).collect()).unwrap()
+            }
+        };
+        let sections = (0..nsections)
+            .map(|i| {
+                let h = 20 + i * COFF_SECTION_HEADER_SIZE;
+                let raw_size = u32_at(h + 16);
+                let raw_ptr = u32_at(h + 20);
+                let reloc_ptr = u32_at(h + 24) as usize;
+                let nrelocs = u16_at(h + 32) as usize;
+                let relocs = (0..nrelocs)
+                    .map(|r| {
+                        let e = reloc_ptr + r * COFF_RELOC_SIZE;
+                        (u32_at(e), u32_at(e + 4), u16_at(e + 8))
+                    })
+                    .collect();
+                let data = if raw_ptr == 0 {
+                    Vec::new()
+                } else {
+                    buf[raw_ptr as usize..(raw_ptr + raw_size) as usize].to_vec()
+                };
+                CoffSection {
+                    name: if buf[h] == b'/' {
+                        let digits: String = buf[h + 1..h + 8]
+                            .iter()
+                            .take_while(|b| b.is_ascii_digit())
+                            .map(|&b| b as char)
+                            .collect();
+                        let off = strtab + digits.parse::<usize>().unwrap();
+                        let end = buf[off..].iter().position(|&b| b == 0).unwrap();
+                        String::from_utf8(buf[off..off + end].to_vec()).unwrap()
+                    } else {
+                        name_at(&buf[h..h + 8])
+                    },
+                    raw_ptr,
+                    raw_size,
+                    characteristics: u32_at(h + 36),
+                    data,
+                    relocs,
+                }
+            })
+            .collect();
+        let mut symbols = Vec::new();
+        let mut i = 0;
+        while i < nsyms {
+            let e = sym_ptr + i * COFF_SYMBOL_SIZE;
+            let aux = buf[e + 17] as usize;
+            symbols.push(CoffSymbol {
+                name: name_at(&buf[e..e + 8]),
+                value: u32_at(e + 8),
+                section: u16_at(e + 12) as i16,
+                class: buf[e + 16],
+            });
+            for _ in 0..aux {
+                symbols.push(CoffSymbol {
+                    name: String::new(),
+                    value: 0,
+                    section: 0,
+                    class: 0,
+                });
+            }
+            i += 1 + aux;
+        }
+        CoffFile { sections, symbols }
+    }
+
+    fn coff_section(name: &str, exec: bool, write: bool, data: Vec<u8>) -> Section {
+        Section {
+            group: None,
+            name: name.into(),
+            flags: SectionFlags {
+                alloc: true,
+                exec,
+                write,
+                tls: false,
+            },
+            data,
+            alignment: 16,
+        }
+    }
+
+    fn coff_symbol(name: &str, global: bool, section: &str, value: u64) -> ObjectSymbol {
+        ObjectSymbol {
+            attributes: Default::default(),
+            name: name.into(),
+            global,
+            section: section.into(),
+            value,
+        }
+    }
+
+    fn coff_reloc(
+        section: &str,
+        offset: usize,
+        symbol: &str,
+        kind: u32,
+        addend: i64,
+    ) -> ExternalReloc {
+        ExternalReloc {
+            offset,
+            symbol: symbol.into(),
+            section: section.into(),
+            kind,
+            addend,
+            trailing: 0,
+            branch: false,
+            section_symbol: false,
+        }
+    }
+
+    fn coff_object(
+        sections: &[Section],
+        symbols: &[ObjectSymbol],
+        relocations: &[ExternalReloc],
+    ) -> Vec<u8> {
+        let opts = ObjectWriteOptions::default();
+        CoffWriter::new()
+            .object_bytes(&ObjectWriteRequest {
+                code: &sections[0].data,
+                sections,
+                symbols,
+                relocations,
+                target_arch: TargetArchitecture::X86_64,
+                target_os: TargetOperatingSystem::Windows,
+                opts: &opts,
+            })
+            .expect("coff write")
+    }
+
+    #[test]
+    fn coff_non_text_sections_hold_their_symbols_and_relocations() {
+        let lea = [0x48, 0x8d, 0x05, 0, 0, 0, 0];
+        let mut text = Vec::new();
+        text.extend_from_slice(&lea);
+        text.extend_from_slice(&lea);
+        text.push(0xc3);
+        let sections = [
+            coff_section(".text", true, false, text),
+            coff_section(".data", false, true, b"hi\0".to_vec()),
+            coff_section(".rodata.str1", false, false, b"ro\0".to_vec()),
+            coff_section(".bss", false, true, vec![0; 16]),
+        ];
+        let symbols = [
+            coff_symbol("main", true, ".text", 0),
+            coff_symbol("msg", false, ".data", 0),
+            coff_symbol("ro", false, ".rodata.str1", 0),
+            coff_symbol("buf", false, ".bss", 8),
+        ];
+        let relocations = [
+            coff_reloc(".text", 3, "msg", 2, -4),
+            coff_reloc(".text", 10, "ro", 2, -4),
+        ];
+        let buf = coff_object(&sections, &symbols, &relocations);
+        let obj = coff_parse(&buf);
+
+        let names: Vec<&str> = obj.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, [".text", ".data", ".rodata.str1", ".bss"]);
+        let index_of =
+            |name: &str| obj.sections.iter().position(|s| s.name == name).unwrap() as i16 + 1;
+        let symbol = |name: &str| {
+            obj.symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("symbol {name} missing"))
+        };
+
+        let data = &obj.sections[1];
+        assert!(data.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0);
+        assert!(data.characteristics & IMAGE_SCN_MEM_WRITE != 0);
+        assert_eq!(&data.data[..3], b"hi\0");
+        let msg = symbol("msg");
+        assert_eq!(msg.section, index_of(".data"));
+        assert_eq!(msg.class, IMAGE_SYM_CLASS_STATIC);
+        assert_eq!(msg.value, 0);
+
+        let rodata = &obj.sections[2];
+        assert!(rodata.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0);
+        assert!(rodata.characteristics & IMAGE_SCN_MEM_WRITE == 0);
+        assert_eq!(symbol("ro").section, index_of(".rodata.str1"));
+
+        let bss = &obj.sections[3];
+        assert!(bss.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0);
+        assert_eq!(bss.raw_ptr, 0);
+        assert_eq!(bss.raw_size, 16);
+        let buf_sym = symbol("buf");
+        assert_eq!(buf_sym.section, index_of(".bss"));
+        assert_eq!(buf_sym.value, 8);
+
+        let main = symbol("main");
+        assert_eq!(main.section, index_of(".text"));
+        assert_eq!(main.class, IMAGE_SYM_CLASS_EXTERNAL);
+
+        let text = &obj.sections[0];
+        assert_eq!(text.relocs.len(), 2);
+        let (offset, symidx, ty) = text.relocs[0];
+        assert_eq!((offset, ty), (3, IMAGE_REL_AMD64_REL32));
+        assert_eq!(obj.symbols[symidx as usize].name, "msg");
+        let (offset, symidx, ty) = text.relocs[1];
+        assert_eq!((offset, ty), (10, IMAGE_REL_AMD64_REL32));
+        assert_eq!(obj.symbols[symidx as usize].name, "ro");
+        assert_eq!(&text.data[3..7], &[0, 0, 0, 0]);
+        assert_eq!(&text.data[10..14], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn coff_absolute_data_pointer_relocation_is_addr64() {
+        let sections = [
+            coff_section(".text", true, false, vec![0xc3]),
+            coff_section(".data", false, true, vec![0; 8]),
+        ];
+        let symbols = [coff_symbol("main", true, ".text", 0)];
+        let relocations = [coff_reloc(".data", 0, "main", 1, 8)];
+        let buf = coff_object(&sections, &symbols, &relocations);
+        let obj = coff_parse(&buf);
+
+        let data = &obj.sections[1];
+        assert_eq!(data.relocs.len(), 1);
+        let (offset, symidx, ty) = data.relocs[0];
+        assert_eq!((offset, ty), (0, IMAGE_REL_AMD64_ADDR64));
+        assert_eq!(obj.symbols[symidx as usize].name, "main");
+        assert_eq!(obj.symbols[symidx as usize].section, 1);
+        assert_eq!(&data.data[..8], &8u64.to_le_bytes());
     }
 }
