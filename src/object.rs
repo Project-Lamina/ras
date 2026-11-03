@@ -1614,6 +1614,8 @@ const IMAGE_SYM_UNDEFINED: i16 = 0;
 const IMAGE_SYM_ABSOLUTE: i16 = -1;
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 const IMAGE_SYM_CLASS_STATIC: u8 = 3;
+const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
+const IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY: u32 = 1;
 const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
@@ -1766,6 +1768,30 @@ fn coff_symbol_entry(
     entry
 }
 
+/// The auxiliary record that must follow every `IMAGE_SYM_CLASS_WEAK_EXTERNAL`
+/// symbol: the symbol-table index of the default definition, then the search
+/// characteristics. A weak external without this record is malformed.
+fn coff_weak_aux(default_index: u32) -> [u8; COFF_SYMBOL_SIZE] {
+    let mut aux = [0u8; COFF_SYMBOL_SIZE];
+    aux[0..4].copy_from_slice(&default_index.to_le_bytes());
+    aux[4..8].copy_from_slice(&IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY.to_le_bytes());
+    aux
+}
+
+/// The name of the default definition a weak external falls back to. COFF holds
+/// the definition under this name and leaves the weak name undefined, so a
+/// strong definition anywhere else in the link wins.
+fn coff_weak_default_name(name: &str) -> String {
+    format!(".weak.{name}")
+}
+
+/// COFF has no symbol visibility. The only thing it can say about a symbol that
+/// is not meant to be exported is that it is file-local, which is the storage
+/// class `IMAGE_SYM_CLASS_STATIC`.
+fn coff_is_file_local(attributes: &crate::parser::SymbolAttributes) -> bool {
+    attributes.hidden || attributes.internal_visibility || attributes.private_extern
+}
+
 fn coff_section_name(name: &str, strtab: &mut Vec<u8>) -> Result<[u8; 8], RasError> {
     let mut out = [0u8; 8];
     if name.len() <= 8 {
@@ -1822,6 +1848,30 @@ impl ObjectWriter for CoffWriter {
             return Err(RasError::ObjectError(format!(
                 "Mach-O section {} cannot be written to a COFF object",
                 s.name
+            )));
+        }
+        if let Some(sym) = req.symbols.iter().find(|s| s.attributes.protected) {
+            return Err(RasError::ObjectError(format!(
+                "protected visibility is not supported for COFF: {}",
+                sym.name
+            )));
+        }
+        if let Some(sym) = req.symbols.iter().find(|s| {
+            s.attributes.weak && (coff_is_file_local(&s.attributes) || s.attributes.local)
+        }) {
+            return Err(RasError::ObjectError(format!(
+                "COFF cannot make {} both weak and file-local: a weak external is resolved across objects, so it has to be an external symbol",
+                sym.name
+            )));
+        }
+        if let Some(sym) = req
+            .symbols
+            .iter()
+            .find(|s| s.attributes.weak && s.section == "*COM*")
+        {
+            return Err(RasError::ObjectError(format!(
+                "COFF has no weak common symbol: {}",
+                sym.name
             )));
         }
         for r in relocations
@@ -1928,6 +1978,14 @@ impl ObjectWriter for CoffWriter {
                 continue;
             }
             let (section, value, ty) = match sym.section.as_str() {
+                "" if sym.attributes.weak && referenced.contains(sym.name.as_str()) => {
+                    let ty = if sym.attributes.symbol_type == 2 {
+                        IMAGE_SYM_DTYPE_FUNCTION
+                    } else {
+                        0
+                    };
+                    (IMAGE_SYM_ABSOLUTE, 0, ty)
+                }
                 "" => continue,
                 "*ABS*" => (IMAGE_SYM_ABSOLUTE, sym.value as u32, 0),
                 "*COM*" => (
@@ -1950,7 +2008,34 @@ impl ObjectWriter for CoffWriter {
                     ((si + 1) as i16, sym.value as u32, ty)
                 }
             };
-            let class = if sym.global || sym.section == "*COM*" {
+            if sym.attributes.weak {
+                let default_index = nsyms;
+                sym_bytes.extend_from_slice(&coff_symbol_entry(
+                    &mut strtab,
+                    &coff_weak_default_name(&sym.name),
+                    value,
+                    section,
+                    ty,
+                    IMAGE_SYM_CLASS_STATIC,
+                    0,
+                ));
+                symbol_index.insert(sym.name.as_str(), nsyms + 1);
+                sym_bytes.extend_from_slice(&coff_symbol_entry(
+                    &mut strtab,
+                    &sym.name,
+                    0,
+                    IMAGE_SYM_UNDEFINED,
+                    ty,
+                    IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                    1,
+                ));
+                sym_bytes.extend_from_slice(&coff_weak_aux(default_index));
+                nsyms += 3;
+                continue;
+            }
+            let class = if coff_is_file_local(&sym.attributes) {
+                IMAGE_SYM_CLASS_STATIC
+            } else if sym.global || sym.section == "*COM*" {
                 IMAGE_SYM_CLASS_EXTERNAL
             } else {
                 IMAGE_SYM_CLASS_STATIC
@@ -3226,6 +3311,186 @@ mod tests {
             })
             .expect_err("SECREL in ELF");
         assert!(err.to_string().contains("only supported in COFF"), "{err}");
+    }
+
+    fn coff_try_object(
+        sections: &[Section],
+        symbols: &[ObjectSymbol],
+        relocations: &[ExternalReloc],
+    ) -> Result<Vec<u8>, RasError> {
+        let opts = ObjectWriteOptions::default();
+        CoffWriter::new().object_bytes(&ObjectWriteRequest {
+            code: &sections[0].data,
+            sections,
+            symbols,
+            relocations,
+            target_arch: TargetArchitecture::X86_64,
+            target_os: TargetOperatingSystem::Windows,
+            opts: &opts,
+        })
+    }
+
+    /// The raw 18-byte records of the COFF symbol table, auxiliary ones included.
+    fn coff_raw_symbols(buf: &[u8]) -> Vec<[u8; COFF_SYMBOL_SIZE]> {
+        let sym_ptr = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let nsyms = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        (0..nsyms)
+            .map(|i| {
+                let e = sym_ptr + i * COFF_SYMBOL_SIZE;
+                buf[e..e + COFF_SYMBOL_SIZE].try_into().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coff_weak_definition_becomes_a_weak_external_with_its_auxiliary_record() {
+        let sections = [coff_section(".text", true, false, vec![0x90, 0xc3])];
+        let mut weak = coff_symbol("wf", true, ".text", 1);
+        weak.attributes.weak = true;
+        weak.attributes.symbol_type = 2;
+        let symbols = [coff_symbol("main", true, ".text", 0), weak];
+        let buf = coff_object(&sections, &symbols, &[]);
+        let obj = coff_parse(&buf);
+
+        let default = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == ".weak.wf")
+            .expect("default definition");
+        assert_eq!(obj.symbols[default].class, IMAGE_SYM_CLASS_STATIC);
+        assert_eq!(obj.symbols[default].section, 1);
+        assert_eq!(obj.symbols[default].value, 1);
+
+        let weak_index = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == "wf")
+            .expect("weak external");
+        assert_eq!(obj.symbols[weak_index].class, IMAGE_SYM_CLASS_WEAK_EXTERNAL);
+        assert_eq!(obj.symbols[weak_index].section, IMAGE_SYM_UNDEFINED);
+        assert_eq!(obj.symbols[weak_index].value, 0);
+        assert_eq!(obj.symbols[weak_index].typ, IMAGE_SYM_DTYPE_FUNCTION);
+
+        let raw = coff_raw_symbols(&buf);
+        assert_eq!(raw.len(), obj.symbols.len(), "NumberOfSymbols counts aux");
+        assert_eq!(raw[weak_index][17], 1, "one auxiliary record");
+        let aux = raw[weak_index + 1];
+        assert_eq!(
+            u32::from_le_bytes(aux[0..4].try_into().unwrap()),
+            default as u32,
+            "aux names the default definition"
+        );
+        assert_eq!(
+            u32::from_le_bytes(aux[4..8].try_into().unwrap()),
+            IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY
+        );
+        assert!(aux[8..].iter().all(|&b| b == 0), "rest of aux is unused");
+    }
+
+    #[test]
+    fn coff_relocation_against_a_weak_symbol_targets_the_weak_external() {
+        let sections = [coff_section(
+            ".text",
+            true,
+            false,
+            vec![0xe8, 0, 0, 0, 0, 0xc3],
+        )];
+        let mut weak = coff_symbol("wf", true, ".text", 5);
+        weak.attributes.weak = true;
+        let symbols = [coff_symbol("main", true, ".text", 0), weak];
+        let relocations = [coff_reloc(".text", 1, "wf", 4, -4)];
+        let buf = coff_object(&sections, &symbols, &relocations);
+        let obj = coff_parse(&buf);
+        let target = obj.sections[0].relocs[0].1 as usize;
+        assert_eq!(obj.symbols[target].name, "wf");
+        assert_eq!(obj.symbols[target].class, IMAGE_SYM_CLASS_WEAK_EXTERNAL);
+    }
+
+    #[test]
+    fn coff_weak_reference_without_a_definition_falls_back_to_absolute_zero() {
+        let sections = [coff_section(
+            ".text",
+            true,
+            false,
+            vec![0xe8, 0, 0, 0, 0, 0xc3],
+        )];
+        let mut weak = coff_symbol("maybe", true, "", 0);
+        weak.attributes.weak = true;
+        let symbols = [coff_symbol("main", true, ".text", 0), weak];
+        let relocations = [coff_reloc(".text", 1, "maybe", 4, -4)];
+        let buf = coff_object(&sections, &symbols, &relocations);
+        let obj = coff_parse(&buf);
+        let default = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == ".weak.maybe")
+            .expect("default definition");
+        assert_eq!(obj.symbols[default].section, IMAGE_SYM_ABSOLUTE);
+        assert_eq!(obj.symbols[default].value, 0);
+        let weak_index = obj.symbols.iter().position(|s| s.name == "maybe").unwrap();
+        assert_eq!(obj.symbols[weak_index].class, IMAGE_SYM_CLASS_WEAK_EXTERNAL);
+        let raw = coff_raw_symbols(&buf);
+        assert_eq!(
+            u32::from_le_bytes(raw[weak_index + 1][0..4].try_into().unwrap()),
+            default as u32
+        );
+    }
+
+    #[test]
+    fn coff_visibility_that_is_not_exported_becomes_a_static_symbol() {
+        for set in [
+            |a: &mut crate::parser::SymbolAttributes| a.hidden = true,
+            |a: &mut crate::parser::SymbolAttributes| a.internal_visibility = true,
+            |a: &mut crate::parser::SymbolAttributes| a.private_extern = true,
+        ] {
+            let sections = [coff_section(".text", true, false, vec![0xc3])];
+            let mut sym = coff_symbol("quiet", true, ".text", 0);
+            set(&mut sym.attributes);
+            let symbols = [coff_symbol("main", true, ".text", 0), sym];
+            let buf = coff_object(&sections, &symbols, &[]);
+            let obj = coff_parse(&buf);
+            let quiet = obj.symbols.iter().find(|s| s.name == "quiet").unwrap();
+            assert_eq!(quiet.class, IMAGE_SYM_CLASS_STATIC);
+            let main = obj.symbols.iter().find(|s| s.name == "main").unwrap();
+            assert_eq!(main.class, IMAGE_SYM_CLASS_EXTERNAL);
+        }
+    }
+
+    #[test]
+    fn coff_refuses_protected_visibility() {
+        let sections = [coff_section(".text", true, false, vec![0xc3])];
+        let mut sym = coff_symbol("p", true, ".text", 0);
+        sym.attributes.protected = true;
+        let err = coff_try_object(&sections, &[sym], &[]).expect_err("protected on COFF");
+        assert!(err.to_string().contains("protected visibility"), "{err}");
+    }
+
+    #[test]
+    fn coff_refuses_a_weak_symbol_that_is_also_file_local() {
+        for set in [
+            |a: &mut crate::parser::SymbolAttributes| a.hidden = true,
+            |a: &mut crate::parser::SymbolAttributes| a.local = true,
+        ] {
+            let sections = [coff_section(".text", true, false, vec![0xc3])];
+            let mut sym = coff_symbol("w", true, ".text", 0);
+            sym.attributes.weak = true;
+            set(&mut sym.attributes);
+            let err = coff_try_object(&sections, &[sym], &[]).expect_err("weak and file-local");
+            assert!(
+                err.to_string().contains("both weak and file-local"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn coff_refuses_a_weak_common_symbol() {
+        let sections = [coff_section(".text", true, false, vec![0xc3])];
+        let mut sym = coff_symbol("c", true, "*COM*", 0);
+        sym.attributes.weak = true;
+        sym.attributes.common = Some((8, 8));
+        let err = coff_try_object(&sections, &[sym], &[]).expect_err("weak common");
+        assert!(err.to_string().contains("no weak common symbol"), "{err}");
     }
 
     fn macho_custom_section(name: &str, kind: u32, attributes: u32, data: Vec<u8>) -> Section {
