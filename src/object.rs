@@ -92,6 +92,7 @@ const ELF32_SECTION_HEADER_SIZE: usize = 40;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ET_REL: u16 = 1;
 const EM_X86_64: u16 = 62;
+const EM_386: u16 = 3;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
 const EM_PPC64: u16 = 21;
@@ -101,18 +102,40 @@ const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
+const SHT_REL: u32 = 9;
 const SHF_INFO_LINK: u64 = 0x40;
 const SHF_TLS: u64 = 0x400;
 const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
 const ELF32_SYM_SIZE: u64 = 16;
 const ELF32_RELA_SIZE: u64 = 12;
+const ELF32_REL_SIZE: u64 = 8;
 const STB_GLOBAL: u8 = 1;
 const STT_TLS: u8 = 6;
+
+const R_386_32: u32 = 1;
+const R_386_PC32: u32 = 2;
+const R_386_PLT32: u32 = 4;
+const R_386_16: u32 = 20;
+const R_386_8: u32 = 23;
+
+/// The width of the field an i386 relocation patches. The addend is stored
+/// there, so a kind whose field width is unknown cannot be written at all.
+fn i386_rel_width(kind: u32) -> Result<usize, RasError> {
+    match kind {
+        R_386_32 | R_386_PC32 | R_386_PLT32 => Ok(4),
+        R_386_16 => Ok(2),
+        R_386_8 => Ok(1),
+        _ => Err(RasError::ObjectError(format!(
+            "i386 relocation type {kind} is not implemented"
+        ))),
+    }
+}
 
 fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
         TargetArchitecture::X86_64 => Some(EM_X86_64),
+        TargetArchitecture::I686 => Some(EM_386),
         TargetArchitecture::Aarch64 => Some(EM_AARCH64),
         #[cfg(feature = "nightly")]
         TargetArchitecture::Arx64 => Some(EM_ARX64),
@@ -316,13 +339,21 @@ impl ObjectWriter for ElfWriter {
         }
         let machine = elf64_e_machine(req.target_arch)
             .ok_or_else(|| RasError::ObjectError("Unsupported ELF architecture".into()))?;
-        let class32 = matches!(req.target_arch, TargetArchitecture::Riscv32);
+        let class32 = matches!(
+            req.target_arch,
+            TargetArchitecture::Riscv32 | TargetArchitecture::I686
+        );
+        // The i386 psABI defines Elf32_Rel only: the addend lives in the field
+        // the relocation patches, not in the relocation entry.
+        let use_rel = req.target_arch == TargetArchitecture::I686;
         let sym_size = if class32 {
             ELF32_SYM_SIZE
         } else {
             ELF64_SYM_SIZE
         };
-        let rela_size = if class32 {
+        let rela_size = if use_rel {
+            ELF32_REL_SIZE
+        } else if class32 {
             ELF32_RELA_SIZE
         } else {
             ELF64_RELA_SIZE
@@ -344,7 +375,10 @@ impl ObjectWriter for ElfWriter {
                 macho: None,
             });
         }
-        if req.target_arch == TargetArchitecture::X86_64 {
+        if matches!(
+            req.target_arch,
+            TargetArchitecture::X86_64 | TargetArchitecture::I686
+        ) {
             for name in [".data", ".bss"] {
                 if !sections.iter().any(|s| s.name == name) {
                     sections.push(Section {
@@ -408,6 +442,7 @@ impl ObjectWriter for ElfWriter {
                 !matches!(
                     (req.target_arch, r.kind),
                     (TargetArchitecture::X86_64, 1 | 10 | 11 | 12 | 14)
+                        | (TargetArchitecture::I686, R_386_32 | R_386_16 | R_386_8)
                         | (TargetArchitecture::Aarch64, 257..=259)
                 )
             })
@@ -544,7 +579,15 @@ impl ObjectWriter for ElfWriter {
                 .or_else(|| sym.attributes.common.map(|c| c.0))
             {
                 let end = symtab.len();
-                symtab[end - 8..].copy_from_slice(&size.to_le_bytes());
+                if class32 {
+                    let at = end - 8;
+                    let size = u32::try_from(size).map_err(|_| {
+                        RasError::ObjectError(format!("Symbol size {size} is not 32-bit"))
+                    })?;
+                    symtab[at..at + 4].copy_from_slice(&size.to_le_bytes());
+                } else {
+                    symtab[end - 8..].copy_from_slice(&size.to_le_bytes());
+                }
             }
         }
         for reloc in req.relocations.iter().filter(|r| !r.section_symbol) {
@@ -587,7 +630,18 @@ impl ObjectWriter for ElfWriter {
                 } else {
                     (sym_indices[r.symbol.as_str()], r.addend)
                 };
-                if class32 {
+                if use_rel {
+                    let info = (index << 8) | (r.kind & 0xff);
+                    bytes.extend_from_slice(&info.to_le_bytes());
+                    let width = i386_rel_width(r.kind)?;
+                    let field = data[i].get_mut(r.offset..r.offset + width).ok_or_else(|| {
+                        RasError::ObjectError(format!(
+                            "Relocation for {} lies outside {}",
+                            r.symbol, section.name
+                        ))
+                    })?;
+                    field.copy_from_slice(&addend.to_le_bytes()[..width]);
+                } else if class32 {
                     let info = (index << 8) | (r.kind & 0xff);
                     bytes.extend_from_slice(&info.to_le_bytes());
                     let addend = i32::try_from(addend).map_err(|_| {
@@ -608,10 +662,14 @@ impl ObjectWriter for ElfWriter {
                         .push((headers.len() + 1) as u32);
                 }
                 rela_sections.push(headers.len());
-                names.push(format!(".rela{}", section.name));
+                names.push(format!(
+                    "{}{}",
+                    if use_rel { ".rel" } else { ".rela" },
+                    section.name
+                ));
                 data.push(bytes);
                 headers.push(Elf64SectionHeader {
-                    section_type: SHT_RELA,
+                    section_type: if use_rel { SHT_REL } else { SHT_RELA },
                     flags: SHF_INFO_LINK | if section.group.is_some() { 0x200 } else { 0 },
                     info: (i + 1) as u32,
                     addralign: table_align,
