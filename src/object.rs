@@ -2148,6 +2148,7 @@ impl ObjectWriter for CoffWriter {
 
         let mut raw_ptr = vec![0u32; sections.len()];
         let mut raw_size = vec![0u32; sections.len()];
+        let mut raw_end = vec![0u32; sections.len()];
         let mut reloc_ptr = vec![0u32; sections.len()];
         let mut cursor = 20 + COFF_SECTION_HEADER_SIZE * sections.len();
         for (i, s) in sections.iter().enumerate() {
@@ -2156,7 +2157,8 @@ impl ObjectWriter for CoffWriter {
             } else if !s.data.is_empty() {
                 let padded = s.data.len().div_ceil(COFF_RAW_ALIGN) * COFF_RAW_ALIGN;
                 raw_ptr[i] = cursor as u32;
-                raw_size[i] = padded as u32;
+                raw_size[i] = s.data.len() as u32;
+                raw_end[i] = (cursor + padded) as u32;
                 cursor += padded;
             }
         }
@@ -2193,7 +2195,7 @@ impl ObjectWriter for CoffWriter {
         for (i, _) in sections.iter().enumerate() {
             if raw_ptr[i] != 0 {
                 out.extend_from_slice(&data[i]);
-                out.resize(raw_ptr[i] as usize + raw_size[i] as usize, 0);
+                out.resize(raw_end[i] as usize, 0);
             }
         }
         for bytes in &reloc_bytes {
