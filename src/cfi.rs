@@ -45,7 +45,12 @@ pub(crate) fn advance(value: i128) -> Result<Vec<u8>, RasError> {
     })
 }
 
-fn cfa(opcode: u8, register: Option<i128>, offset: i128) -> Result<Vec<u8>, RasError> {
+fn cfa(
+    opcode: u8,
+    register: Option<i128>,
+    offset: i128,
+    data_alignment: i128,
+) -> Result<Vec<u8>, RasError> {
     let mut bytes = vec![opcode];
     if let Some(register) = register {
         if register < 0 {
@@ -54,8 +59,8 @@ fn cfa(opcode: u8, register: Option<i128>, offset: i128) -> Result<Vec<u8>, RasE
         bytes.extend(crate::parser::leb128(register, false));
     }
     let unsigned = crate::parser::leb128(offset.max(0), false);
-    let signed = crate::parser::leb128(offset / -8, true);
-    if offset % 8 == 0 && (offset < 0 || signed.len() < unsigned.len()) {
+    let signed = crate::parser::leb128(offset / data_alignment, true);
+    if offset % data_alignment == 0 && (offset < 0 || signed.len() < unsigned.len()) {
         bytes[0] = if opcode == 12 { 0x12 } else { 0x13 };
         bytes.extend(signed);
     } else if offset >= 0 {
@@ -68,6 +73,16 @@ fn cfa(opcode: u8, register: Option<i128>, offset: i128) -> Result<Vec<u8>, RasE
 
 fn number(value: &str) -> Result<i128, RasError> {
     crate::parser::parse_integer(value)
+}
+
+/// The factor a DWARF offset is stored in, which is the stack slot size of
+/// the architecture.
+fn data_alignment(arch: TargetArchitecture) -> i128 {
+    if arch == TargetArchitecture::Armv7 {
+        -4
+    } else {
+        -8
+    }
 }
 
 fn register(value: &str, arch: TargetArchitecture) -> Result<i128, RasError> {
@@ -84,6 +99,8 @@ fn register(value: &str, arch: TargetArchitecture) -> Result<i128, RasError> {
             .iter()
             .position(|name| *name == value)
             .map(|n| n as i128)
+    } else if arch == TargetArchitecture::Armv7 {
+        crate::encoder::armv7::gpr(value).ok().map(i128::from)
     } else if value == "sp" {
         Some(31)
     } else {
@@ -111,10 +128,11 @@ pub(crate) fn lower(
     }
     if !matches!(
         arch,
-        TargetArchitecture::X86_64 | TargetArchitecture::Aarch64
+        TargetArchitecture::X86_64 | TargetArchitecture::Aarch64 | TargetArchitecture::Armv7
     ) {
         return Err(RasError::ParseError("CFI unsupported for target".into()));
     }
+    let data_alignment = data_alignment(arch);
     let mut prefix = ".Lras_cfi".to_string();
     while source.contains(&prefix) {
         prefix.push('_');
@@ -163,18 +181,18 @@ pub(crate) fn lower(
                 } else {
                     0
                 },
-                cfa_register: if arch == TargetArchitecture::X86_64 {
-                    7
-                } else {
-                    31
+                cfa_register: match arch {
+                    TargetArchitecture::X86_64 => 7,
+                    TargetArchitecture::Armv7 => 13,
+                    _ => 31,
                 },
                 states: Vec::new(),
                 simple: args == ["simple"],
                 signal: false,
-                return_column: if arch == TargetArchitecture::X86_64 {
-                    16
-                } else {
-                    30
+                return_column: match arch {
+                    TargetArchitecture::X86_64 => 16,
+                    TargetArchitecture::Armv7 => 14,
+                    _ => 30,
                 },
             });
             continue;
@@ -202,7 +220,7 @@ pub(crate) fn lower(
             let cie = if let Some(cie) = cies.get(&key) {
                 cie.clone()
             } else {
-                writeln!(frames, ".balign 4\n{base}_cie:\n.long {base}_cie_end-{base}_cie_body\n{base}_cie_body:\n.long 0\n.byte 1\n.asciz \"{augmentation}\"\n.uleb128 1\n.sleb128 -8\n.uleb128 {}\n.uleb128 {base}_aug_end-{base}_aug\n{base}_aug:", f.return_column).unwrap();
+                writeln!(frames, ".balign 4\n{base}_cie:\n.long {base}_cie_end-{base}_cie_body\n{base}_cie_body:\n.long 0\n.byte 1\n.asciz \"{augmentation}\"\n.uleb128 1\n.sleb128 {data_alignment}\n.uleb128 {}\n.uleb128 {base}_aug_end-{base}_aug\n{base}_aug:", f.return_column).unwrap();
                 if let Some((encoding, symbol)) = &f.personality {
                     writeln!(frames, ".byte {encoding}").unwrap();
                     frames.push_str(&pointer(*encoding, symbol)?);
@@ -212,10 +230,10 @@ pub(crate) fn lower(
                 }
                 writeln!(frames, ".byte 0x1b\n{base}_aug_end:").unwrap();
                 if !f.simple {
-                    if arch == TargetArchitecture::X86_64 {
-                        frames.push_str(".byte 12,7,8,0x90,1\n");
-                    } else {
-                        frames.push_str(".byte 12,31,0\n");
+                    match arch {
+                        TargetArchitecture::X86_64 => frames.push_str(".byte 12,7,8,0x90,1\n"),
+                        TargetArchitecture::Armv7 => frames.push_str(".byte 12,13,0\n"),
+                        _ => frames.push_str(".byte 12,31,0\n"),
                     }
                 }
                 writeln!(frames, ".balign 4\n{base}_cie_end:").unwrap();
@@ -278,7 +296,7 @@ pub(crate) fn lower(
             ".cfi_def_cfa" => {
                 f.cfa_register = register(arg(0)?, arch)?;
                 f.cfa_offset = number(arg(1)?)?;
-                bytes = cfa(12, Some(f.cfa_register), f.cfa_offset)?;
+                bytes = cfa(12, Some(f.cfa_register), f.cfa_offset, data_alignment)?;
             }
             ".cfi_def_cfa_register" => {
                 f.cfa_register = register(arg(0)?, arch)?;
@@ -291,7 +309,7 @@ pub(crate) fn lower(
                 } else {
                     value
                 };
-                bytes = cfa(14, None, f.cfa_offset)?;
+                bytes = cfa(14, None, f.cfa_offset, data_alignment)?;
             }
             ".cfi_offset" | ".cfi_rel_offset" | ".cfi_val_offset" => {
                 let reg = register(arg(0)?, arch)?;
@@ -301,10 +319,10 @@ pub(crate) fn lower(
                     } else {
                         0
                     };
-                if offset % -8 != 0 {
+                if offset % data_alignment != 0 {
                     return Err(invalid());
                 }
-                let factor = offset / -8;
+                let factor = offset / data_alignment;
                 if reg < 0 {
                     return Err(invalid());
                 }
@@ -360,7 +378,12 @@ pub(crate) fn lower(
     if !frames.is_empty() {
         writeln!(
             output,
-            ".section .eh_frame,\"a\",@progbits\n.balign 8\n{frames}"
+            ".section .eh_frame,\"a\",@progbits\n.balign {}\n{frames}",
+            if arch == TargetArchitecture::Armv7 {
+                4
+            } else {
+                8
+            }
         )
         .unwrap();
     }
