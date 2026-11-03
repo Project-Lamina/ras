@@ -97,6 +97,10 @@ const EM_386: u16 = 3;
 const EM_ARM: u16 = 40;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
+
+/// The float ABI an object was built for. A module that leaves this at soft-float
+/// cannot be merged with a double-float one, which is what glibc ships.
+const EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x4;
 const EM_PPC64: u16 = 21;
 #[cfg(feature = "nightly")]
 const EM_ARX64: u16 = 0xa064;
@@ -243,6 +247,7 @@ fn write_elf_header_with_shnum<W: Write>(
     let e_flags: u32 = match e_machine {
         EM_PPC64 => 2,
         EM_ARM => 0x0500_0000,
+        EM_RISCV => EF_RISCV_FLOAT_ABI_DOUBLE,
         _ => 0,
     };
     w.write_all(&e_flags.to_le_bytes()).map_err(map)?;
