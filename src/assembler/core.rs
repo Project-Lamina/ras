@@ -10,6 +10,7 @@ use crate::{
     dwarf::{self, LocRow},
     encoder::{
         aarch64::AArch64Encoder,
+        armv7::Armv7Encoder,
         powerpc::{PowerPcEncoder, branch_field_bits},
         riscv::RiscVEncoder,
         traits::{InstructionEncoder, ParsedInstruction, RipFixup, TlsModel},
@@ -31,6 +32,12 @@ const R_386_32: u32 = 1;
 const R_X86_PC32: u32 = 2;
 const R_386_16: u32 = 20;
 const R_386_8: u32 = 23;
+const R_ARM_ABS32: u32 = 2;
+const R_ARM_REL32: u32 = 3;
+const R_ARM_CALL: u32 = 28;
+const R_ARM_JUMP24: u32 = 29;
+const R_ARM_MOVW_ABS_NC: u32 = 43;
+const R_ARM_MOVT_ABS: u32 = 44;
 const R_X86_64_TPOFF32: u32 = 23;
 const R_X86_64_TPOFF64: u32 = 18;
 const R_X86_64_GOTTPOFF: u32 = 22;
@@ -206,6 +213,15 @@ enum PatchPoint {
         offset: usize,
         fixup: PowerPcFixup,
     },
+    /// An A32 instruction whose symbol-dependent field the assembler or the
+    /// linker fills in: a branch displacement, or half of a movw/movt pair.
+    Armv7 {
+        offset: usize,
+        target: String,
+        addend: i64,
+        word: u32,
+        kind: u32,
+    },
 }
 
 enum PowerPcFixup {
@@ -239,6 +255,7 @@ impl RasAssembler {
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
             TargetArchitecture::X86_64 => Box::new(X86_64Encoder::new()),
             TargetArchitecture::I686 => Box::new(X86_64Encoder::new_32()),
+            TargetArchitecture::Armv7 => Box::new(Armv7Encoder::new()),
             TargetArchitecture::Aarch64 => Box::new(AArch64Encoder::new()),
             #[cfg(feature = "nightly")]
             TargetArchitecture::Arx64 => Box::new(Arx64Encoder::new()),
@@ -297,12 +314,12 @@ impl RasAssembler {
     /// resolution.
     pub fn assemble_text_to_object_bytes(&mut self, asm_text: &str) -> Result<Vec<u8>, RasError> {
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
-        let comment_markers: &'static [&'static str] =
-            if self.target_arch == TargetArchitecture::Aarch64 {
-                &["//"]
-            } else {
-                &["#"]
-            };
+        let comment_markers: &'static [&'static str] = match self.target_arch {
+            TargetArchitecture::Aarch64 => &["//"],
+            // `#` introduces an A32 immediate, so ARM comments start with `@`.
+            TargetArchitecture::Armv7 => &["@", "//"],
+            _ => &["#"],
+        };
         let mut parsed = AssemblyParser::new()
             .with_darwin_directives(self.target_os == TargetOperatingSystem::MacOS)
             .with_line_comments(comment_markers)
@@ -455,6 +472,7 @@ impl RasAssembler {
                     TargetArchitecture::Riscv32
                         | TargetArchitecture::Riscv64
                         | TargetArchitecture::PowerPC64
+                        | TargetArchitecture::Armv7
                 ))
                 && section.flags.exec
             {
@@ -637,6 +655,21 @@ impl RasAssembler {
                 relocs.extend(debug.relocs);
             }
         }
+        if self.target_arch == TargetArchitecture::Armv7 && !parsed.arm_attributes.is_empty() {
+            sections.push(crate::parser::Section {
+                group: None,
+                name: crate::object::ARM_ATTRIBUTES_SECTION.into(),
+                flags: crate::parser::SectionFlags {
+                    alloc: false,
+                    exec: false,
+                    write: false,
+                    tls: false,
+                },
+                data: crate::object::arm_attributes(&parsed.arm_attributes),
+                alignment: 1,
+                macho: None,
+            });
+        }
         let code = &sections.iter().find(|s| s.name == ".text").unwrap().data;
 
         self.object_writer
@@ -691,6 +724,7 @@ impl RasAssembler {
                         | TargetArchitecture::Riscv32
                         | TargetArchitecture::Riscv64
                         | TargetArchitecture::PowerPC64
+                        | TargetArchitecture::Armv7
                 );
         let alignment = if power {
             1usize.checked_shl(u32::try_from(value).unwrap_or(u32::MAX))
@@ -973,14 +1007,15 @@ impl RasAssembler {
                             TargetArchitecture::Riscv32
                                 | TargetArchitecture::Riscv64
                                 | TargetArchitecture::PowerPC64
+                                | TargetArchitecture::Armv7
                         )
                     {
                         let prefix = padding % 4;
                         code.resize(code.len() + prefix, 0);
-                        let nop = if self.target_arch == TargetArchitecture::PowerPC64 {
-                            0x6000_0000u32
-                        } else {
-                            0x0000_0013u32
+                        let nop = match self.target_arch {
+                            TargetArchitecture::PowerPC64 => 0x6000_0000u32,
+                            TargetArchitecture::Armv7 => 0xe320_f000u32,
+                            _ => 0x0000_0013u32,
                         };
                         for _ in 0..padding / 4 {
                             code.extend_from_slice(&nop.to_le_bytes());
@@ -1293,6 +1328,59 @@ impl RasAssembler {
                         }
                     }
 
+                    if self.target_arch == TargetArchitecture::Armv7 {
+                        let operands = &inst.operands;
+                        let patch = if let Some((word, kind)) = armv7_branch(&opcode) {
+                            if operands.len() != 1 {
+                                return Err(RasError::EncodingError(format!(
+                                    "{opcode} takes one branch target"
+                                )));
+                            }
+                            let target = operands[0].trim();
+                            check_branch_target(target)?;
+                            let (symbol, addend) = split_addend(target)?;
+                            Some(PatchPoint::Armv7 {
+                                offset: current_offset,
+                                target: symbol.to_string(),
+                                addend,
+                                word,
+                                kind,
+                            })
+                        } else if let Some((bits, prefix, kind)) = armv7_mov_half(&opcode) {
+                            match operands.as_slice() {
+                                [rd, value]
+                                    if value.trim().trim_start_matches('#').starts_with(prefix) =>
+                                {
+                                    let text = value
+                                        .trim()
+                                        .trim_start_matches('#')
+                                        .trim_start_matches(prefix);
+                                    check_branch_target(text)?;
+                                    let (symbol, addend) = split_addend(text)?;
+                                    let rd = crate::encoder::armv7::gpr(rd)?;
+                                    Some(PatchPoint::Armv7 {
+                                        offset: current_offset,
+                                        target: symbol.to_string(),
+                                        addend,
+                                        word: bits | (rd << 12),
+                                        kind,
+                                    })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(patch) = patch {
+                            if let PatchPoint::Armv7 { word, .. } = &patch {
+                                code.extend_from_slice(&word.to_le_bytes());
+                            }
+                            patch_points.push(patch);
+                            current_offset += 4;
+                            continue;
+                        }
+                    }
+
                     // x86_64 conditional jumps: 2-byte opcode (0x0F 8x) + rel32
                     if is_x86(self.target_arch)
                         && inst.operands.len() == 1
@@ -1493,6 +1581,7 @@ impl RasAssembler {
                                 (TargetArchitecture::X86_64, 8) => 24,
                                 (TargetArchitecture::Aarch64, 4) => 261,
                                 (TargetArchitecture::Aarch64, 8) => 260,
+                                (TargetArchitecture::Armv7, 4) => R_ARM_REL32,
                                 _ => {
                                     return Err(RasError::EncodingError(
                                         "Unsupported relative data relocation".into(),
@@ -1536,6 +1625,7 @@ impl RasAssembler {
                                 (TargetArchitecture::I686, 1) => R_386_8,
                                 (TargetArchitecture::I686, 2) => R_386_16,
                                 (TargetArchitecture::I686, 4) => R_386_32,
+                                (TargetArchitecture::Armv7, 4) => R_ARM_ABS32,
                                 (TargetArchitecture::Aarch64, 2) => 259,
                                 (TargetArchitecture::Aarch64, 4) => 258,
                                 (TargetArchitecture::Aarch64, 8) => 257,
@@ -1681,9 +1771,59 @@ impl RasAssembler {
                 });
                 continue;
             }
+            if let PatchPoint::Armv7 {
+                offset,
+                target,
+                addend,
+                word,
+                kind,
+            } = patch
+            {
+                let branch = matches!(*kind, R_ARM_CALL | R_ARM_JUMP24);
+                let local = !global_symbols.contains(target.as_str())
+                    && symbol_offsets.contains_key(target.as_str());
+                let imm = if branch && local {
+                    // The processor adds eight to the branch's own address.
+                    let delta =
+                        symbol_offsets[target.as_str()] as i64 + *addend - (*offset as i64 + 8);
+                    if delta % 4 != 0 || !(-(1i64 << 25)..(1i64 << 25)).contains(&delta) {
+                        return Err(RasError::EncodingError(format!(
+                            "ARM branch to {target} is out of range"
+                        )));
+                    }
+                    ((delta / 4) as u32) & 0x00ff_ffff
+                } else if branch {
+                    // Elf32_Rel keeps the addend in the displacement, which
+                    // also has to cancel the eight-byte pipeline bias.
+                    (((*addend - 8) / 4) as u32) & 0x00ff_ffff
+                } else {
+                    let half = i16::try_from(*addend).map_err(|_| {
+                        RasError::EncodingError(format!(
+                            "ARM movw/movt addend {addend} for {target} does not fit the \
+                             sixteen-bit field an Elf32_Rel addend lives in"
+                        ))
+                    })? as u16 as u32;
+                    ((half >> 12) << 16) | (half & 0xfff)
+                };
+                code[*offset..*offset + 4].copy_from_slice(&(word | imm).to_le_bytes());
+                if !(branch && local) {
+                    external_relocs.push(ExternalReloc {
+                        offset: *offset,
+                        symbol: target.clone(),
+                        section: String::new(),
+                        kind: *kind,
+                        addend: 0,
+                        trailing: 0,
+                        branch: false,
+                        section_symbol: false,
+                    });
+                }
+                continue;
+            }
             let target = match patch {
                 PatchPoint::Data { .. }
                 | PatchPoint::PowerPc { .. }
+                | PatchPoint::Armv7 { .. }
                 | PatchPoint::X86Abs32 { .. } => unreachable!(),
                 PatchPoint::Riscv { target, .. }
                 | PatchPoint::RiscvPair { target, .. }
@@ -1840,6 +1980,7 @@ impl RasAssembler {
                     | PatchPoint::Riscv { .. }
                     | PatchPoint::RiscvPair { .. }
                     | PatchPoint::X86Abs32 { .. }
+                    | PatchPoint::Armv7 { .. }
                     | PatchPoint::X86Tls { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
@@ -2123,6 +2264,35 @@ impl RasAssembler {
             ))),
         }
     }
+}
+
+/// An A32 branch to a label: the instruction word without its displacement,
+/// and the relocation kind for a target this object cannot resolve itself.
+fn armv7_branch(opcode: &str) -> Option<(u32, u32)> {
+    [
+        ("bl", 0x0b00_0000u32, R_ARM_CALL),
+        ("b", 0x0a00_0000u32, R_ARM_JUMP24),
+    ]
+    .into_iter()
+    .find_map(|(base, bits, kind)| {
+        let cond = crate::encoder::armv7::condition(opcode.strip_prefix(base)?)?;
+        Some(((cond << 28) | bits, kind))
+    })
+}
+
+/// The movw or movt that builds half of a symbol address: the instruction
+/// word without its register or immediate, the operand prefix that selects
+/// the half, and the relocation kind.
+fn armv7_mov_half(opcode: &str) -> Option<(u32, &'static str, u32)> {
+    [
+        ("movw", 0x0300_0000u32, ":lower16:", R_ARM_MOVW_ABS_NC),
+        ("movt", 0x0340_0000u32, ":upper16:", R_ARM_MOVT_ABS),
+    ]
+    .into_iter()
+    .find_map(|(base, bits, prefix, kind)| {
+        let cond = crate::encoder::armv7::condition(opcode.strip_prefix(base)?)?;
+        Some(((cond << 28) | bits, prefix, kind))
+    })
 }
 
 fn is_numeric_operand(text: &str) -> bool {

@@ -93,6 +93,13 @@ pub struct SymbolAttributes {
     pub local_entry: Option<String>,
 }
 
+/// An ARM build attribute value: EABI tags take either a number or a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArmAttributeValue {
+    Number(u32),
+    Text(String),
+}
+
 pub struct ParsedAssembly {
     pub common_order: Vec<String>,
     pub aliases: Vec<(String, String)>,
@@ -102,6 +109,7 @@ pub struct ParsedAssembly {
     pub instructions: Vec<ParsedInstruction>,
     pub lines: Vec<Line>,
     pub files: BTreeMap<u32, DebugFile>,
+    pub arm_attributes: Vec<(u32, ArmAttributeValue)>,
 }
 
 pub struct AssemblyParser {
@@ -120,6 +128,7 @@ pub struct AssemblyParser {
     symbol_names: HashSet<String>,
     /// Name of the symbol a `.def`/`.endef` block is currently describing.
     coff_def: Option<String>,
+    arm_attributes: Vec<(u32, ArmAttributeValue)>,
     /// Darwin reads the third `.comm` operand and `.align` as log2 exponents.
     darwin: bool,
     line_comments: &'static [&'static str],
@@ -148,6 +157,7 @@ impl AssemblyParser {
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
             coff_def: None,
+            arm_attributes: Vec::new(),
             darwin: false,
             line_comments: &["#", "//"],
         }
@@ -255,6 +265,7 @@ impl AssemblyParser {
             instructions,
             lines: self.lines,
             files: self.files,
+            arm_attributes: self.arm_attributes,
         })
     }
 
@@ -807,6 +818,48 @@ impl AssemblyParser {
                 });
             }
             ".ident" => {}
+            ".syntax" => {
+                if parts.get(1).map(|s| s.trim()) != Some("unified") {
+                    return Err(RasError::ParseError(
+                        "ras reads unified ARM syntax only".into(),
+                    ));
+                }
+            }
+            ".arm" => {}
+            ".thumb" | ".thumb_func" | ".code" | ".force_thumb" => {
+                return Err(RasError::ParseError(format!(
+                    "{} selects Thumb, which ras does not encode",
+                    parts[0]
+                )));
+            }
+            ".arch" | ".arch_extension" | ".fpu" => {
+                let name = parts
+                    .get(1)
+                    .map(|s| s.trim())
+                    .ok_or_else(|| RasError::ParseError(format!("{} needs a name", parts[0])))?;
+                self.arm_attributes
+                    .extend(arm_isa_attributes(parts[0], name)?);
+            }
+            ".eabi_attribute" => {
+                let (tag, value) = line[parts[0].len()..]
+                    .split_once(',')
+                    .ok_or_else(|| RasError::ParseError("Invalid .eabi_attribute".into()))?;
+                let tag = u32::try_from(parse_integer(tag.trim())?)
+                    .map_err(|_| RasError::ParseError("Invalid EABI attribute tag".into()))?;
+                let value = value.trim();
+                let value = match parse_quoted_string_bytes(value, false) {
+                    Some(bytes) => ArmAttributeValue::Text(
+                        String::from_utf8(bytes)
+                            .map_err(|_| RasError::ParseError("Invalid EABI string".into()))?,
+                    ),
+                    None => {
+                        ArmAttributeValue::Number(u32::try_from(parse_integer(value)?).map_err(
+                            |_| RasError::ParseError("Invalid EABI attribute value".into()),
+                        )?)
+                    }
+                };
+                self.arm_attributes.push((tag, value));
+            }
             _ => {
                 return Err(RasError::ParseError(format!(
                     "Unsupported directive: {}",
@@ -838,6 +891,33 @@ impl AssemblyParser {
         }));
         Ok(())
     }
+}
+
+/// EABI build attributes implied by `.arch`, `.arch_extension` and `.fpu`.
+/// ras names what it does not know rather than leaving the object silently
+/// describing the wrong ABI.
+fn arm_isa_attributes(
+    directive: &str,
+    name: &str,
+) -> Result<Vec<(u32, ArmAttributeValue)>, RasError> {
+    use ArmAttributeValue::{Number, Text};
+    let attributes = match (directive, name) {
+        (".arch", "armv7-a") => vec![
+            (5, Text("7-A".into())),
+            (6, Number(10)),
+            (7, Number(u32::from(b'A'))),
+            (8, Number(1)),
+            (9, Number(2)),
+        ],
+        (".fpu", "vfpv3-d16") => vec![(10, Number(4))],
+        (".arch_extension", "idiv") => vec![(44, Number(2))],
+        _ => {
+            return Err(RasError::ParseError(format!(
+                "ras has no build attributes for `{directive} {name}`"
+            )));
+        }
+    };
+    Ok(attributes)
 }
 
 fn is_numeric_label(name: &str) -> bool {

@@ -111,6 +111,7 @@ fn is_arch_encoded(arch: TargetArchitecture) -> bool {
         arch,
         TargetArchitecture::X86_64
             | TargetArchitecture::I686
+            | TargetArchitecture::Armv7
             | TargetArchitecture::Aarch64
             | TargetArchitecture::Riscv32
             | TargetArchitecture::Riscv64
