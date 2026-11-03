@@ -56,8 +56,11 @@ pub fn is_object_file_supported(arch: TargetArchitecture, os: TargetOperatingSys
                 )
             )
         }
-        // The COFF writer rejects anything but x86_64, see object.rs.
-        Some(ObjectFormat::Coff) => arch == TargetArchitecture::X86_64,
+        // The COFF writer carries x86_64 and aarch64, see object.rs.
+        Some(ObjectFormat::Coff) => matches!(
+            arch,
+            TargetArchitecture::X86_64 | TargetArchitecture::Aarch64
+        ),
         Some(ObjectFormat::MachO) => {
             matches!(
                 arch,
@@ -139,8 +142,8 @@ pub fn unsupported_target_hint(arch: TargetArchitecture, os: TargetOperatingSyst
                  output is unavailable. Assemble with the system assembler for now."
             ),
             Some(ObjectFormat::Coff) => format!(
-                "ras writes COFF objects for x86_64 only, so {arch:?} on {os:?} is \
-                 unavailable."
+                "ras writes COFF objects for x86_64 and aarch64 only, so {arch:?} on {os:?} \
+                 is unavailable."
             ),
             _ => format!("No object format is mapped for {os:?}."),
         }
@@ -191,8 +194,12 @@ mod tests {
             TargetArchitecture::X86_64,
             TargetOperatingSystem::Windows
         ));
-        assert!(!is_object_file_supported(
+        assert!(is_object_file_supported(
             TargetArchitecture::Aarch64,
+            TargetOperatingSystem::Windows
+        ));
+        assert!(!is_object_file_supported(
+            TargetArchitecture::Riscv64,
             TargetOperatingSystem::Windows
         ));
     }
@@ -203,8 +210,8 @@ mod tests {
             unsupported_target_hint(TargetArchitecture::Riscv64, TargetOperatingSystem::MacOS);
         assert!(macos.contains("Mach-O"), "unhelpful hint: {macos}");
 
-        let win_arm =
-            unsupported_target_hint(TargetArchitecture::Aarch64, TargetOperatingSystem::Windows);
-        assert!(win_arm.contains("COFF"), "unhelpful hint: {win_arm}");
+        let win_riscv =
+            unsupported_target_hint(TargetArchitecture::Riscv64, TargetOperatingSystem::Windows);
+        assert!(win_riscv.contains("COFF"), "unhelpful hint: {win_riscv}");
     }
 }
