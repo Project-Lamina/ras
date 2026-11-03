@@ -913,7 +913,9 @@ impl RasAssembler {
 
         for (index, line) in lines.iter().enumerate() {
             line_offsets.push(current_offset);
-            if self.target_arch == TargetArchitecture::Aarch64 {
+            if self.target_arch == TargetArchitecture::Aarch64
+                && self.target_os != TargetOperatingSystem::Windows
+            {
                 let mode = match line {
                     Line::Instruction(_) => "$x",
                     Line::Data(bytes) if !bytes.is_empty() => "$d",
