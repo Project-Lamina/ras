@@ -1,5 +1,6 @@
 //! Object file generation: ELF (Linux/BSD), Mach-O (macOS), COFF/PE (Windows).
 
+use crate::parser::ArmAttributeValue;
 #[cfg(test)]
 use crate::parser::SectionFlags;
 use crate::{error::RasError, parser::Section};
@@ -93,6 +94,7 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ET_REL: u16 = 1;
 const EM_X86_64: u16 = 62;
 const EM_386: u16 = 3;
+const EM_ARM: u16 = 40;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
 const EM_PPC64: u16 = 21;
@@ -103,6 +105,7 @@ const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHT_REL: u32 = 9;
+const SHT_ARM_ATTRIBUTES: u32 = 0x7000_0003;
 const SHF_INFO_LINK: u64 = 0x40;
 const SHF_TLS: u64 = 0x400;
 const ELF64_SYM_SIZE: u64 = 24;
@@ -119,6 +122,13 @@ const R_386_PLT32: u32 = 4;
 const R_386_16: u32 = 20;
 const R_386_8: u32 = 23;
 
+const R_ARM_ABS32: u32 = 2;
+const R_ARM_REL32: u32 = 3;
+const R_ARM_CALL: u32 = 28;
+const R_ARM_JUMP24: u32 = 29;
+const R_ARM_MOVW_ABS_NC: u32 = 43;
+const R_ARM_MOVT_ABS: u32 = 44;
+
 /// The width of the field an i386 relocation patches. The addend is stored
 /// there, so a kind whose field width is unknown cannot be written at all.
 fn i386_rel_width(kind: u32) -> Result<usize, RasError> {
@@ -132,10 +142,62 @@ fn i386_rel_width(kind: u32) -> Result<usize, RasError> {
     }
 }
 
+/// Where an ARM relocation's addend lives. ARM uses `Elf32_Rel`, so the addend
+/// is always in the instruction or data the relocation patches: for a plain
+/// data word that is a field of a known width, and for an instruction it is a
+/// bit field the assembler has already filled in.
+enum ArmAddend {
+    Field(usize),
+    InPlace,
+}
+
+fn arm_rel_addend(kind: u32) -> Result<ArmAddend, RasError> {
+    match kind {
+        R_ARM_ABS32 | R_ARM_REL32 => Ok(ArmAddend::Field(4)),
+        R_ARM_CALL | R_ARM_JUMP24 | R_ARM_MOVW_ABS_NC | R_ARM_MOVT_ABS => Ok(ArmAddend::InPlace),
+        _ => Err(RasError::ObjectError(format!(
+            "ARM relocation type {kind} is not implemented"
+        ))),
+    }
+}
+
+pub const ARM_ATTRIBUTES_SECTION: &str = ".ARM.attributes";
+
+/// Contents of an `.ARM.attributes` section: format version `A`, then one
+/// `aeabi` vendor subsection holding a single file-scope attribute list.
+pub fn arm_attributes(attributes: &[(u32, ArmAttributeValue)]) -> Vec<u8> {
+    let ordered: std::collections::BTreeMap<u32, &ArmAttributeValue> = attributes
+        .iter()
+        .map(|(tag, value)| (*tag, value))
+        .collect();
+    let mut body = Vec::new();
+    for (tag, value) in ordered {
+        body.extend(crate::parser::leb128(i128::from(tag), false));
+        match value {
+            ArmAttributeValue::Number(number) => {
+                body.extend(crate::parser::leb128(i128::from(*number), false));
+            }
+            ArmAttributeValue::Text(text) => {
+                body.extend_from_slice(text.as_bytes());
+                body.push(0);
+            }
+        }
+    }
+    let mut vendor = b"aeabi\0".to_vec();
+    vendor.push(1);
+    vendor.extend(((body.len() + 5) as u32).to_le_bytes());
+    vendor.extend(body);
+    let mut out = vec![b'A'];
+    out.extend(((vendor.len() + 4) as u32).to_le_bytes());
+    out.extend(vendor);
+    out
+}
+
 fn elf64_e_machine(arch: TargetArchitecture) -> Option<u16> {
     match arch {
         TargetArchitecture::X86_64 => Some(EM_X86_64),
         TargetArchitecture::I686 => Some(EM_386),
+        TargetArchitecture::Armv7 => Some(EM_ARM),
         TargetArchitecture::Aarch64 => Some(EM_AARCH64),
         #[cfg(feature = "nightly")]
         TargetArchitecture::Arx64 => Some(EM_ARX64),
@@ -176,7 +238,13 @@ fn write_elf_header_with_shnum<W: Write>(
             w.write_all(&value.to_le_bytes()).map_err(map)?;
         }
     }
-    let e_flags: u32 = if e_machine == EM_PPC64 { 2 } else { 0 };
+    // EF_ARM_EABI_VER5; the float ABI is described by .ARM.attributes, and the
+    // linker sets EF_ARM_ABI_FLOAT_* on the output from those.
+    let e_flags: u32 = match e_machine {
+        EM_PPC64 => 2,
+        EM_ARM => 0x0500_0000,
+        _ => 0,
+    };
     w.write_all(&e_flags.to_le_bytes()).map_err(map)?;
     w.write_all(&(header_size as u16).to_le_bytes())
         .map_err(map)?;
@@ -341,11 +409,14 @@ impl ObjectWriter for ElfWriter {
             .ok_or_else(|| RasError::ObjectError("Unsupported ELF architecture".into()))?;
         let class32 = matches!(
             req.target_arch,
-            TargetArchitecture::Riscv32 | TargetArchitecture::I686
+            TargetArchitecture::Riscv32 | TargetArchitecture::I686 | TargetArchitecture::Armv7
         );
-        // The i386 psABI defines Elf32_Rel only: the addend lives in the field
-        // the relocation patches, not in the relocation entry.
-        let use_rel = req.target_arch == TargetArchitecture::I686;
+        // The i386 and ARM psABIs define Elf32_Rel only: the addend lives in
+        // the field the relocation patches, not in the relocation entry.
+        let use_rel = matches!(
+            req.target_arch,
+            TargetArchitecture::I686 | TargetArchitecture::Armv7
+        );
         let sym_size = if class32 {
             ELF32_SYM_SIZE
         } else {
@@ -377,7 +448,7 @@ impl ObjectWriter for ElfWriter {
         }
         if matches!(
             req.target_arch,
-            TargetArchitecture::X86_64 | TargetArchitecture::I686
+            TargetArchitecture::X86_64 | TargetArchitecture::I686 | TargetArchitecture::Armv7
         ) {
             for name in [".data", ".bss"] {
                 if !sections.iter().any(|s| s.name == name) {
@@ -402,7 +473,9 @@ impl ObjectWriter for ElfWriter {
         let mut headers: Vec<Elf64SectionHeader> = sections
             .iter()
             .map(|s| Elf64SectionHeader {
-                section_type: if matches!(s.name.as_str(), ".bss" | ".tbss") {
+                section_type: if s.name == ARM_ATTRIBUTES_SECTION {
+                    SHT_ARM_ATTRIBUTES
+                } else if matches!(s.name.as_str(), ".bss" | ".tbss") {
                     8
                 } else if s.name.starts_with(".note.") && s.name != ".note.GNU-stack" {
                     7
@@ -443,6 +516,7 @@ impl ObjectWriter for ElfWriter {
                     (req.target_arch, r.kind),
                     (TargetArchitecture::X86_64, 1 | 10 | 11 | 12 | 14)
                         | (TargetArchitecture::I686, R_386_32 | R_386_16 | R_386_8)
+                        | (TargetArchitecture::Armv7, R_ARM_ABS32)
                         | (TargetArchitecture::Aarch64, 257..=259)
                 )
             })
@@ -633,14 +707,31 @@ impl ObjectWriter for ElfWriter {
                 if use_rel {
                     let info = (index << 8) | (r.kind & 0xff);
                     bytes.extend_from_slice(&info.to_le_bytes());
-                    let width = i386_rel_width(r.kind)?;
-                    let field = data[i].get_mut(r.offset..r.offset + width).ok_or_else(|| {
-                        RasError::ObjectError(format!(
-                            "Relocation for {} lies outside {}",
-                            r.symbol, section.name
-                        ))
-                    })?;
-                    field.copy_from_slice(&addend.to_le_bytes()[..width]);
+                    let width = if req.target_arch == TargetArchitecture::Armv7 {
+                        match arm_rel_addend(r.kind)? {
+                            ArmAddend::Field(width) => Some(width),
+                            ArmAddend::InPlace if addend == 0 => None,
+                            ArmAddend::InPlace => {
+                                return Err(RasError::ObjectError(format!(
+                                    "ARM relocation type {} for {} carries addend {addend}, \
+                                     which belongs in the instruction field",
+                                    r.kind, r.symbol
+                                )));
+                            }
+                        }
+                    } else {
+                        Some(i386_rel_width(r.kind)?)
+                    };
+                    if let Some(width) = width {
+                        let field =
+                            data[i].get_mut(r.offset..r.offset + width).ok_or_else(|| {
+                                RasError::ObjectError(format!(
+                                    "Relocation for {} lies outside {}",
+                                    r.symbol, section.name
+                                ))
+                            })?;
+                        field.copy_from_slice(&addend.to_le_bytes()[..width]);
+                    }
                 } else if class32 {
                     let info = (index << 8) | (r.kind & 0xff);
                     bytes.extend_from_slice(&info.to_le_bytes());
