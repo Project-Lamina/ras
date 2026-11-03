@@ -1207,18 +1207,21 @@ impl RasAssembler {
                                     && self.target_os != TargetOperatingSystem::MacOS,
                             })
                         } else if opcode == "adrp" && operands.len() == 2 {
-                            let (page, kind) = match operands[1].strip_prefix(":got:") {
-                                Some(symbol) => (symbol, 311),
-                                None if operands[1].starts_with(':') => {
-                                    return Err(RasError::EncodingError(format!(
-                                        "Unsupported relocation modifier: {}",
-                                        operands[1]
-                                    )));
-                                }
-                                None => match operands[1].strip_suffix("@TLVPPAGE") {
-                                    Some(symbol) => (symbol, 313),
-                                    None => (operands[1].as_str(), 275),
-                                },
+                            let page_operand = operands[1].as_str();
+                            let (page, kind) = if let Some(symbol) =
+                                page_operand.strip_prefix(":got:")
+                            {
+                                (symbol, 311)
+                            } else if let Some(symbol) = page_operand.strip_prefix(":gottprel:") {
+                                (symbol, 541)
+                            } else if page_operand.starts_with(':') {
+                                return Err(RasError::EncodingError(format!(
+                                    "Unsupported relocation modifier: {page_operand}"
+                                )));
+                            } else if let Some(symbol) = page_operand.strip_suffix("@TLVPPAGE") {
+                                (symbol, 313)
+                            } else {
+                                (page_operand, 275)
                             };
                             let (symbol, addend) = split_addend(page)?;
                             Some(PatchPoint::AArch64 {
@@ -1238,6 +1241,9 @@ impl RasAssembler {
                         {
                             let modifier = operands[2].trim_start_matches('#');
                             let (symbol, kind) = match modifier.split_once(':').map(|(_, r)| r) {
+                                Some(rest) if rest.starts_with("gottprel_lo12:") => {
+                                    (&rest[14..], 542)
+                                }
                                 Some(rest) if rest.starts_with("got_lo12:") => (&rest[9..], 312),
                                 Some(rest) if rest.starts_with("lo12:") => (&rest[5..], 286),
                                 _ => {
@@ -1247,7 +1253,7 @@ impl RasAssembler {
                                     )));
                                 }
                             };
-                            let symbol = symbol.trim_end_matches(']');
+                            let (symbol, addend) = split_addend(symbol.trim_end_matches(']'))?;
                             let (base, base_wide) =
                                 crate::encoder::aarch64::gpr(&operands[1][1..])?;
                             let (rt, rt_wide) = crate::encoder::aarch64::gpr(&operands[0])?;
@@ -1259,8 +1265,53 @@ impl RasAssembler {
                             Some(PatchPoint::AArch64 {
                                 offset: current_offset,
                                 target: symbol.to_string(),
-                                addend: 0,
+                                addend,
                                 word: 0xf940_0000 | (base << 5) | rt,
+                                bits: 0,
+                                kind,
+                                relocate: true,
+                            })
+                        } else if opcode == "add"
+                            && (3..=4).contains(&operands.len())
+                            && operands[2].starts_with(":tprel_")
+                        {
+                            let operand = operands[2].as_str();
+                            let (page_offset, kind, hi12) = if let Some(symbol) =
+                                operand.strip_prefix(":tprel_hi12:")
+                            {
+                                (symbol, 549u32, true)
+                            } else if let Some(symbol) = operand.strip_prefix(":tprel_lo12_nc:") {
+                                (symbol, 551u32, false)
+                            } else if let Some(symbol) = operand.strip_prefix(":tprel_lo12:") {
+                                (symbol, 550u32, false)
+                            } else {
+                                return Err(RasError::EncodingError(format!(
+                                    "Unsupported relocation modifier: {operand}"
+                                )));
+                            };
+                            let shift = operands.get(3).map(String::as_str);
+                            if !matches!(
+                                (hi12, shift),
+                                (true, None | Some("lsl #12")) | (false, None | Some("lsl #0"))
+                            ) {
+                                return Err(RasError::EncodingError(format!(
+                                    "Unsupported shift for {operand}: {}",
+                                    shift.unwrap_or_default()
+                                )));
+                            }
+                            let (symbol, addend) = split_addend(page_offset)?;
+                            let (rd, rd_wide) = crate::encoder::aarch64::gpr(&operands[0])?;
+                            let (rn, rn_wide) = crate::encoder::aarch64::gpr(&operands[1])?;
+                            if !rd_wide || !rn_wide {
+                                return Err(RasError::EncodingError(format!(
+                                    "{operand} takes 64-bit registers"
+                                )));
+                            }
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: symbol.to_string(),
+                                addend,
+                                word: 0x9100_0000 | if hi12 { 1 << 22 } else { 0 } | (rn << 5) | rd,
                                 bits: 0,
                                 kind,
                                 relocate: true,

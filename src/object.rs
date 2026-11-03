@@ -965,7 +965,8 @@ fn arm64_reloc_spec(kind: u32) -> Result<MachORelocSpec, RasError> {
         313 => Ok(spec(ARM64_RELOC_TLVP_LOAD_PAGE21, 2, true)),
         314 => Ok(spec(ARM64_RELOC_TLVP_LOAD_PAGEOFF12, 2, false)),
         _ => Err(RasError::ObjectError(format!(
-            "arm64 relocation kind {kind} has no Mach-O equivalent"
+            "{} (kind {kind}) has no Mach-O equivalent",
+            aarch64_reloc_name(kind)
         ))),
     }
 }
@@ -1707,6 +1708,11 @@ fn aarch64_reloc_name(kind: u32) -> &'static str {
         311 => "R_AARCH64_ADR_GOT_PAGE",
         312 => "R_AARCH64_LD64_GOT_LO12_NC",
         313 | 314 => "Mach-O TLVP",
+        541 => "R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21",
+        542 => "R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC",
+        549 => "R_AARCH64_TLSLE_ADD_TPREL_HI12",
+        550 => "R_AARCH64_TLSLE_ADD_TPREL_LO12",
+        551 => "R_AARCH64_TLSLE_ADD_TPREL_LO12_NC",
         _ => "unknown AArch64 relocation",
     }
 }
