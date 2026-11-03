@@ -26,6 +26,11 @@ use crate::{
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 
 const R_X86_64_REX_GOTPCRELX: u32 = 42;
+const R_386_32: u32 = 1;
+/// R_386_PC32 and R_X86_64_PC32: the two architectures number it alike.
+const R_X86_PC32: u32 = 2;
+const R_386_16: u32 = 20;
+const R_386_8: u32 = 23;
 const R_X86_64_TPOFF32: u32 = 23;
 const R_X86_64_TPOFF64: u32 = 18;
 const R_X86_64_GOTTPOFF: u32 = 22;
@@ -150,6 +155,12 @@ enum PatchPoint {
         target: String,
         relocate: bool,
     },
+    /// A 32-bit absolute symbol reference in an i686 instruction immediate.
+    X86Abs32 {
+        offset: usize,
+        target: String,
+        addend: i64,
+    },
     X86RipRel32 {
         offset: usize,
         target: String,
@@ -227,6 +238,7 @@ impl RasAssembler {
     ) -> Result<Self, RasError> {
         let encoder: Box<dyn InstructionEncoder> = match target_arch {
             TargetArchitecture::X86_64 => Box::new(X86_64Encoder::new()),
+            TargetArchitecture::I686 => Box::new(X86_64Encoder::new_32()),
             TargetArchitecture::Aarch64 => Box::new(AArch64Encoder::new()),
             #[cfg(feature = "nightly")]
             TargetArchitecture::Arx64 => Box::new(Arx64Encoder::new()),
@@ -434,6 +446,7 @@ impl RasAssembler {
                 &section.name,
                 &global_symbols,
                 self.target_os == TargetOperatingSystem::MacOS,
+                self.target_arch,
             )?;
             section.alignment = if (self.target_arch == TargetArchitecture::Aarch64
                 && self.target_os != TargetOperatingSystem::MacOS
@@ -972,7 +985,7 @@ impl RasAssembler {
                         for _ in 0..padding / 4 {
                             code.extend_from_slice(&nop.to_le_bytes());
                         }
-                    } else if executable && self.target_arch == TargetArchitecture::X86_64 {
+                    } else if executable && is_x86(self.target_arch) {
                         x86_nop_padding(&mut code, padding);
                     } else {
                         code.resize(code.len() + padding, 0);
@@ -1281,7 +1294,7 @@ impl RasAssembler {
                     }
 
                     // x86_64 conditional jumps: 2-byte opcode (0x0F 8x) + rel32
-                    if self.target_arch == TargetArchitecture::X86_64
+                    if is_x86(self.target_arch)
                         && inst.operands.len() == 1
                         && let Some(cc_byte) = x86_cond_jmp_byte(&opcode)
                     {
@@ -1307,7 +1320,26 @@ impl RasAssembler {
                         continue;
                     }
 
-                    if self.target_arch == TargetArchitecture::X86_64
+                    if self.target_arch == TargetArchitecture::I686
+                        && opcode == "movl"
+                        && let [src, dst] = inst.operands.as_slice()
+                        && let Some(text) = src.trim().strip_prefix('$')
+                        && let Some((label, addend)) = crate::encoder::x86_64::rip_expression(text)
+                        && let Some(reg) = crate::encoder::x86_64::gpr32_number(dst)
+                    {
+                        check_branch_target(label)?;
+                        code.push(0xb8 | reg);
+                        code.extend_from_slice(&[0u8; 4]);
+                        patch_points.push(PatchPoint::X86Abs32 {
+                            offset: current_offset + 1,
+                            target: label.to_string(),
+                            addend,
+                        });
+                        current_offset += 5;
+                        continue;
+                    }
+
+                    if is_x86(self.target_arch)
                         && is_jmp_call
                         && inst.operands.len() == 1
                         && !inst.operands[0].trim().starts_with('*')
@@ -1400,6 +1432,7 @@ impl RasAssembler {
         section: &str,
         global_symbols: &HashSet<&str>,
         macho: bool,
+        arch: TargetArchitecture,
     ) -> EncodeResult {
         let Layout {
             mut code,
@@ -1500,6 +1533,9 @@ impl RasAssembler {
                                 (TargetArchitecture::X86_64, 2) => 12,
                                 (TargetArchitecture::X86_64, 4) => 10,
                                 (TargetArchitecture::X86_64, 8) => 1,
+                                (TargetArchitecture::I686, 1) => R_386_8,
+                                (TargetArchitecture::I686, 2) => R_386_16,
+                                (TargetArchitecture::I686, 4) => R_386_32,
                                 (TargetArchitecture::Aarch64, 2) => 259,
                                 (TargetArchitecture::Aarch64, 4) => 258,
                                 (TargetArchitecture::Aarch64, 8) => 257,
@@ -1627,8 +1663,28 @@ impl RasAssembler {
                 }
                 continue;
             }
+            if let PatchPoint::X86Abs32 {
+                offset,
+                target,
+                addend,
+            } = patch
+            {
+                external_relocs.push(ExternalReloc {
+                    offset: *offset,
+                    symbol: target.clone(),
+                    section: String::new(),
+                    kind: R_386_32,
+                    addend: *addend,
+                    trailing: 0,
+                    branch: false,
+                    section_symbol: false,
+                });
+                continue;
+            }
             let target = match patch {
-                PatchPoint::Data { .. } | PatchPoint::PowerPc { .. } => unreachable!(),
+                PatchPoint::Data { .. }
+                | PatchPoint::PowerPc { .. }
+                | PatchPoint::X86Abs32 { .. } => unreachable!(),
                 PatchPoint::Riscv { target, .. }
                 | PatchPoint::RiscvPair { target, .. }
                 | PatchPoint::AArch64 { target, .. }
@@ -1783,6 +1839,7 @@ impl RasAssembler {
                     | PatchPoint::AArch64 { .. }
                     | PatchPoint::Riscv { .. }
                     | PatchPoint::RiscvPair { .. }
+                    | PatchPoint::X86Abs32 { .. }
                     | PatchPoint::X86Tls { .. } => unreachable!(),
                     PatchPoint::X86Rel32 { offset, .. } => {
                         let rel32 = (target_offset as i64) - (*offset as i64 + 4);
@@ -1827,10 +1884,11 @@ impl RasAssembler {
                             offset: *offset,
                             symbol: target.to_string(),
                             section: String::new(),
-                            kind: if positions.contains_key(target)
-                                && !global_symbols.contains(target)
+                            kind: if arch == TargetArchitecture::I686
+                                || (positions.contains_key(target)
+                                    && !global_symbols.contains(target))
                             {
-                                2
+                                R_X86_PC32
                             } else {
                                 4
                             },
@@ -2434,6 +2492,12 @@ fn x86_nop_padding(code: &mut Vec<u8>, mut padding: usize) {
         code.extend_from_slice(NOPS[size]);
         padding -= size;
     }
+}
+
+/// x86 in either operating mode: the branch, padding and relocation shapes
+/// below are the same for 32- and 64-bit code.
+fn is_x86(arch: TargetArchitecture) -> bool {
+    matches!(arch, TargetArchitecture::X86_64 | TargetArchitecture::I686)
 }
 
 fn x86_cond_jmp_byte(opcode: &str) -> Option<u8> {
