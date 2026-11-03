@@ -8,9 +8,20 @@ use crate::{
 mod evex_table;
 use evex_table::{BCST, EVEX_TABLE, KDST, MASK, MEMSRC, ROUND, SAE, STORE, ZERO};
 
+/// Which x86 operating mode the encoder emits for. Protected mode is the
+/// 32-bit i686 target: no REX prefixes, no RIP-relative addressing, 32-bit
+/// address and operand defaults, and eight general registers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Mode {
+    #[default]
+    Long,
+    Protected,
+}
+
 pub struct X86_64Encoder {
     position: usize,
     rip_fixup: Option<RipFixup>,
+    mode: Mode,
 }
 
 impl Default for X86_64Encoder {
@@ -24,7 +35,36 @@ impl X86_64Encoder {
         Self {
             position: 0,
             rip_fixup: None,
+            mode: Mode::Long,
         }
+    }
+
+    /// An encoder for 32-bit protected mode, the i686 target.
+    pub fn new_32() -> Self {
+        Self {
+            position: 0,
+            rip_fixup: None,
+            mode: Mode::Protected,
+        }
+    }
+
+    fn protected(&self) -> bool {
+        self.mode == Mode::Protected
+    }
+
+    /// The width a base or index register of a memory operand must have.
+    fn address_width(&self) -> u8 {
+        if self.protected() { 32 } else { 64 }
+    }
+
+    /// The width of a push, a pop and an indirect branch target.
+    fn stack_width(&self) -> u8 {
+        self.address_width()
+    }
+
+    fn encode_op(&self, mut op: Op<'_>) -> Result<Encoded, RasError> {
+        op.mode = self.mode;
+        encode_op(op)
     }
 
     fn encode_rex(&self, w: bool, r: u8, x: u8, b: u8) -> u8 {
@@ -114,13 +154,13 @@ impl X86_64Encoder {
                 _ => return Err(invalid()),
             };
             if base.trim_start_matches('%') == "rip" {
-                if index.is_some() || segment.is_some() {
+                if index.is_some() || segment.is_some() || self.protected() {
                     return Err(invalid());
                 }
                 mem.rip = true;
             } else if !base.is_empty() {
                 let reg = gpr(base)
-                    .filter(|g| g.width == 64 && !g.high)
+                    .filter(|g| g.width == self.address_width() && !g.high)
                     .ok_or_else(invalid)?;
                 mem.base = Some(reg.num);
             }
@@ -147,7 +187,7 @@ impl X86_64Encoder {
                     }
                     None => {
                         let reg = gpr(index)
-                            .filter(|g| g.width == 64 && !g.high && g.num != 4)
+                            .filter(|g| g.width == self.address_width() && !g.high && g.num != 4)
                             .ok_or_else(invalid)?;
                         mem.index = Some((reg.num, scale_bits));
                     }
@@ -262,6 +302,12 @@ impl X86_64Encoder {
         }
         let gpr =
             gpr(op).ok_or_else(|| RasError::EncodingError(format!("Unknown register: {}", op)))?;
+        if self.protected() && (gpr.num >= 8 || gpr.width == 64) {
+            return Err(RasError::EncodingError(format!(
+                "Register {} does not exist in 32-bit mode",
+                op.trim()
+            )));
+        }
         Ok((Rm::Reg(gpr.num), Some(gpr)))
     }
 
@@ -287,7 +333,7 @@ impl X86_64Encoder {
                 }
                 let (byte_rex, high) = byte_flags(&[gpr]);
                 let opcode = [if width == 8 { 0xc6 } else { 0xc7 }];
-                return encode_op(Op {
+                return self.encode_op(Op {
                     legacy,
                     wide: width == 64,
                     byte_rex,
@@ -335,7 +381,7 @@ impl X86_64Encoder {
             }
             (Rm::Reg(reg), rm) => ([if width == 8 { 0x88 } else { 0x89 }], reg, rm),
         };
-        encode_op(Op {
+        self.encode_op(Op {
             legacy,
             wide: width == 64,
             byte_rex,
@@ -431,7 +477,7 @@ impl X86_64Encoder {
                 (if is_test { 0xf7 } else { 0x81 }, imm_bytes(imm, width)?)
             };
             let (byte_rex, high) = byte_flags(&[dst_gpr]);
-            return encode_op(Op {
+            return self.encode_op(Op {
                 legacy: if width == 16 { &[0x66] } else { &[] },
                 wide: width == 64,
                 byte_rex,
@@ -459,7 +505,7 @@ impl X86_64Encoder {
                 ));
             }
         };
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
@@ -509,7 +555,7 @@ impl X86_64Encoder {
                 }
             }
         };
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
@@ -537,7 +583,7 @@ impl X86_64Encoder {
         let width = operand_width(width, &[gpr])?;
         check_alu_width(width)?;
         let (byte_rex, high) = byte_flags(&[gpr]);
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
@@ -578,7 +624,7 @@ impl X86_64Encoder {
                 width
             )));
         }
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             opcode: &[0x0f, 0x40 | cc],
@@ -604,7 +650,7 @@ impl X86_64Encoder {
                 "SSE op: destination must be an xmm register".into(),
             ));
         };
-        encode_op(Op {
+        self.encode_op(Op {
             legacy,
             opcode,
             reg,
@@ -637,7 +683,7 @@ impl X86_64Encoder {
                 ));
             }
         };
-        encode_op(Op {
+        self.encode_op(Op {
             legacy,
             opcode,
             reg,
@@ -691,7 +737,7 @@ impl X86_64Encoder {
                 ));
             }
         };
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg,
             rm,
@@ -725,7 +771,7 @@ impl X86_64Encoder {
         let (reg, reg_wide) = parse_vector(operands[2].trim()).ok_or_else(|| {
             RasError::EncodingError("VEX arithmetic: destination must be a vector register".into())
         })?;
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg,
             rm,
@@ -766,7 +812,7 @@ impl X86_64Encoder {
             Some(if wide { 64 } else { 32 }),
             &[rm_gpr, Some(reg), Some(count)],
         )?;
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[0xf7],
             reg: reg.num,
             rm,
@@ -813,7 +859,7 @@ impl X86_64Encoder {
                 (destination, mmx(source)?)
             };
             if wide && (mmx_register(other).is_some() || self.is_memory(other)) {
-                return encode_op(Op {
+                return self.encode_op(Op {
                     opcode: &[0x0f, if load { 0x6f } else { 0x7f }],
                     reg,
                     rm: mmx_rm(other)?,
@@ -826,7 +872,7 @@ impl X86_64Encoder {
             {
                 return Err(bad(format!("{}: operand widths do not match", name)));
             }
-            return encode_op(Op {
+            return self.encode_op(Op {
                 opcode: &[0x0f, if load { 0x6e } else { 0x7e }],
                 reg,
                 rm,
@@ -843,7 +889,7 @@ impl X86_64Encoder {
                     .ok_or_else(|| bad(format!("{} writes an xmm register", name)))?;
                 (reg, mmx_rm(source)?)
             };
-            return encode_op(Op {
+            return self.encode_op(Op {
                 legacy: prefix_bytes(prefix),
                 opcode: &[0x0f, opcode],
                 reg,
@@ -857,7 +903,7 @@ impl X86_64Encoder {
                 let reg = gpr(destination)
                     .filter(|reg| matches!(reg.width, 32 | 64) && !reg.high)
                     .ok_or_else(|| bad("pmovmskb writes a general register".into()))?;
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &[0x0f, 0xd7],
                     reg: reg.num,
                     rm: Rm::Reg(mmx(source)?),
@@ -866,7 +912,7 @@ impl X86_64Encoder {
             }
             "maskmovq" => {
                 let (source, destination) = two()?;
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &[0x0f, 0xf7],
                     reg: mmx(destination)?,
                     rm: Rm::Reg(mmx(source)?),
@@ -878,7 +924,7 @@ impl X86_64Encoder {
                 if !self.is_memory(destination) {
                     return Err(bad("movntq stores to memory".into()));
                 }
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &[0x0f, 0xe7],
                     reg: mmx(source)?,
                     rm: Rm::Mem(self.parse_mem(destination)?),
@@ -903,7 +949,7 @@ impl X86_64Encoder {
                         .ok_or_else(|| bad("pextrw writes a general register".into()))?;
                     (reg.num, Rm::Reg(mmx(other)?))
                 };
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &[0x0f, if insert { 0xc4 } else { 0xc5 }],
                     reg,
                     rm,
@@ -917,7 +963,7 @@ impl X86_64Encoder {
                     && let Some((group, digit)) = packed_shift_imm(name)
                     && mmx_packed(name).is_some()
                 {
-                    return encode_op(Op {
+                    return self.encode_op(Op {
                         opcode: &[0x0f, group],
                         reg: digit,
                         rm: Rm::Reg(mmx(destination)?),
@@ -932,7 +978,7 @@ impl X86_64Encoder {
                         _ => None,
                     })
                 {
-                    return encode_op(Op {
+                    return self.encode_op(Op {
                         opcode: &escape(entry.0, entry.1),
                         reg: mmx(destination)?,
                         rm: mmx_rm(source)?,
@@ -943,7 +989,7 @@ impl X86_64Encoder {
                 let (map, opcode) = mmx_packed(name)
                     .ok_or_else(|| bad(format!("Unsupported MMX operation: {}", name)))?;
                 let (source, destination) = two()?;
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &escape(map, opcode),
                     reg: mmx(destination)?,
                     rm: mmx_rm(source)?,
@@ -1006,7 +1052,7 @@ impl X86_64Encoder {
         }
         let rm = Rm::Mem(memory);
         if evex {
-            encode_op(Op {
+            self.encode_op(Op {
                 opcode: &[opcode],
                 reg: number,
                 rm,
@@ -1022,7 +1068,7 @@ impl X86_64Encoder {
                 ..Op::default()
             })
         } else {
-            encode_op(Op {
+            self.encode_op(Op {
                 opcode: &[opcode],
                 reg: number,
                 rm,
@@ -1080,7 +1126,7 @@ impl X86_64Encoder {
                     if zeroing {
                         return Err(bad("{z} requires a register destination".into()));
                     }
-                    return encode_op(Op {
+                    return self.encode_op(Op {
                         opcode: &[0x11],
                         reg: low(source)?,
                         rm: Rm::Mem(self.parse_mem(destination)?),
@@ -1094,7 +1140,7 @@ impl X86_64Encoder {
                         name
                     )));
                 }
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &[0x10],
                     reg: low(destination)?,
                     rm: Rm::Mem(self.parse_mem(source)?),
@@ -1104,7 +1150,7 @@ impl X86_64Encoder {
             }
             [source, first, destination] => {
                 let (destination, mask, zeroing) = split_mask(destination)?;
-                encode_op(Op {
+                self.encode_op(Op {
                     opcode: &[0x10],
                     reg: low(destination)?,
                     rm: Rm::Reg(low(source)?),
@@ -1143,7 +1189,7 @@ impl X86_64Encoder {
         }
         let reg = parse_xmm(destination.trim())
             .ok_or_else(|| bad(format!("{} writes an xmm register", name)))?;
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg,
             rm,
@@ -1175,7 +1221,7 @@ impl X86_64Encoder {
             return Err(bad(format!("{} requires {} operands", name, expected)));
         }
         let plain = |vvvv, len256, reg, rm, imm: &[u8]| {
-            encode_op(Op {
+            self.encode_op(Op {
                 opcode: &[opcode],
                 reg,
                 rm,
@@ -1235,7 +1281,7 @@ impl X86_64Encoder {
                     } else {
                         (register.num, Rm::Reg(k))
                     };
-                    encode_op(Op {
+                    self.encode_op(Op {
                         opcode: &[opcode + if load { 2 } else { 3 }],
                         reg,
                         rm,
@@ -1262,7 +1308,7 @@ impl X86_64Encoder {
                     },
                     (Some(source), None) => match gpr(destination) {
                         Some(register) => general(register, source, false),
-                        None if self.is_memory(destination) => encode_op(Op {
+                        None if self.is_memory(destination) => self.encode_op(Op {
                             opcode: &[opcode + 1],
                             reg: source,
                             rm: Rm::Mem(self.parse_mem(destination)?),
@@ -1319,7 +1365,7 @@ impl X86_64Encoder {
                     && element_len == length.saturating_sub(element_shift)
             })
             .ok_or_else(|| bad(format!("{}: operand sizes do not match", name)))?;
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg: number,
             rm: Rm::Mem(memory),
@@ -1362,7 +1408,7 @@ impl X86_64Encoder {
         if index_len != 2 - u8::from(!index_wide && element_wide) {
             return Err(bad(format!("{}: wrong index register width", name)));
         }
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg: digit,
             rm: Rm::Mem(memory),
@@ -1444,7 +1490,7 @@ impl X86_64Encoder {
                 )));
             }
             let (number, length) = vector(destination)?;
-            return encode_op(Op {
+            return self.encode_op(Op {
                 opcode: &[opcode],
                 reg: number,
                 rm: Rm::Reg(register.num),
@@ -1565,7 +1611,7 @@ impl X86_64Encoder {
                 entry.name
             )));
         }
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[store.unwrap_or(entry.opcode)],
             reg,
             rm,
@@ -1604,7 +1650,7 @@ impl X86_64Encoder {
                 ));
             }
         };
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg,
             rm,
@@ -1634,7 +1680,7 @@ impl X86_64Encoder {
         let (dst, dst_wide) = parse_vector(operands[2].trim()).ok_or_else(|| {
             RasError::EncodingError("VEX shift: destination must be a vector register".into())
         })?;
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[group],
             reg: digit,
             rm: Rm::Reg(rm),
@@ -1709,7 +1755,7 @@ impl X86_64Encoder {
                 })?,
             _ => (0, false),
         };
-        encode_op(Op {
+        self.encode_op(Op {
             opcode: &[opcode],
             reg,
             rm,
@@ -1747,7 +1793,7 @@ impl X86_64Encoder {
                 "shift: destination must be an xmm register".into(),
             ));
         }
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: &[0x66],
             opcode: &[0x0f, group],
             reg: digit,
@@ -1771,9 +1817,17 @@ impl X86_64Encoder {
             "fistpq" => Some((0xdf, 7)),
             "fldcw" => Some((0xd9, 5)),
             "fnstcw" => Some((0xd9, 7)),
+            "fsts" => Some((0xd9, 2)),
+            "fstps" => Some((0xd9, 3)),
+            "fildll" => Some((0xdf, 5)),
             "fadds" => Some((0xd8, 0)),
             "faddl" => Some((0xdc, 0)),
+            "fmuls" => Some((0xd8, 1)),
             "fmull" => Some((0xdc, 1)),
+            "fsubs" => Some((0xd8, 4)),
+            "fsubl" => Some((0xdc, 4)),
+            "fdivs" => Some((0xd8, 6)),
+            "fdivl" => Some((0xdc, 6)),
             _ => None,
         };
         if let Some((byte, digit)) = memory {
@@ -1782,7 +1836,7 @@ impl X86_64Encoder {
                     "x87 memory operation requires 1 operand".into(),
                 ));
             };
-            return encode_op(Op {
+            return self.encode_op(Op {
                 opcode: &[byte],
                 reg: digit,
                 rm: Rm::Mem(self.parse_mem(operand)?),
@@ -1873,7 +1927,7 @@ impl X86_64Encoder {
             }
             _ => dst_gpr.width == 64,
         };
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: &[legacy],
             wide,
             opcode: &[0x0f, opcode],
@@ -1904,7 +1958,7 @@ impl X86_64Encoder {
                 "movslq: destination must be 64-bit".into(),
             ));
         }
-        encode_op(Op {
+        self.encode_op(Op {
             wide: true,
             opcode: &[0x63],
             reg,
@@ -1935,7 +1989,7 @@ impl X86_64Encoder {
                 "lea: unsupported operand width".into(),
             ));
         }
-        encode_op(Op {
+        self.encode_op(Op {
             wide: width == 64,
             opcode: &[0x8d],
             reg,
@@ -1975,7 +2029,7 @@ impl X86_64Encoder {
             bytes.push(0x0f);
         }
         bytes.push(if width == 8 { byte_op } else { wide_op });
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
@@ -2032,7 +2086,7 @@ impl X86_64Encoder {
             ));
         }
         let (byte_rex, high) = byte_flags(&[src_gpr]);
-        encode_op(Op {
+        self.encode_op(Op {
             legacy: if width == 16 { &[0x66] } else { &[] },
             wide: width == 64,
             byte_rex,
@@ -2060,6 +2114,12 @@ impl InstructionEncoder for X86_64Encoder {
 
     fn encode_instruction(&mut self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
         self.rip_fixup = None;
+        if self.protected() && !protected_mode_supported(&inst.opcode.to_lowercase()) {
+            return Err(RasError::EncodingError(format!(
+                "{} is not implemented by the 32-bit (i686) encoder",
+                inst.opcode
+            )));
+        }
         if let Some(suffix) = inst
             .operands
             .iter()
@@ -2099,7 +2159,7 @@ impl InstructionEncoder for X86_64Encoder {
             let (rm, gpr) = self.parse_rm(operand, false)?;
             operand_width(Some(8), &[gpr])?;
             let (byte_rex, high) = byte_flags(&[gpr]);
-            let enc = encode_op(Op {
+            let enc = self.encode_op(Op {
                 byte_rex,
                 high,
                 opcode: &[0x0f, 0x90 | cc],
@@ -2216,7 +2276,7 @@ impl InstructionEncoder for X86_64Encoder {
                     };
                     if let Some((reg, xmm, op)) = transfer {
                         operand_width(Some(64), &[Some(reg)])?;
-                        code = self.emit(encode_op(Op {
+                        code = self.emit(self.encode_op(Op {
                             legacy: &[0x66],
                             wide: true,
                             opcode: &[0x0f, op],
@@ -2231,7 +2291,7 @@ impl InstructionEncoder for X86_64Encoder {
                             &inst.operands,
                         )?);
                     } else if let Some(reg) = a_xmm {
-                        code = self.emit(encode_op(Op {
+                        code = self.emit(self.encode_op(Op {
                             legacy: &[0x66],
                             opcode: &[0x0f, 0xd6],
                             reg,
@@ -2257,13 +2317,14 @@ impl InstructionEncoder for X86_64Encoder {
                     RasError::EncodingError(format!("{}: expected indirect operand", opcode))
                 })?;
                 let (rm, gpr) = self.parse_rm(target, false)?;
-                if gpr.is_some_and(|gpr| gpr.width != 64) {
+                let width = self.stack_width();
+                if gpr.is_some_and(|gpr| gpr.width != width) {
                     return Err(RasError::EncodingError(format!(
-                        "{opcode}: indirect target must be a 64-bit register"
+                        "{opcode}: indirect target must be a {width}-bit register"
                     )));
                 }
                 let digit = if opcode == "call" { 2 } else { 4 };
-                let enc = encode_op(Op {
+                let enc = self.encode_op(Op {
                     opcode: &[0xff],
                     reg: digit,
                     rm,
@@ -2271,19 +2332,26 @@ impl InstructionEncoder for X86_64Encoder {
                 })?;
                 code = self.emit(enc);
             }
-            "flds" | "fldl" | "fldt" | "fstl" | "fstpl" | "fstpt" | "fildl" | "fildq"
-            | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl" | "fmull" | "fld"
-            | "fxch" | "fstp" | "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "fcomi"
-            | "fcomip" | "fucomip" => {
+            "flds" | "fldl" | "fldt" | "fsts" | "fstl" | "fstps" | "fstpl" | "fstpt" | "fildl"
+            | "fildq" | "fildll" | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl"
+            | "fmuls" | "fmull" | "fsubs" | "fsubl" | "fdivs" | "fdivl" | "fld" | "fxch"
+            | "fstp" | "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "fcomi" | "fcomip"
+            | "fucomip" => {
                 code = self.emit(self.encode_x87(&opcode, &inst.operands)?);
             }
-            "fldz" | "fchs" => {
+            "fldz" | "fchs" | "fabs" | "fsqrt" => {
                 if !inst.operands.is_empty() {
                     return Err(RasError::EncodingError(
                         "x87 constant/sign operation takes no operands".into(),
                     ));
                 }
-                code.extend_from_slice(&[0xd9, if opcode == "fldz" { 0xee } else { 0xe0 }]);
+                let second = match opcode.as_str() {
+                    "fldz" => 0xee,
+                    "fchs" => 0xe0,
+                    "fabs" => 0xe1,
+                    _ => 0xfa,
+                };
+                code.extend_from_slice(&[0xd9, second]);
             }
             "fld1" => code.extend_from_slice(&[0xd9, 0xe8]),
             "bswap" | "bswapl" | "bswapq" => {
@@ -2292,6 +2360,7 @@ impl InstructionEncoder for X86_64Encoder {
                 };
                 let reg = gpr(operand)
                     .filter(|g| matches!(g.width, 32 | 64))
+                    .filter(|g| !self.protected() || (g.width == 32 && g.num < 8))
                     .ok_or_else(|| {
                         RasError::EncodingError("bswap requires 32/64-bit register".into())
                     })?;
@@ -2347,7 +2416,7 @@ impl InstructionEncoder for X86_64Encoder {
                         };
                         (op, reg.num)
                     };
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     wide: width == 64,
                     opcode: &[0x0f, op],
                     reg,
@@ -2382,7 +2451,7 @@ impl InstructionEncoder for X86_64Encoder {
                     RasError::EncodingError("bit count requires register destination".into())
                 })?;
                 operand_width(Some(width), &[rm_gpr, Some(reg)])?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: if width == 16 { &[0x66, 0xf3] } else { &[0xf3] },
                     wide: width == 64,
                     opcode: &[0x0f, count_opcode],
@@ -2415,6 +2484,13 @@ impl InstructionEncoder for X86_64Encoder {
                     ));
                 }
             },
+            "int" => {
+                let [operand] = inst.operands.as_slice() else {
+                    return Err(RasError::EncodingError("int requires 1 operand".into()));
+                };
+                code.push(0xcd);
+                code.push(immediate_byte(operand)?);
+            }
             "endbr64" => code.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]),
             "leave" => code.push(0xC9),
             "cvttsd2si" | "cvttsd2sil" | "cvttsd2siq" | "cvttss2si" | "cvttss2sil"
@@ -2448,7 +2524,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = parse_xmm(dst).ok_or_else(|| {
                     RasError::EncodingError("cvtsi2sd requires xmm destination".into())
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: &[if opcode.starts_with("cvtsi2ss") {
                         0xf3
                     } else {
@@ -2494,7 +2570,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = parse_xmm(dst).ok_or_else(|| {
                     RasError::EncodingError(format!("{} requires an xmm destination", name))
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: prefix_bytes(prefix),
                     opcode: &escape(map, op),
                     reg,
@@ -2521,7 +2597,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = parse_xmm(dst).ok_or_else(|| {
                     RasError::EncodingError(format!("{} requires an xmm destination", name))
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: &[0x66],
                     opcode: &escape(2, op),
                     reg,
@@ -2547,7 +2623,7 @@ impl InstructionEncoder for X86_64Encoder {
                     )));
                 }
                 let (rm, _) = self.parse_rm(dst, true)?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: prefix_bytes(prefix),
                     opcode: &escape(1, op),
                     reg,
@@ -2569,7 +2645,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = gpr(dst.trim()).filter(|g| g.width == 32).ok_or_else(|| {
                     RasError::EncodingError(format!("{} requires a 32-bit destination", name))
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: prefix_bytes(prefix),
                     opcode: &escape(1, op),
                     reg: reg.num,
@@ -2594,7 +2670,7 @@ impl InstructionEncoder for X86_64Encoder {
                 if gpr.is_some() {
                     operand_width(Some(width), &[gpr])?;
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: &[0x66],
                     wide,
                     opcode: &[0x0f, 0x3a, op],
@@ -2665,7 +2741,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = parse_xmm(dst).ok_or_else(|| {
                     RasError::EncodingError("shuffle requires xmm destination".into())
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: match opcode.as_str() {
                         "pshuflw" => &[0xf2],
                         "pshufhw" => &[0xf3],
@@ -2774,7 +2850,7 @@ impl InstructionEncoder for X86_64Encoder {
                 } else {
                     &[0x0f, 0xc4]
                 };
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: &[0x66],
                     opcode: escaped,
                     reg,
@@ -2834,7 +2910,7 @@ impl InstructionEncoder for X86_64Encoder {
                         opcode
                     )));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[0x0f, 0xae],
                     reg: if opcode == "ldmxcsr" { 2 } else { 3 },
                     rm: self.parse_rm(target, true)?.0,
@@ -2860,7 +2936,7 @@ impl InstructionEncoder for X86_64Encoder {
                         opcode
                     )));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[0x0f, 0x18],
                     reg: digit,
                     rm: self.parse_rm(target, true)?.0,
@@ -2882,7 +2958,7 @@ impl InstructionEncoder for X86_64Encoder {
                         "movnti requires a memory destination".into(),
                     ));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     wide,
                     opcode: &[0x0f, 0xc3],
                     reg: reg.num,
@@ -2912,7 +2988,7 @@ impl InstructionEncoder for X86_64Encoder {
                 operand_width(Some(source), &[source_gpr])?;
                 let (byte_rex, high) = byte_flags(&[source_gpr]);
                 let legacy: &[u8] = if source == 16 { &[0x66, 0xf2] } else { &[0xf2] };
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy,
                     wide,
                     byte_rex,
@@ -2959,28 +3035,37 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_movsxd(&inst.operands)?;
                 code = self.emit(enc);
             }
-            "pushq" | "push" | "popq" | "pop" => {
+            "pushq" | "pushl" | "push" | "popq" | "popl" | "pop" => {
                 let [operand] = inst.operands.as_slice() else {
                     return Err(RasError::EncodingError(
                         "push/pop requires 1 operand".into(),
                     ));
+                };
+                let width = match (opcode.as_bytes().last(), self.protected()) {
+                    (Some(b'q'), false) => 64,
+                    (Some(b'q'), true) | (Some(b'l'), false) => {
+                        return Err(RasError::EncodingError(format!(
+                            "{opcode} is not available in this mode"
+                        )));
+                    }
+                    _ => self.stack_width(),
                 };
                 let push = opcode.starts_with("push");
                 if let Some(imm) = operand.strip_prefix('$').filter(|_| push) {
                     let imm = parse_imm(imm)?;
                     let small = i8::try_from(imm).is_ok();
                     code.push(if small { 0x6a } else { 0x68 });
-                    code.extend(imm_bytes(imm, if small { 8 } else { 64 })?);
+                    code.extend(imm_bytes(imm, if small { 8 } else { width })?);
                 } else {
                     let (rm, reg) = self.parse_rm(operand, false)?;
-                    operand_width(Some(64), &[reg])?;
+                    operand_width(Some(width), &[reg])?;
                     if let Rm::Reg(reg) = rm {
                         if reg >= 8 {
                             code.push(0x41);
                         }
                         code.push((if push { 0x50 } else { 0x58 }) | (reg & 7));
                     } else {
-                        code = self.emit(encode_op(Op {
+                        code = self.emit(self.encode_op(Op {
                             opcode: &[if push { 0xff } else { 0x8f }],
                             reg: if push { 6 } else { 0 },
                             rm,
@@ -3021,7 +3106,7 @@ impl InstructionEncoder for X86_64Encoder {
                     }
                     let small = (-128..=127).contains(&imm);
                     let immediate = imm_bytes(imm, if small { 8 } else { width })?;
-                    code = self.emit(encode_op(Op {
+                    code = self.emit(self.encode_op(Op {
                         wide: width == 64,
                         opcode: &[if small { 0x6b } else { 0x69 }],
                         reg: dst.num,
@@ -3053,7 +3138,7 @@ impl InstructionEncoder for X86_64Encoder {
                         width
                     )));
                 }
-                let enc = encode_op(Op {
+                let enc = self.encode_op(Op {
                     wide: width == 64,
                     opcode: &[0x0f, 0xaf],
                     reg,
@@ -3284,7 +3369,7 @@ impl InstructionEncoder for X86_64Encoder {
                 } else {
                     (reg, rm)
                 };
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[op],
                     reg,
                     rm,
@@ -3317,7 +3402,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = gpr(dst.trim()).filter(|g| g.width == 32).ok_or_else(|| {
                     RasError::EncodingError(format!("{} requires a 32-bit destination", opcode))
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[op],
                     reg: reg.num,
                     rm: Rm::Reg(rm),
@@ -3366,7 +3451,7 @@ impl InstructionEncoder for X86_64Encoder {
                         ));
                     }
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[op],
                     reg,
                     rm,
@@ -3424,7 +3509,7 @@ impl InstructionEncoder for X86_64Encoder {
                             })?;
                             (load + 1, reg, self.parse_rm(dst, true)?.0)
                         };
-                        code = self.emit(encode_op(Op {
+                        code = self.emit(self.encode_op(Op {
                             opcode: &[opcode_byte],
                             reg,
                             rm,
@@ -3453,7 +3538,7 @@ impl InstructionEncoder for X86_64Encoder {
                             }
                             _ => (load, destination, self.parse_rm(src, true)?.0),
                         };
-                        code = self.emit(encode_op(Op {
+                        code = self.emit(self.encode_op(Op {
                             opcode: &[op],
                             reg,
                             rm,
@@ -3488,7 +3573,7 @@ impl InstructionEncoder for X86_64Encoder {
                 let reg = parse_xmm(dst).ok_or_else(|| {
                     RasError::EncodingError("vcvtsi2 requires an xmm destination".into())
                 })?;
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[0x2a],
                     reg,
                     rm,
@@ -3528,7 +3613,7 @@ impl InstructionEncoder for X86_64Encoder {
                         "vcvt: destination width does not match suffix".into(),
                     ));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[if truncate { 0x2c } else { 0x2d }],
                     reg: reg.num,
                     rm: self.parse_rm(src, true)?.0,
@@ -3567,7 +3652,7 @@ impl InstructionEncoder for X86_64Encoder {
                         name
                     )));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[load + u8::from(store) * 2],
                     reg,
                     rm: self.parse_rm(memory, true)?.0,
@@ -3612,7 +3697,7 @@ impl InstructionEncoder for X86_64Encoder {
                         opcode
                     )));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     opcode: &[op],
                     reg,
                     rm: self.parse_rm(dst, true)?.0,
@@ -3709,7 +3794,7 @@ impl InstructionEncoder for X86_64Encoder {
                         "movd requires 32/64-bit GPR".into(),
                     ));
                 }
-                code = self.emit(encode_op(Op {
+                code = self.emit(self.encode_op(Op {
                     legacy: &[0x66],
                     wide: width == 64,
                     opcode: &[0x0f, op],
@@ -3835,6 +3920,7 @@ struct Op<'a> {
     imm: &'a [u8],
     vex: Option<Vex>,
     evex: Option<Evex>,
+    mode: Mode,
 }
 
 /// The parts of a VEX prefix that vary between instructions.
@@ -4397,6 +4483,11 @@ impl Evex {
 }
 
 fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
+    if op.mode == Mode::Protected && (op.vex.is_some() || op.evex.is_some()) {
+        return Err(RasError::EncodingError(
+            "VEX and EVEX encodings are not implemented in 32-bit mode".into(),
+        ));
+    }
     let mut tail = Vec::new();
     let mut rex_x = 0;
     let mut rex_b = 0;
@@ -4499,14 +4590,23 @@ fn encode_op(op: Op<'_>) -> Result<Encoded, RasError> {
     } else {
         let rex = 0x40 | (u8::from(op.wide) << 3) | ((op.reg >> 3) << 2) | (rex_x << 1) | rex_b;
         let needs_rex = rex != 0x40 || op.byte_rex;
-        if op.high && needs_rex {
-            return Err(RasError::EncodingError(
-                "High byte registers cannot use REX".into(),
-            ));
-        }
-        bytes.extend_from_slice(op.legacy);
-        if needs_rex {
-            bytes.push(rex);
+        if op.mode == Mode::Protected {
+            if needs_rex {
+                return Err(RasError::EncodingError(
+                    "32-bit mode has no REX prefix: 64-bit operands and the registers above %edi are unavailable".into(),
+                ));
+            }
+            bytes.extend_from_slice(op.legacy);
+        } else {
+            if op.high && needs_rex {
+                return Err(RasError::EncodingError(
+                    "High byte registers cannot use REX".into(),
+                ));
+            }
+            bytes.extend_from_slice(op.legacy);
+            if needs_rex {
+                bytes.push(rex);
+            }
         }
     }
     bytes.extend_from_slice(op.opcode);
@@ -5049,6 +5149,40 @@ fn lane_transfer(name: &str) -> Option<(u8, bool, u8)> {
     Some(entry)
 }
 
+/// The mnemonics the encoder emits correct 32-bit code for. Protected mode
+/// shares every encoding path with long mode, so a mnemonic outside this set
+/// could otherwise reach a 32-bit object with a long-mode encoding; it refuses
+/// by name instead.
+fn protected_mode_supported(opcode: &str) -> bool {
+    const PLAIN: &[&str] = &[
+        "bswap", "bswapl", "call", "cdq", "cltd", "cwtl", "endbr32", "int", "jmp", "lea", "leal",
+        "leave", "mov", "movb", "movl", "movw", "movsbl", "movsbw", "movswl", "movzbl", "movzwl",
+        "movsx", "movzx", "nop", "pop", "popl", "push", "pushl", "ret", "ud2", "imul", "imull",
+        "btl", "btsl", "btrl", "btcl", "bsfl", "bsrl", "xchgb", "xchgw", "xchgl", "xaddb", "xaddw",
+        "xaddl", "cmpxchgb", "cmpxchgw", "cmpxchgl", "lock",
+    ];
+    const X87: &[&str] = &[
+        "fabs", "fadds", "faddl", "fchs", "fcomi", "fcomip", "fdivs", "fdivl", "fdivp", "fild",
+        "fildl", "fildll", "fistpl", "fistpq", "fld", "fld1", "fldcw", "fldl", "flds", "fldt",
+        "fldz", "fmul", "fmuls", "fmull", "fmulp", "fnstcw", "fsqrt", "fst", "fstl", "fsts",
+        "fstp", "fstpl", "fstps", "fstpt", "fsub", "fsubs", "fsubl", "fsubrp", "fucomip", "fxch",
+    ];
+    if PLAIN.contains(&opcode) || X87.contains(&opcode) {
+        return true;
+    }
+    if let Some(cc) = opcode.strip_prefix("set") {
+        return condition_code(cc).is_some();
+    }
+    if let Some(cc) = opcode.strip_prefix('j') {
+        return condition_code(cc).is_some();
+    }
+    let narrow = |width: Option<u8>| width != Some(64);
+    alu_mnemonic(opcode).is_some_and(|(_, width)| narrow(width))
+        || shift_mnemonic(opcode).is_some_and(|(_, width)| narrow(width))
+        || unary_mnemonic(opcode).is_some_and(|(_, width)| narrow(width))
+        || cmov_mnemonic(opcode).is_some_and(|(_, width)| narrow(width))
+}
+
 fn disp32(value: i64) -> Result<[u8; 4], RasError> {
     i32::try_from(value)
         .map(i32::to_le_bytes)
@@ -5107,6 +5241,13 @@ pub(crate) fn rip_expression(text: &str) -> Option<(&str, i64)> {
         }
     }
     None
+}
+
+/// A 32-bit general register that exists in 32-bit mode, by its number.
+pub(crate) fn gpr32_number(name: &str) -> Option<u8> {
+    gpr(name)
+        .filter(|reg| reg.width == 32 && reg.num < 8 && !reg.high)
+        .map(|reg| reg.num)
 }
 
 fn is_got_symbol(text: &str) -> bool {
