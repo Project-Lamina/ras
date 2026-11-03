@@ -1467,10 +1467,21 @@ const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 const IMAGE_SYM_CLASS_STATIC: u8 = 3;
 const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 
+const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
+
 const IMAGE_REL_AMD64_ADDR64: u16 = 1;
 const IMAGE_REL_AMD64_ADDR32: u16 = 2;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
 const IMAGE_REL_AMD64_SECREL: u16 = 0x000E;
+
+const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
+const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
+const IMAGE_REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
+const IMAGE_REL_ARM64_PAGEOFFSET_12A: u16 = 0x0006;
+const IMAGE_REL_ARM64_PAGEOFFSET_12L: u16 = 0x0007;
+const IMAGE_REL_ARM64_ADDR64: u16 = 0x000E;
+const IMAGE_REL_ARM64_BRANCH19: u16 = 0x000F;
+const IMAGE_REL_ARM64_BRANCH14: u16 = 0x0010;
 
 const COFF_SECTION_HEADER_SIZE: usize = 40;
 const COFF_SYMBOL_SIZE: usize = 18;
@@ -1518,6 +1529,65 @@ fn coff_reloc_type(kind: u32, symbol: &str) -> Result<(u16, usize), RasError> {
         ))),
         _ => Ok((IMAGE_REL_AMD64_REL32, 4)),
     }
+}
+
+/// Where a COFF relocation's addend lives: in a data field of this many bytes,
+/// or inside the instruction word, which the writer must not rewrite.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoffAddend {
+    Field(usize),
+    Instruction,
+}
+
+fn aarch64_reloc_name(kind: u32) -> &'static str {
+    match kind {
+        257 => "R_AARCH64_ABS64",
+        258 => "R_AARCH64_ABS32",
+        259 => "R_AARCH64_ABS16",
+        260 => "R_AARCH64_PREL64",
+        261 => "R_AARCH64_PREL32",
+        275 => "R_AARCH64_ADR_PREL_PG_HI21",
+        277 => "R_AARCH64_ADD_ABS_LO12_NC",
+        279 => "R_AARCH64_TSTBR14",
+        280 => "R_AARCH64_CONDBR19",
+        282 => "R_AARCH64_JUMP26",
+        283 => "R_AARCH64_CALL26",
+        286 => "R_AARCH64_LDST64_ABS_LO12_NC",
+        311 => "R_AARCH64_ADR_GOT_PAGE",
+        312 => "R_AARCH64_LD64_GOT_LO12_NC",
+        313 | 314 => "Mach-O TLVP",
+        _ => "unknown AArch64 relocation",
+    }
+}
+
+fn coff_arm64_reloc_type(
+    kind: u32,
+    symbol: &str,
+    addend: i64,
+) -> Result<(u16, CoffAddend), RasError> {
+    let (ty, addend_place) = match kind {
+        257 => (IMAGE_REL_ARM64_ADDR64, CoffAddend::Field(8)),
+        258 => (IMAGE_REL_ARM64_ADDR32, CoffAddend::Field(4)),
+        275 => (IMAGE_REL_ARM64_PAGEBASE_REL21, CoffAddend::Instruction),
+        277 => (IMAGE_REL_ARM64_PAGEOFFSET_12A, CoffAddend::Instruction),
+        286 => (IMAGE_REL_ARM64_PAGEOFFSET_12L, CoffAddend::Instruction),
+        279 => (IMAGE_REL_ARM64_BRANCH14, CoffAddend::Instruction),
+        280 => (IMAGE_REL_ARM64_BRANCH19, CoffAddend::Instruction),
+        282 | 283 => (IMAGE_REL_ARM64_BRANCH26, CoffAddend::Instruction),
+        _ => {
+            return Err(RasError::ObjectError(format!(
+                "{} against {symbol} has no ARM64 COFF relocation",
+                aarch64_reloc_name(kind)
+            )));
+        }
+    };
+    if addend_place == CoffAddend::Instruction && addend != 0 {
+        return Err(RasError::ObjectError(format!(
+            "{} against {symbol} carries addend {addend}; the ARM64 COFF writer only encodes a zero addend in an instruction field",
+            aarch64_reloc_name(kind)
+        )));
+    }
+    Ok((ty, addend_place))
 }
 
 fn coff_symbol_entry(
@@ -1583,13 +1653,17 @@ impl CoffWriter {
 impl ObjectWriter for CoffWriter {
     fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
         let relocations = req.relocations;
-        if req.target_arch != TargetArchitecture::X86_64 {
-            return Err(RasError::ObjectError(format!(
-                "COFF writer: unsupported architecture {:?}",
-                req.target_arch
-            )));
-        }
-        if let Some(r) = relocations.iter().find(|r| matches!(r.kind, 18 | 22 | 23)) {
+        let machine = match req.target_arch {
+            TargetArchitecture::X86_64 => IMAGE_FILE_MACHINE_AMD64,
+            TargetArchitecture::Aarch64 => IMAGE_FILE_MACHINE_ARM64,
+            other => {
+                return Err(RasError::ObjectError(format!(
+                    "COFF writer: unsupported architecture {other:?}"
+                )));
+            }
+        };
+        let x86 = machine == IMAGE_FILE_MACHINE_AMD64;
+        if x86 && let Some(r) = relocations.iter().find(|r| matches!(r.kind, 18 | 22 | 23)) {
             return Err(RasError::ObjectError(format!(
                 "x86_64 TLS relocation kind {} for {} is only supported in ELF objects",
                 r.kind, r.symbol
@@ -1601,7 +1675,10 @@ impl ObjectWriter for CoffWriter {
                 s.name
             )));
         }
-        for r in relocations.iter().filter(|r| r.kind == X86_64_SECREL32) {
+        for r in relocations
+            .iter()
+            .filter(|r| x86 && r.kind == X86_64_SECREL32)
+        {
             if let Some(sym) = req.symbols.iter().find(|s| s.name == r.symbol)
                 && !sym.section.is_empty()
                 && !sym.section.starts_with(".tls")
@@ -1774,7 +1851,12 @@ impl ObjectWriter for CoffWriter {
         for r in relocations {
             let si = section_index[r.section.as_str()];
             let section = &sections[si];
-            let (ty, width) = coff_reloc_type(r.kind, &r.symbol)?;
+            let (ty, addend_place) = if x86 {
+                let (ty, width) = coff_reloc_type(r.kind, &r.symbol)?;
+                (ty, CoffAddend::Field(width))
+            } else {
+                coff_arm64_reloc_type(r.kind, &r.symbol, r.addend)?
+            };
             let target = if r.section_symbol {
                 *section_symbol.get(r.symbol.as_str()).ok_or_else(|| {
                     RasError::ObjectError(format!("Unknown relocation section: {}", r.symbol))
@@ -1788,6 +1870,10 @@ impl ObjectWriter for CoffWriter {
                     section.name
                 )));
             }
+            let width = match addend_place {
+                CoffAddend::Field(width) => width,
+                CoffAddend::Instruction => 4,
+            };
             let bytes = data[si]
                 .get_mut(r.offset..r.offset + width)
                 .ok_or_else(|| {
@@ -1796,14 +1882,20 @@ impl ObjectWriter for CoffWriter {
                         r.offset, section.name
                     ))
                 })?;
-            let implicit = if width == 4 {
-                i32::from_le_bytes(bytes.try_into().unwrap()) as i64
-            } else {
-                i64::from_le_bytes(bytes.try_into().unwrap())
-            };
-            let adjust = if ty == IMAGE_REL_AMD64_REL32 { 4 } else { 0 };
-            let value = implicit + r.addend + adjust;
-            bytes.copy_from_slice(&value.to_le_bytes()[..width]);
+            if let CoffAddend::Field(width) = addend_place {
+                let implicit = if width == 4 {
+                    i32::from_le_bytes(bytes.try_into().unwrap()) as i64
+                } else {
+                    i64::from_le_bytes(bytes.try_into().unwrap())
+                };
+                let adjust = if x86 && ty == IMAGE_REL_AMD64_REL32 {
+                    4
+                } else {
+                    0
+                };
+                let value = implicit + r.addend + adjust;
+                bytes.copy_from_slice(&value.to_le_bytes()[..width]);
+            }
             reloc_bytes[si].extend_from_slice(&(r.offset as u32).to_le_bytes());
             reloc_bytes[si].extend_from_slice(&target.to_le_bytes());
             reloc_bytes[si].extend_from_slice(&ty.to_le_bytes());
@@ -1832,7 +1924,7 @@ impl ObjectWriter for CoffWriter {
         let sym_ptr = cursor as u32;
 
         let mut out: Vec<u8> = Vec::with_capacity(cursor + sym_bytes.len() + strtab.len());
-        out.extend_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        out.extend_from_slice(&machine.to_le_bytes());
         out.extend_from_slice(&(sections.len() as u16).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&sym_ptr.to_le_bytes());
