@@ -506,8 +506,8 @@ fn got_and_lo12_relocations_use_their_own_kinds() {
 #[test]
 fn unsupported_relocation_modifiers_are_rejected() {
     for asm in [
-        ".text\nadrp x0, :gottprel:sym\n",
         ".text\nadrp x0, :tlsdesc:sym\n",
+        ".text\nadrp x0, :tlsgd:sym\n",
         ".text\nldr w0, [x1, :lo12:sym]\n",
         ".text\nldr x0, [x0, :tprel_lo12_nc:sym]\n",
         ".text\nmovz x0, :abs_g0:sym\n",
