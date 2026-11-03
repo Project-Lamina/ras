@@ -1629,7 +1629,7 @@ const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
 const IMAGE_REL_AMD64_ADDR64: u16 = 1;
 const IMAGE_REL_AMD64_ADDR32: u16 = 2;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
-const IMAGE_REL_AMD64_SECREL: u16 = 0x000E;
+const IMAGE_REL_AMD64_SECREL: u16 = 0x000B;
 
 const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
 const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
@@ -3240,7 +3240,7 @@ mod tests {
     }
 
     #[test]
-    fn coff_secrel32_relocates_against_tls_symbol_with_type_0e() {
+    fn coff_secrel32_relocates_against_tls_symbol_with_type_0b() {
         let text = vec![0x8b, 0x80, 0, 0, 0, 0, 0xc3];
         let sections = [
             coff_section(".text", true, false, text),
@@ -3259,7 +3259,7 @@ mod tests {
         let (offset, symbol, ty) = text.relocs[0];
         assert_eq!(offset, 2);
         assert_eq!(ty, IMAGE_REL_AMD64_SECREL);
-        assert_eq!(ty, 0x000e);
+        assert_eq!(ty, 0x000b);
         let target = obj
             .symbols
             .iter()
