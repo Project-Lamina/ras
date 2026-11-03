@@ -9,19 +9,57 @@ use crate::{
     parser::{DebugFile, Section, SectionFlags},
 };
 use lamina_platform::TargetArchitecture;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-const DW_TAG_COMPILE_UNIT: u8 = 0x11;
-const DW_AT_NAME: u8 = 0x03;
-const DW_AT_STMT_LIST: u8 = 0x10;
-const DW_AT_LOW_PC: u8 = 0x11;
-const DW_AT_HIGH_PC: u8 = 0x12;
-const DW_AT_RANGES: u8 = 0x55;
-const DW_AT_COMP_DIR: u8 = 0x1b;
-const DW_FORM_ADDR: u8 = 0x01;
-const DW_FORM_DATA8: u8 = 0x07;
-const DW_FORM_STRING: u8 = 0x08;
-const DW_FORM_SEC_OFFSET: u8 = 0x17;
+const DW_TAG_COMPILE_UNIT: u64 = 0x11;
+const DW_TAG_FORMAL_PARAMETER: u64 = 0x05;
+const DW_TAG_POINTER_TYPE: u64 = 0x0f;
+const DW_TAG_BASE_TYPE: u64 = 0x24;
+const DW_TAG_SUBPROGRAM: u64 = 0x2e;
+const DW_TAG_UNSPECIFIED_PARAMETERS: u64 = 0x18;
+
+const DW_AT_NAME: u64 = 0x03;
+const DW_AT_BYTE_SIZE: u64 = 0x0b;
+const DW_AT_STMT_LIST: u64 = 0x10;
+const DW_AT_LOW_PC: u64 = 0x11;
+const DW_AT_HIGH_PC: u64 = 0x12;
+const DW_AT_LANGUAGE: u64 = 0x13;
+const DW_AT_COMP_DIR: u64 = 0x1b;
+const DW_AT_PRODUCER: u64 = 0x25;
+const DW_AT_PROTOTYPED: u64 = 0x27;
+const DW_AT_DECL_FILE: u64 = 0x3a;
+const DW_AT_DECL_LINE: u64 = 0x3b;
+const DW_AT_ENCODING: u64 = 0x3e;
+const DW_AT_EXTERNAL: u64 = 0x3f;
+const DW_AT_FRAME_BASE: u64 = 0x40;
+const DW_AT_TYPE: u64 = 0x49;
+const DW_AT_RANGES: u64 = 0x55;
+
+const DW_FORM_ADDR: u64 = 0x01;
+const DW_FORM_DATA2: u64 = 0x05;
+const DW_FORM_DATA8: u64 = 0x07;
+const DW_FORM_STRING: u64 = 0x08;
+const DW_FORM_DATA1: u64 = 0x0b;
+const DW_FORM_UDATA: u64 = 0x0f;
+const DW_FORM_REF4: u64 = 0x13;
+const DW_FORM_SEC_OFFSET: u64 = 0x17;
+const DW_FORM_EXPRLOC: u64 = 0x18;
+const DW_FORM_FLAG_PRESENT: u64 = 0x19;
+
+const DW_ATE_BOOLEAN: u64 = 0x02;
+const DW_ATE_FLOAT: u64 = 0x04;
+const DW_ATE_SIGNED: u64 = 0x05;
+const DW_ATE_UNSIGNED: u64 = 0x07;
+
+const DW_OP_CALL_FRAME_CFA: u8 = 0x9c;
+
+/// Every ELF target this writer serves addresses with 64 bits.
+const ADDRESS_SIZE: u8 = 8;
+
+/// Lamina's scalars follow C's conventions for width, signedness and float format,
+/// which is what a debugger reads this field for. Nothing here claims C semantics
+/// beyond that.
+const DW_LANG_C99: u64 = 0x0c;
 
 const DW_LNS_COPY: u8 = 1;
 const DW_LNS_ADVANCE_PC: u8 = 2;
@@ -36,6 +74,164 @@ const LINE_BASE: i8 = -5;
 const LINE_RANGE: u8 = 14;
 const OPCODE_BASE: u8 = 13;
 const STANDARD_OPCODE_LENGTHS: [u8; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
+
+/// What the caller wants described in `.debug_info`, named in target-neutral terms.
+///
+/// A variable's location is deliberately absent: a backend that cannot say where a
+/// value lives after register allocation must leave it unsaid, and a debugger reads
+/// the silence as "optimized out". When backends can say, the location belongs on
+/// [`FormalParameter`] and on a `locals` list beside it, as a DWARF expression; the
+/// writer already gives every subprogram a `DW_AT_frame_base` for one to be relative to.
+#[derive(Debug, Clone, Default)]
+pub struct DebugInfoRequest {
+    /// Name and version of the producing compiler.
+    pub producer: Option<String>,
+    pub subprograms: Vec<Subprogram>,
+}
+
+/// One function. `name` is the symbol as it appears in the object; a name this object
+/// does not define is skipped rather than described without an address.
+#[derive(Debug, Clone)]
+pub struct Subprogram {
+    pub name: String,
+    pub external: bool,
+    pub decl: Option<DeclSite>,
+    /// `None` for a function that returns nothing, or whose return type has no
+    /// description the writer can give honestly.
+    pub ret: Option<DebugType>,
+    pub params: Vec<FormalParameter>,
+    /// A trailing `...`, which the DWARF spells as unspecified parameters.
+    pub variadic: bool,
+}
+
+/// `file` is the number the source gave a `.file` directive, not the line table index.
+#[derive(Debug, Clone, Copy)]
+pub struct DeclSite {
+    pub file: u32,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormalParameter {
+    pub name: Option<String>,
+    pub ty: Option<DebugType>,
+}
+
+/// A type a debugger can be told about without guessing. An aggregate whose members
+/// the caller cannot enumerate has no variant here on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DebugType {
+    Base(BaseType),
+    /// A pointer to an unspecified type, which is all an untyped machine pointer is.
+    Pointer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BaseType {
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+}
+
+impl BaseType {
+    fn name(self) -> &'static str {
+        match self {
+            BaseType::Bool => "bool",
+            BaseType::I8 => "i8",
+            BaseType::I16 => "i16",
+            BaseType::I32 => "i32",
+            BaseType::I64 => "i64",
+            BaseType::U8 => "u8",
+            BaseType::U16 => "u16",
+            BaseType::U32 => "u32",
+            BaseType::U64 => "u64",
+            BaseType::F32 => "f32",
+            BaseType::F64 => "f64",
+        }
+    }
+
+    fn byte_size(self) -> u8 {
+        match self {
+            BaseType::Bool | BaseType::I8 | BaseType::U8 => 1,
+            BaseType::I16 | BaseType::U16 => 2,
+            BaseType::I32 | BaseType::U32 | BaseType::F32 => 4,
+            BaseType::I64 | BaseType::U64 | BaseType::F64 => 8,
+        }
+    }
+
+    fn encoding(self) -> u64 {
+        match self {
+            BaseType::Bool => DW_ATE_BOOLEAN,
+            BaseType::I8 | BaseType::I16 | BaseType::I32 | BaseType::I64 => DW_ATE_SIGNED,
+            BaseType::U8 | BaseType::U16 | BaseType::U32 | BaseType::U64 => DW_ATE_UNSIGNED,
+            BaseType::F32 | BaseType::F64 => DW_ATE_FLOAT,
+        }
+    }
+}
+
+/// Where a function's code sits, resolved by the assembler after layout.
+#[derive(Debug, Clone)]
+pub(crate) struct FunctionExtent {
+    pub section: String,
+    pub start: u64,
+    pub length: u64,
+}
+
+/// The abbreviation table, interned as entries are needed. A DIE asks for the exact
+/// attribute list it is about to write and gets the code for it, so a new attribute
+/// never has to be threaded through a table written by hand.
+#[derive(PartialEq, Eq)]
+struct Abbrev {
+    tag: u64,
+    children: bool,
+    attributes: Vec<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct Abbrevs {
+    entries: Vec<Abbrev>,
+}
+
+impl Abbrevs {
+    fn code(&mut self, tag: u64, children: bool, attributes: &[(u64, u64)]) -> u64 {
+        let wanted = Abbrev {
+            tag,
+            children,
+            attributes: attributes.to_vec(),
+        };
+        match self.entries.iter().position(|entry| *entry == wanted) {
+            Some(index) => index as u64 + 1,
+            None => {
+                self.entries.push(wanted);
+                self.entries.len() as u64
+            }
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            push_uleb(&mut out, index as u64 + 1);
+            push_uleb(&mut out, entry.tag);
+            out.push(u8::from(entry.children));
+            for (attribute, form) in &entry.attributes {
+                push_uleb(&mut out, *attribute);
+                push_uleb(&mut out, *form);
+            }
+            out.extend_from_slice(&[0, 0]);
+        }
+        out.push(0);
+        out
+    }
+}
 
 pub(crate) struct LocRow {
     pub section: String,
@@ -60,14 +256,28 @@ fn absolute_kinds(arch: TargetArchitecture) -> Option<(u32, u32)> {
     }
 }
 
+/// Everything the assembler resolved that the writer describes.
+pub(crate) struct DebugSource<'a> {
+    pub sections: &'a [Section],
+    pub rows: &'a [LocRow],
+    pub files: &'a BTreeMap<u32, DebugFile>,
+    pub extents: &'a HashMap<String, FunctionExtent>,
+    pub request: Option<&'a DebugInfoRequest>,
+}
+
 pub(crate) fn build(
     arch: TargetArchitecture,
-    sections: &[Section],
-    rows: &[LocRow],
-    files: &BTreeMap<u32, DebugFile>,
+    source: &DebugSource<'_>,
     fallback_name: &str,
     always_emit: bool,
 ) -> Result<Option<DebugSections>, RasError> {
+    let DebugSource {
+        sections,
+        rows,
+        files,
+        extents,
+        request,
+    } = *source;
     let Some((abs64, abs32)) = absolute_kinds(arch) else {
         return Ok(None);
     };
@@ -231,42 +441,63 @@ pub(crate) fn build(
             .map(|dir| dir.display().to_string())
     });
 
-    let mut abbrev = Vec::new();
-    for code in 1u8..=4 {
-        let with_comp_dir = code & 1 == 0;
-        let with_ranges = code > 2;
-        abbrev.push(code);
-        abbrev.push(DW_TAG_COMPILE_UNIT);
-        abbrev.push(0);
-        let mut attributes = Vec::new();
-        if with_comp_dir {
-            attributes.push((DW_AT_COMP_DIR, DW_FORM_STRING));
+    let request = request.filter(|request| !request.subprograms.is_empty());
+    let described: Vec<(&Subprogram, &FunctionExtent)> = request
+        .map(|request| {
+            request
+                .subprograms
+                .iter()
+                .filter_map(|sub| Some((sub, extents.get(sub.name.as_str())?)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut type_pool: Vec<DebugType> = Vec::new();
+    for (sub, _) in &described {
+        let used = sub
+            .ret
+            .iter()
+            .chain(sub.params.iter().filter_map(|param| param.ty.as_ref()));
+        for ty in used {
+            if !type_pool.contains(ty) {
+                type_pool.push(*ty);
+            }
         }
-        attributes.extend([
-            (DW_AT_NAME, DW_FORM_STRING),
-            (DW_AT_STMT_LIST, DW_FORM_SEC_OFFSET),
-            (DW_AT_LOW_PC, DW_FORM_ADDR),
-        ]);
-        attributes.push(if with_ranges {
-            (DW_AT_RANGES, DW_FORM_SEC_OFFSET)
-        } else {
-            (DW_AT_HIGH_PC, DW_FORM_DATA8)
-        });
-        for (attribute, form) in attributes {
-            abbrev.push(attribute);
-            abbrev.push(form);
-        }
-        abbrev.extend_from_slice(&[0, 0]);
     }
-    abbrev.push(0);
+
+    let mut abbrevs = Abbrevs::default();
+    let producer = request.and_then(|request| request.producer.as_deref());
+    let mut cu_attributes: Vec<(u64, u64)> = Vec::new();
+    if producer.is_some() {
+        cu_attributes.push((DW_AT_PRODUCER, DW_FORM_STRING));
+    }
+    cu_attributes.push((DW_AT_LANGUAGE, DW_FORM_DATA2));
+    if comp_dir.is_some() {
+        cu_attributes.push((DW_AT_COMP_DIR, DW_FORM_STRING));
+    }
+    cu_attributes.extend([
+        (DW_AT_NAME, DW_FORM_STRING),
+        (DW_AT_STMT_LIST, DW_FORM_SEC_OFFSET),
+        (DW_AT_LOW_PC, DW_FORM_ADDR),
+    ]);
+    cu_attributes.push(if ranged {
+        (DW_AT_RANGES, DW_FORM_SEC_OFFSET)
+    } else {
+        (DW_AT_HIGH_PC, DW_FORM_DATA8)
+    });
+    let has_children = !described.is_empty() || !type_pool.is_empty();
+    let cu_code = abbrevs.code(DW_TAG_COMPILE_UNIT, has_children, &cu_attributes);
 
     let mut info = vec![0u8; 4];
     info.extend_from_slice(&4u16.to_le_bytes());
     let mut info_relocs = vec![(info.len(), ".debug_abbrev".to_string(), 4, 0i64)];
     info.extend_from_slice(&[0; 4]);
-    info.push(8);
-    let code = 1 + u8::from(comp_dir.is_some()) + 2 * u8::from(ranged);
-    info.push(code);
+    info.push(ADDRESS_SIZE);
+    push_uleb(&mut info, cu_code);
+    if let Some(producer) = producer {
+        push_cstr(&mut info, producer);
+    }
+    info.extend_from_slice(&(DW_LANG_C99 as u16).to_le_bytes());
     if let Some(dir) = comp_dir.as_deref() {
         push_cstr(&mut info, dir);
     }
@@ -282,6 +513,113 @@ pub(crate) fn build(
         info.extend_from_slice(&[0; 8]);
         info.extend_from_slice(&(text.data.len() as u64).to_le_bytes());
     }
+
+    // The type pool comes first, so every `DW_FORM_ref4` below points backwards and no
+    // DIE needs patching after the fact.
+    let mut type_offsets: HashMap<DebugType, u32> = HashMap::new();
+    for ty in &type_pool {
+        let offset = info.len() as u32;
+        match ty {
+            DebugType::Base(base) => {
+                let code = abbrevs.code(
+                    DW_TAG_BASE_TYPE,
+                    false,
+                    &[
+                        (DW_AT_NAME, DW_FORM_STRING),
+                        (DW_AT_ENCODING, DW_FORM_DATA1),
+                        (DW_AT_BYTE_SIZE, DW_FORM_DATA1),
+                    ],
+                );
+                push_uleb(&mut info, code);
+                push_cstr(&mut info, base.name());
+                info.push(base.encoding() as u8);
+                info.push(base.byte_size());
+            }
+            DebugType::Pointer => {
+                let code = abbrevs.code(
+                    DW_TAG_POINTER_TYPE,
+                    false,
+                    &[(DW_AT_BYTE_SIZE, DW_FORM_DATA1)],
+                );
+                push_uleb(&mut info, code);
+                info.push(ADDRESS_SIZE);
+            }
+        }
+        type_offsets.insert(*ty, offset);
+    }
+
+    for (sub, extent) in &described {
+        let decl = sub
+            .decl
+            .and_then(|decl| Some((file_index(decl.file).ok()?, u64::from(decl.line))));
+        let ret = sub.ret.and_then(|ty| type_offsets.get(&ty).copied());
+        let mut attributes = vec![(DW_AT_NAME, DW_FORM_STRING)];
+        if sub.external {
+            attributes.push((DW_AT_EXTERNAL, DW_FORM_FLAG_PRESENT));
+        }
+        if decl.is_some() {
+            attributes.push((DW_AT_DECL_FILE, DW_FORM_UDATA));
+            attributes.push((DW_AT_DECL_LINE, DW_FORM_UDATA));
+        }
+        attributes.push((DW_AT_PROTOTYPED, DW_FORM_FLAG_PRESENT));
+        if ret.is_some() {
+            attributes.push((DW_AT_TYPE, DW_FORM_REF4));
+        }
+        attributes.extend([
+            (DW_AT_LOW_PC, DW_FORM_ADDR),
+            (DW_AT_HIGH_PC, DW_FORM_DATA8),
+            (DW_AT_FRAME_BASE, DW_FORM_EXPRLOC),
+        ]);
+        let children = !sub.params.is_empty() || sub.variadic;
+        let code = abbrevs.code(DW_TAG_SUBPROGRAM, children, &attributes);
+        push_uleb(&mut info, code);
+        push_cstr(&mut info, &sub.name);
+        if let Some((file, line)) = decl {
+            push_uleb(&mut info, file);
+            push_uleb(&mut info, line);
+        }
+        if let Some(offset) = ret {
+            info.extend_from_slice(&offset.to_le_bytes());
+        }
+        info_relocs.push((info.len(), extent.section.clone(), 8, extent.start as i64));
+        info.extend_from_slice(&[0; 8]);
+        info.extend_from_slice(&extent.length.to_le_bytes());
+        info.push(1);
+        info.push(DW_OP_CALL_FRAME_CFA);
+
+        // A parameter carries no `DW_AT_location`: nothing here knows where the
+        // allocator put it, and a guessed location makes a debugger print a wrong
+        // value rather than say it does not know.
+        for param in &sub.params {
+            let ty = param.ty.and_then(|ty| type_offsets.get(&ty).copied());
+            let mut attributes = Vec::new();
+            if param.name.is_some() {
+                attributes.push((DW_AT_NAME, DW_FORM_STRING));
+            }
+            if ty.is_some() {
+                attributes.push((DW_AT_TYPE, DW_FORM_REF4));
+            }
+            let code = abbrevs.code(DW_TAG_FORMAL_PARAMETER, false, &attributes);
+            push_uleb(&mut info, code);
+            if let Some(name) = param.name.as_deref() {
+                push_cstr(&mut info, name);
+            }
+            if let Some(offset) = ty {
+                info.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+        if sub.variadic {
+            let code = abbrevs.code(DW_TAG_UNSPECIFIED_PARAMETERS, false, &[]);
+            push_uleb(&mut info, code);
+        }
+        if children {
+            info.push(0);
+        }
+    }
+    if has_children {
+        info.push(0);
+    }
+    let abbrev = abbrevs.encode();
     let info_unit_length = (info.len() - 4) as u32;
     info[..4].copy_from_slice(&info_unit_length.to_le_bytes());
 

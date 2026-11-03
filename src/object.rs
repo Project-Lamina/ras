@@ -18,6 +18,12 @@ pub struct ObjectWriteOptions {
     pub keep_locals: bool,
     /// Compile unit name used when the source declares no `.file` entry.
     pub dwarf_decl_file_name: String,
+    /// Symbols that define a function. Each is emitted as `STT_FUNC` with the byte
+    /// length of its code, independently of whether debug info is requested.
+    pub function_symbols: Vec<String>,
+    /// Subprograms and their types for `.debug_info`. A name with no definition in
+    /// this object is skipped.
+    pub debug_info: Option<crate::dwarf::DebugInfoRequest>,
 }
 
 impl Default for ObjectWriteOptions {
@@ -26,6 +32,8 @@ impl Default for ObjectWriteOptions {
             emit_minimal_dwarf_sections: false,
             keep_locals: false,
             dwarf_decl_file_name: "lamina.s".to_string(),
+            function_symbols: Vec::new(),
+            debug_info: None,
         }
     }
 }

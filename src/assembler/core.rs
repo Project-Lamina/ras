@@ -7,7 +7,7 @@
 #[cfg(feature = "nightly")]
 use crate::encoder::arx64::Arx64Encoder;
 use crate::{
-    dwarf::{self, LocRow},
+    dwarf::{self, FunctionExtent, LocRow},
     encoder::{
         aarch64::AArch64Encoder,
         armv7::Armv7Encoder,
@@ -440,6 +440,13 @@ impl RasAssembler {
                     .map(|(name, _)| name.as_str()),
             )
             .collect();
+        let wanted_functions: HashSet<&str> = self
+            .object_write_options
+            .function_symbols
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut extents: HashMap<String, FunctionExtent> = HashMap::new();
         let mut symbols = Vec::new();
         let mut relocs = Vec::new();
         for ((section, lines), layout) in sections.iter_mut().zip(&section_lines).zip(layouts) {
@@ -456,6 +463,7 @@ impl RasAssembler {
             }
             let layout = layout.unwrap();
             loc_rows.extend(Self::loc_rows(&section.name, lines, &layout.line_offsets));
+            let line_offsets = layout.line_offsets.clone();
             let (data, mut syms, mut relocations) = Self::finish_layout(
                 layout,
                 lines,
@@ -489,6 +497,14 @@ impl RasAssembler {
                 }
             }
             section.data = data;
+            Self::function_extents(
+                &section.name,
+                lines,
+                &line_offsets,
+                section.data.len(),
+                &wanted_functions,
+                &mut extents,
+            );
             for reloc in &mut relocations {
                 reloc.section = section.name.clone();
             }
@@ -641,12 +657,29 @@ impl RasAssembler {
                 row.file
             )));
         }
+        // A `.type` or `.size` the source stated wins: the caller naming a symbol as a
+        // function says what it is, not how long the assembler should think it is.
+        for symbol in &mut symbols {
+            let Some(extent) = extents.get(&symbol.name) else {
+                continue;
+            };
+            if symbol.attributes.symbol_type == 0 {
+                symbol.attributes.symbol_type = 2;
+            }
+            if symbol.attributes.size.is_none() {
+                symbol.attributes.size = Some(extent.length.to_string());
+            }
+        }
         if object_format_for_os(self.target_os) == Some(ObjectFormat::Elf) {
             let debug = dwarf::build(
                 self.target_arch,
-                &sections,
-                &loc_rows,
-                &parsed.files,
+                &dwarf::DebugSource {
+                    sections: &sections,
+                    rows: &loc_rows,
+                    files: &parsed.files,
+                    extents: &extents,
+                    request: self.object_write_options.debug_info.as_ref(),
+                },
                 &self.object_write_options.dwarf_decl_file_name,
                 self.object_write_options.emit_minimal_dwarf_sections,
             )?;
@@ -683,6 +716,61 @@ impl RasAssembler {
                 opts: &self.object_write_options,
             })
             .map_err(|e| RasError::ObjectError(e.to_string()))
+    }
+
+    /// The byte range each wanted function's code occupies in `section`. The end is
+    /// taken from the last line that emitted bytes, so alignment padding that follows
+    /// a function belongs to no function.
+    fn function_extents(
+        section: &str,
+        lines: &[Line],
+        offsets: &[usize],
+        section_length: usize,
+        wanted: &HashSet<&str>,
+        out: &mut HashMap<String, FunctionExtent>,
+    ) {
+        if wanted.is_empty() {
+            return;
+        }
+        let starts: Vec<(usize, &str)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| match line {
+                Line::Label(symbol) if wanted.contains(symbol.name.as_str()) => {
+                    Some((index, symbol.name.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (position, (index, name)) in starts.iter().enumerate() {
+            let limit = starts
+                .get(position + 1)
+                .map_or(lines.len(), |(next, _)| *next);
+            let emitting = (index + 1..limit).rev().find(|line| {
+                matches!(
+                    lines[*line],
+                    Line::Instruction(_)
+                        | Line::Data(_)
+                        | Line::Leb128 { .. }
+                        | Line::DataExpression { .. }
+                )
+            });
+            let Some(&start) = offsets.get(*index) else {
+                continue;
+            };
+            let end = match emitting {
+                Some(line) => offsets.get(line + 1).copied().unwrap_or(section_length),
+                None => start,
+            };
+            out.insert(
+                name.to_string(),
+                FunctionExtent {
+                    section: section.to_string(),
+                    start: start as u64,
+                    length: end.saturating_sub(start) as u64,
+                },
+            );
+        }
     }
 
     fn loc_rows(section: &str, lines: &[Line], offsets: &[usize]) -> Vec<LocRow> {
