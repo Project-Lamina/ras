@@ -1070,7 +1070,10 @@ impl AArch64Encoder {
                     .and_then(|s| s.strip_suffix(']'))
                     .ok_or_else(|| error("Expected base and immediate address"))?;
                 let fields: Vec<_> = inside.split(',').map(str::trim).collect();
-                if fields.len() > 2 {
+                let index = fields
+                    .get(1)
+                    .filter(|field| **field != "sp" && gpr(field).is_ok());
+                if fields.len() > if index.is_some() { 3 } else { 2 } {
                     return Err(error(format!("Too many address operands for {op}")));
                 }
                 let (rn, base_wide) = gpr(fields[0])?;
@@ -1112,11 +1115,15 @@ impl AArch64Encoder {
                     }
                 };
                 let scale = if kind == DataKind::Q { 4 } else { size };
-                let offset = match post_offset {
-                    Some(text) => immediate(text)?,
-                    None => fields.get(1).map_or(Ok(0), |s| immediate(s))?,
+                let offset = match (post_offset, index) {
+                    (Some(text), _) => immediate(text)?,
+                    (None, Some(_)) => 0,
+                    (None, None) => fields.get(1).map_or(Ok(0), |s| immediate(s))?,
                 };
                 let writeback = pre || post;
+                if index.is_some() && (writeback || op.contains("ur")) {
+                    return Err(error(format!("{op} has no register offset form here")));
+                }
                 if writeback && op.contains("ur") {
                     return Err(error(format!("{op} has no writeback form")));
                 }
@@ -1160,7 +1167,34 @@ impl AArch64Encoder {
                     }
                     ((offset as u32) & 511) << 12
                 };
-                base | imm | (rn << 5) | rt
+                if let Some(index) = index {
+                    let (rm, index_wide) = gpr(index)?;
+                    let (extend, amount) = match fields.get(2) {
+                        Some(field) => field
+                            .split_once(char::is_whitespace)
+                            .map_or((*field, "#0"), |(name, amount)| (name, amount.trim())),
+                        None => ("lsl", "#0"),
+                    };
+                    let option: u32 = match (extend, index_wide) {
+                        ("lsl", true) => 0b011,
+                        ("sxtx", true) => 0b111,
+                        ("uxtw", false) => 0b010,
+                        ("sxtw", false) => 0b110,
+                        _ => return Err(error(format!("Bad index extend for {op}: {extend}"))),
+                    };
+                    let amount = immediate(amount)?;
+                    if amount != 0 && amount != i64::from(scale) {
+                        return Err(error(format!("Bad index shift for {op}: {amount}")));
+                    }
+                    let shifted = u32::from(amount != 0) << 12;
+                    let register_form = ((size as u32) << 30)
+                        | 0x3820_0800
+                        | if fp { 0x0400_0000 } else { 0 }
+                        | (opc << 22);
+                    register_form | (rm << 16) | (option << 13) | shifted | (rn << 5) | rt
+                } else {
+                    base | imm | (rn << 5) | rt
+                }
             }
             "ldxr" | "ldxrb" | "ldxrh" | "ldaxr" | "ldaxrb" | "ldaxrh" => {
                 let (rt, size) = exclusive_data(op, arg(0)?)?;
