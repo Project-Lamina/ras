@@ -1313,6 +1313,9 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
         nlists.push(nlist);
     }
     for reloc in req.relocations {
+        if reloc.section_symbol {
+            continue;
+        }
         let defined_here = symbol_by_name
             .get(reloc.symbol.as_str())
             .is_some_and(|s| !s.section.is_empty() && s.section != "*COM*" && s.section != "*ABS*");
@@ -1373,6 +1376,30 @@ fn macho_object_bytes(req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError>
         let field_addr = sections[ord].addr + field;
         let width = 1usize << spec.width_log2;
         let addend = reloc.addend + bias;
+
+        if reloc.section_symbol {
+            let target_ord = *section_ord.get(reloc.symbol.as_str()).ok_or_else(|| {
+                RasError::ObjectError(format!(
+                    "relocation against unknown section {}",
+                    reloc.symbol
+                ))
+            })?;
+            if spec.pcrel {
+                return Err(RasError::ObjectError(format!(
+                    "pc-relative relocation against section {} is not supported for Mach-O",
+                    reloc.symbol
+                )));
+            }
+            let content = sections[target_ord].addr as i64 + reloc.addend;
+            write_field(&mut sections[ord].data, reloc.offset, width, content)?;
+            let r_address = u32::try_from(reloc.offset)
+                .map_err(|_| RasError::ObjectError("relocation offset too large".into()))?;
+            let info = ((target_ord as u32 + 1) & 0x00ff_ffff)
+                | (spec.width_log2 << 25)
+                | (spec.r_type << 28);
+            sections[ord].relocs.push((r_address, info));
+            continue;
+        }
 
         let target = match symbol_by_name.get(reloc.symbol.as_str()) {
             Some(sym) if sym.section.as_str() == "*ABS*" => {
