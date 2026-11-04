@@ -127,6 +127,11 @@ pub(crate) struct LocRow {
     pub line: u32,
     pub column: u32,
     pub is_stmt: bool,
+    pub prologue_end: bool,
+    pub epilogue_begin: bool,
+    pub basic_block: bool,
+    pub discriminator: u64,
+    pub isa: u64,
 }
 
 /// Everything the assembler resolved that a debug writer describes.

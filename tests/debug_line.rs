@@ -76,3 +76,58 @@ fn loc_rows_follow_relaxed_branches() {
         ]
     );
 }
+
+fn dwarfdump(object: &std::path::Path) -> Option<String> {
+    for tool in ["llvm-dwarfdump-18", "llvm-dwarfdump"] {
+        if let Ok(output) = Command::new(tool).arg("--debug-line").arg(object).output()
+            && output.status.success()
+        {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    None
+}
+
+#[test]
+fn loc_flags_reach_the_line_program() {
+    let dir = TempDir::new("debug_line_flags");
+    let path = dir.path().join("flags.o");
+    Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble(
+            ".file 1 \"flags.c\"\n.text\n.globl f\nf:\n.loc 1 1 0 prologue_end\nnop\n.loc 1 2 0 basic_block discriminator 3\nnop\n.loc 1 3 0 epilogue_begin isa 1\nret\n",
+            &path,
+        )
+        .unwrap();
+    let Some(text) = dwarfdump(&path) else {
+        return;
+    };
+    let rows: Vec<Vec<String>> = text
+        .lines()
+        .filter(|line| line.starts_with("0x"))
+        .map(|line| {
+            line.split_whitespace()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(rows.len(), 4, "{text}");
+    let flags = |row: &Vec<String>| row[7..].join(" ");
+    let isa = |row: &Vec<String>| row[4].clone();
+    let discriminator = |row: &Vec<String>| row[5].clone();
+    assert_eq!(flags(&rows[0]), "is_stmt prologue_end");
+    assert_eq!(flags(&rows[1]), "is_stmt basic_block");
+    assert_eq!(flags(&rows[2]), "is_stmt epilogue_begin");
+    assert_eq!(
+        [
+            discriminator(&rows[0]),
+            discriminator(&rows[1]),
+            discriminator(&rows[2])
+        ],
+        ["0", "3", "0"]
+    );
+    assert_eq!(
+        [isa(&rows[0]), isa(&rows[1]), isa(&rows[2])],
+        ["0", "0", "1"]
+    );
+}

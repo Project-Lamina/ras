@@ -76,8 +76,15 @@ const DW_LNS_ADVANCE_LINE: u8 = 3;
 const DW_LNS_SET_FILE: u8 = 4;
 const DW_LNS_SET_COLUMN: u8 = 5;
 const DW_LNS_NEGATE_STMT: u8 = 6;
+const DW_LNS_SET_BASIC_BLOCK: u8 = 7;
+/// DWARF 4 section 6.2.5.2. A row carrying this is where a debugger should place a
+/// function entry breakpoint, past the prologue, rather than guessing.
+const DW_LNS_SET_PROLOGUE_END: u8 = 10;
+const DW_LNS_SET_EPILOGUE_BEGIN: u8 = 11;
+const DW_LNS_SET_ISA: u8 = 12;
 const DW_LNE_END_SEQUENCE: u8 = 1;
 const DW_LNE_SET_ADDRESS: u8 = 2;
+const DW_LNE_SET_DISCRIMINATOR: u8 = 4;
 
 const LINE_BASE: i8 = -5;
 const LINE_RANGE: u8 = 14;
@@ -256,6 +263,7 @@ pub(crate) fn build(
 
         let (mut file, mut line, mut column, mut is_stmt, mut address) =
             (1u64, 1u32, 0u32, true, 0u64);
+        let mut isa = 0u64;
         for row in picked {
             let row_file = file_index(row.file)?;
             if row_file != file {
@@ -271,6 +279,28 @@ pub(crate) fn build(
             if row.is_stmt != is_stmt {
                 program.push(DW_LNS_NEGATE_STMT);
                 is_stmt = row.is_stmt;
+            }
+            if row.isa != isa {
+                program.push(DW_LNS_SET_ISA);
+                push_uleb(&mut program, row.isa);
+                isa = row.isa;
+            }
+            if row.basic_block {
+                program.push(DW_LNS_SET_BASIC_BLOCK);
+            }
+            if row.prologue_end {
+                program.push(DW_LNS_SET_PROLOGUE_END);
+            }
+            if row.epilogue_begin {
+                program.push(DW_LNS_SET_EPILOGUE_BEGIN);
+            }
+            if row.discriminator != 0 {
+                program.push(0);
+                let mut operand = Vec::new();
+                push_uleb(&mut operand, row.discriminator);
+                push_uleb(&mut program, operand.len() as u64 + 1);
+                program.push(DW_LNE_SET_DISCRIMINATOR);
+                program.extend_from_slice(&operand);
             }
             if row.offset > address {
                 program.push(DW_LNS_ADVANCE_PC);

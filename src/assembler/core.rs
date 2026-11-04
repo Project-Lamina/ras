@@ -796,6 +796,11 @@ impl RasAssembler {
                 line,
                 column,
                 is_stmt,
+                prologue_end,
+                epilogue_begin,
+                basic_block,
+                discriminator,
+                isa,
             } = line
             else {
                 continue;
@@ -813,6 +818,11 @@ impl RasAssembler {
                 line: *line,
                 column: *column,
                 is_stmt: *is_stmt,
+                prologue_end: *prologue_end,
+                epilogue_begin: *epilogue_begin,
+                basic_block: *basic_block,
+                discriminator: *discriminator,
+                isa: *isa,
             });
         }
         rows

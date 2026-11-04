@@ -54,7 +54,15 @@ pub enum Line {
         file: u32,
         line: u32,
         column: u32,
+        /// `is_stmt` and `isa` are line-program registers that persist across rows;
+        /// the three flags and `discriminator` are reset by every row the program
+        /// emits. DWARF 4 section 6.2.2.
         is_stmt: bool,
+        prologue_end: bool,
+        epilogue_begin: bool,
+        basic_block: bool,
+        discriminator: u64,
+        isa: u64,
     },
     Label(Symbol),
     Instruction(ParsedInstruction),
@@ -123,6 +131,7 @@ pub struct AssemblyParser {
     lines: Vec<Line>,
     files: BTreeMap<u32, DebugFile>,
     is_stmt: bool,
+    isa: u64,
     attributes: HashMap<String, SymbolAttributes>,
     pending_globals: HashSet<String>,
     symbol_names: HashSet<String>,
@@ -153,6 +162,7 @@ impl AssemblyParser {
             lines: Vec::new(),
             files: BTreeMap::new(),
             is_stmt: true,
+            isa: 0,
             attributes: HashMap::new(),
             pending_globals: HashSet::new(),
             symbol_names: HashSet::new(),
@@ -791,7 +801,15 @@ impl AssemblyParser {
                     _ => (0, 2),
                 };
                 let mut options = operands[options_start..].iter();
+                let (mut prologue_end, mut epilogue_begin, mut basic_block) = (false, false, false);
+                let mut discriminator = 0u64;
                 while let Some(&option) = options.next() {
+                    let value = |text: Option<&&str>| {
+                        text.and_then(|text| text.parse::<u64>().ok())
+                            .ok_or_else(|| {
+                                RasError::ParseError(format!(".loc {option} requires a number"))
+                            })
+                    };
                     match option {
                         "is_stmt" => {
                             self.is_stmt = match options.next() {
@@ -804,10 +822,21 @@ impl AssemblyParser {
                                 }
                             };
                         }
-                        "discriminator" | "isa" | "view" => {
-                            options.next();
+                        "prologue_end" => prologue_end = true,
+                        "epilogue_begin" => epilogue_begin = true,
+                        "basic_block" => basic_block = true,
+                        "discriminator" => discriminator = value(options.next())?,
+                        "isa" => self.isa = value(options.next())?,
+                        "view" => {
+                            return Err(RasError::ParseError(
+                                ".loc view numbers are a gas bookkeeping feature ras does not implement".into(),
+                            ));
                         }
-                        _ => {}
+                        other => {
+                            return Err(RasError::ParseError(format!(
+                                "Unsupported .loc option: {other}"
+                            )));
+                        }
                     }
                 }
                 self.lines.push(Line::Loc {
@@ -815,6 +844,11 @@ impl AssemblyParser {
                     line: source_line,
                     column,
                     is_stmt: self.is_stmt,
+                    prologue_end,
+                    epilogue_begin,
+                    basic_block,
+                    discriminator,
+                    isa: self.isa,
                 });
             }
             ".ident" => {}
@@ -1507,6 +1541,7 @@ mod tests {
                     line,
                     column,
                     is_stmt,
+                    ..
                 } => Some((*file, *line, *column, *is_stmt)),
                 _ => None,
             })
@@ -1525,6 +1560,57 @@ mod tests {
         assert!(
             AssemblyParser::new()
                 .parse(".loc 1 2 3 is_stmt 2\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn loc_flags_are_per_row_and_isa_is_sticky() {
+        let asm = parse(
+            ".file 1 \"a.c\"\n.loc 1 1 0 prologue_end isa 2 discriminator 7\nnop\n.loc 1 2 0 epilogue_begin basic_block\nnop\n",
+        );
+        let rows: Vec<_> = asm
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Loc {
+                    prologue_end,
+                    epilogue_begin,
+                    basic_block,
+                    discriminator,
+                    isa,
+                    ..
+                } => Some((
+                    *prologue_end,
+                    *epilogue_begin,
+                    *basic_block,
+                    *discriminator,
+                    *isa,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [(true, false, false, 7, 2), (false, true, true, 0, 2),]
+        );
+    }
+
+    #[test]
+    fn loc_names_options_it_does_not_implement() {
+        let view = match AssemblyParser::new().parse(".loc 1 1 0 view .LVU0\n") {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected .loc view to be refused"),
+        };
+        assert!(view.contains("view"), "{view}");
+        let unknown = match AssemblyParser::new().parse(".loc 1 1 0 atom_group 3\n") {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected an unknown .loc option to be refused"),
+        };
+        assert!(unknown.contains("atom_group"), "{unknown}");
+        assert!(
+            AssemblyParser::new()
+                .parse(".loc 1 1 0 discriminator x\n")
                 .is_err()
         );
     }
