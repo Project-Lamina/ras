@@ -864,6 +864,9 @@ impl AssemblyParser {
                 });
             }
             ".ident" => {}
+            // Hints only: the linker takes the deployment target from its own arguments,
+            // and dropping a linker optimization hint leaves the code correct.
+            ".build_version" | ".macosx_version_min" | ".loh" | ".subsections_via_symbols" => {}
             ".syntax" => {
                 if parts.get(1).map(|s| s.trim()) != Some("unified") {
                     return Err(RasError::ParseError(

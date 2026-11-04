@@ -316,6 +316,13 @@ impl RasAssembler {
     /// Uses two-pass assembly for `jmp`/`call` instructions with forward label
     /// resolution.
     pub fn assemble_text_to_object_bytes(&mut self, asm_text: &str) -> Result<Vec<u8>, RasError> {
+        let macho_text;
+        let asm_text = if self.target_os == TargetOperatingSystem::MacOS {
+            macho_text = crate::cfi::strip_for_macho(asm_text)?;
+            macho_text.as_str()
+        } else {
+            asm_text
+        };
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
         let comment_markers: &'static [&'static str] = match self.target_arch {
             TargetArchitecture::Aarch64 => &["//"],

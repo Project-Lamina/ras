@@ -103,8 +103,16 @@ fn register(value: &str, arch: TargetArchitecture) -> Result<i128, RasError> {
         crate::encoder::armv7::gpr(value).ok().map(i128::from)
     } else if value == "sp" {
         Some(31)
+    } else if value == "fp" {
+        Some(29)
+    } else if value == "lr" {
+        Some(30)
     } else {
-        value.strip_prefix('x').and_then(|n| n.parse().ok())
+        // clang spells the frame pointer w29 in .cfi_def_cfa
+        value
+            .strip_prefix('x')
+            .or_else(|| value.strip_prefix('w'))
+            .and_then(|n| n.parse().ok())
     };
     reg.ok_or_else(|| RasError::ParseError(format!("Unsupported CFI register: {value}")))
 }
@@ -117,6 +125,26 @@ fn pointer(encoding: u8, symbol: &str) -> Result<String, RasError> {
             "Unsupported CFI pointer encoding: {encoding:#x}"
         ))),
     }
+}
+
+/// Mach-O output has no unwind tables yet. Plain CFI only describes frames, so it goes,
+/// the code stays correct and frame pointers still walk. Exception tables cannot be
+/// dropped without breaking catch, so those are refused by name.
+pub(crate) fn strip_for_macho(source: &str) -> Result<String, RasError> {
+    let mut output = String::with_capacity(source.len());
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(".cfi_personality") || trimmed.starts_with(".cfi_lsda") {
+            return Err(RasError::ParseError(format!(
+                "Mach-O exception tables are not supported: {trimmed}"
+            )));
+        }
+        if !trimmed.starts_with(".cfi_") {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    Ok(output)
 }
 
 pub(crate) fn lower(
