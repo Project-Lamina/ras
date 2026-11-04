@@ -100,12 +100,20 @@ pub fn compile_mir_aarch64_function(
         }
 
         let stack_size = frame.frame_size as usize;
+        let homes = assign_register_homes(func, &mut stack_slots);
 
         // AAPCS64 wants the frame 16-byte aligned, and the prologue saves x29, x30 on top of it.
-        let aligned_stack_size = (stack_size + 15) & !15;
+        let aligned_stack_size = (stack_size + 8 * homes.len() + 15) & !15;
 
         let prologue = encode_prologue(aligned_stack_size)?;
         code.extend_from_slice(&prologue);
+        for (index, home) in homes.iter().enumerate() {
+            code.extend_from_slice(&encode_str(
+                &format!("x{home}"),
+                29,
+                home_save_offset(stack_size, index),
+            )?);
+        }
 
         // The encoder materializes a virtual register by loading its stack slot, so the ABI
         // argument registers have to be spilled to those slots first.
@@ -413,6 +421,7 @@ pub fn compile_mir_aarch64_function(
                         code.extend_from_slice(&encode_str("x11", 29, caller_off)?);
                     }
 
+                    code.extend_from_slice(&encode_home_restores(&homes, stack_size)?);
                     let epilogue_tail = encode_epilogue(aligned_stack_size)?;
                     code.extend_from_slice(&epilogue_tail);
 
@@ -458,6 +467,7 @@ pub fn compile_mir_aarch64_function(
             write_u32_le(&mut code, fix.patch_location, patched)?;
         }
 
+        code.extend_from_slice(&encode_home_restores(&homes, stack_size)?);
         let epilogue = encode_epilogue(aligned_stack_size)?;
         code.extend_from_slice(&epilogue);
 

@@ -62,13 +62,134 @@ pub(super) fn encode_epilogue(aligned_stack_size: usize) -> Result<Vec<u8>, RasE
     Ok(code)
 }
 
+/// A virtual register given a register of its own has this in place of a frame offset.
+/// Every slot access goes through the helpers below, so that is the one place to look.
+const REGISTER_HOME: i32 = 1 << 24;
+
+fn register_home(base_reg: u8, offset: i32) -> Option<u8> {
+    (base_reg == 29 && offset >= REGISTER_HOME).then(|| (offset - REGISTER_HOME) as u8)
+}
+
+fn encode_mov_x(rd: u8, rm: u8) -> Vec<u8> {
+    let word = 0xAA00_03E0u32 | ((rm as u32) << 16) | (rd as u32);
+    word.to_le_bytes().to_vec()
+}
+
+/// Weight of one access: a block inside a loop runs about this many times more.
+const LOOP_WEIGHT: u64 = 8;
+const MAX_LOOP_WEIGHT_DEPTH: u32 = 6;
+
+/// Give the most used virtual registers a callee-saved register for the whole function.
+/// Each one keeps it alone, so no liveness is needed and calls cannot disturb it.
+/// Returns the registers the prologue has to save.
+#[cfg(feature = "encoder")]
+pub(super) fn assign_register_homes(
+    func: &lamina_mir::Function,
+    stack_slots: &mut std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+) -> Vec<u8> {
+    const HOMES: [u8; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+    // A save and a restore are two memory accesses, so fewer uses than that lose.
+    const MIN_WEIGHT: u64 = 3;
+
+    let position: std::collections::HashMap<&str, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label.as_str(), index))
+        .collect();
+    let mut depth = vec![0u32; func.blocks.len()];
+    for (index, block) in func.blocks.iter().enumerate() {
+        let targets: Vec<&str> = match block.terminator() {
+            Some(lamina_mir::Instruction::Jmp { target }) => vec![target],
+            Some(lamina_mir::Instruction::Br {
+                true_target,
+                false_target,
+                ..
+            }) => vec![true_target, false_target],
+            Some(lamina_mir::Instruction::Switch { cases, default, .. }) => cases
+                .iter()
+                .map(|(_, target)| target.as_str())
+                .chain([default.as_str()])
+                .collect(),
+            _ => Vec::new(),
+        };
+        for target in targets {
+            if let Some(&head) = position.get(target)
+                && head <= index
+            {
+                for inside in &mut depth[head..=index] {
+                    *inside += 1;
+                }
+            }
+        }
+    }
+
+    let mut pinned = std::collections::HashSet::new();
+    let mut weights: std::collections::HashMap<lamina_mir::VirtualReg, u64> =
+        std::collections::HashMap::new();
+    for (index, block) in func.blocks.iter().enumerate() {
+        let weight = LOOP_WEIGHT.pow(depth[index].min(MAX_LOOP_WEIGHT_DEPTH));
+        for inst in &block.instructions {
+            if let lamina_mir::Instruction::StackAddr { slot, .. } = &inst.instr {
+                pinned.insert(*slot);
+            }
+            for reg in inst.use_regs().into_iter().chain(inst.def_reg()) {
+                if let Register::Virtual(vreg) = reg {
+                    *weights.entry(*vreg).or_default() += weight;
+                }
+            }
+        }
+    }
+    pinned.extend(func.stack_reservations.keys().copied());
+    pinned.extend(func.stack_alignments.keys().copied());
+
+    let mut ranked: Vec<(lamina_mir::VirtualReg, u64)> = weights
+        .into_iter()
+        .filter(|(vreg, weight)| {
+            *weight >= MIN_WEIGHT && !pinned.contains(vreg) && stack_slots.contains_key(vreg)
+        })
+        .collect();
+    // Sorted on the register too, the map's order must not change the code.
+    ranked.sort_by_key(|(vreg, weight)| (std::cmp::Reverse(*weight), format!("{vreg:?}")));
+
+    let mut used = Vec::new();
+    for ((vreg, _), home) in ranked.into_iter().zip(HOMES) {
+        stack_slots.insert(vreg, REGISTER_HOME + i32::from(home));
+        used.push(home);
+    }
+    used
+}
+
+/// Where the prologue saves the `index`th register it took, under the locals.
+pub(super) fn home_save_offset(stack_size: usize, index: usize) -> i32 {
+    -((stack_size + 8 * (index + 1)) as i32)
+}
+
+pub(super) fn encode_home_restores(used: &[u8], stack_size: usize) -> Result<Vec<u8>, RasError> {
+    let mut code = Vec::new();
+    for (index, home) in used.iter().enumerate() {
+        code.extend_from_slice(&encode_ldr_imm64(
+            *home,
+            29,
+            home_save_offset(stack_size, index),
+        )?);
+    }
+    Ok(code)
+}
+
 pub(super) fn encode_str(src_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
     let src = parse_register(src_reg)?;
+    if let Some(home) = register_home(base_reg, offset) {
+        return Ok(encode_mov_x(home, src));
+    }
     encode_str_imm64(src, base_reg, offset)
 }
 
 pub(super) fn encode_ldr(dst_reg: &str, base_reg: u8, offset: i32) -> Result<Vec<u8>, RasError> {
     let dst = parse_register(dst_reg)?;
+    if let Some(home) = register_home(base_reg, offset) {
+        return Ok(encode_mov_x(dst, home));
+    }
     encode_ldr_imm64(dst, base_reg, offset)
 }
 
@@ -117,6 +238,15 @@ pub(super) fn encode_ldr_typed(
 ) -> Result<Vec<u8>, RasError> {
     let dst = parse_register(dst_reg)?;
     let kind = mir_scalar_ld_kind(ty)?;
+    if let Some(home) = register_home(base_reg, offset) {
+        return Ok(match kind {
+            AArch64ScalarLdKind::I8S => encode_sbfm64(dst, home, 0, 7),
+            AArch64ScalarLdKind::I8U => encode_ubfm64(dst, home, 0, 7),
+            AArch64ScalarLdKind::I16S => encode_sbfm64(dst, home, 0, 15),
+            AArch64ScalarLdKind::I32S => encode_sbfm64(dst, home, 0, 31),
+            AArch64ScalarLdKind::I64 => encode_mov_x(dst, home),
+        });
+    }
     encode_ldr_scalar(dst, base_reg, offset, kind)
 }
 
@@ -128,6 +258,14 @@ pub(super) fn encode_str_typed(
 ) -> Result<Vec<u8>, RasError> {
     let src = parse_register(src_reg)?;
     let kind = mir_scalar_st_kind(ty)?;
+    if let Some(home) = register_home(base_reg, offset) {
+        return Ok(match kind {
+            AArch64ScalarStKind::I8 => encode_ubfm64(home, src, 0, 7),
+            AArch64ScalarStKind::I16 => encode_ubfm64(home, src, 0, 15),
+            AArch64ScalarStKind::I32 => encode_ubfm64(home, src, 0, 31),
+            AArch64ScalarStKind::I64 => encode_mov_x(home, src),
+        });
+    }
     encode_str_scalar(src, base_reg, offset, kind)
 }
 

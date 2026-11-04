@@ -4,7 +4,7 @@
 use lamina_mir::{
     block::Block,
     function::{Function, Parameter, Signature},
-    instruction::{AddressMode, Immediate, Instruction, IntBinOp, MemoryAttrs, Operand},
+    instruction::{AddressMode, Immediate, Instruction, IntBinOp, IntCmpOp, MemoryAttrs, Operand},
     module::{Global, Module},
     register::{Register, VirtualReg},
     types::{MirType, ScalarType},
@@ -425,4 +425,137 @@ fn switch_takes_matching_case_or_default() {
     assert_eq!(switch_on(1), 10);
     assert_eq!(switch_on(-70000), 20);
     assert_eq!(switch_on(5), 30);
+}
+
+fn looping_sum(name: &str, limit: i64) -> Function {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(0),
+        src: imm(0),
+    });
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(1),
+        src: imm(0),
+    });
+    entry.push(Instruction::Jmp {
+        target: "head".to_string(),
+    });
+    let mut head = Block::new("head");
+    head.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(0),
+        lhs: reg(0),
+        rhs: reg(1),
+    });
+    head.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(1),
+        lhs: reg(1),
+        rhs: imm(1),
+    });
+    head.push(Instruction::IntCmp {
+        op: IntCmpOp::SLt,
+        ty: I64,
+        dst: v(2),
+        lhs: reg(1),
+        rhs: imm(limit),
+    });
+    head.push(Instruction::Br {
+        cond: v(2),
+        true_target: "head".to_string(),
+        false_target: "done".to_string(),
+    });
+    let mut done = Block::new("done");
+    done.push(Instruction::Ret {
+        value: Some(reg(0)),
+    });
+    let mut function = Function::new(Signature::new(name).with_return(I64));
+    function.add_block(entry);
+    function.add_block(head);
+    function.add_block(done);
+    function
+}
+
+#[test]
+fn hot_values_survive_a_call_that_uses_the_same_registers() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(0),
+        src: imm(1000),
+    });
+    entry.push(Instruction::Jmp {
+        target: "again".to_string(),
+    });
+    let mut again = Block::new("again");
+    again.push(Instruction::Call {
+        name: "inner".to_string(),
+        args: Vec::new(),
+        ret: Some(v(1)),
+    });
+    again.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(0),
+        lhs: reg(0),
+        rhs: reg(1),
+    });
+    again.push(Instruction::IntCmp {
+        op: IntCmpOp::SLt,
+        ty: I64,
+        dst: v(2),
+        lhs: reg(0),
+        rhs: imm(1100),
+    });
+    again.push(Instruction::Br {
+        cond: v(2),
+        true_target: "again".to_string(),
+        false_target: "out".to_string(),
+    });
+    let mut out = Block::new("out");
+    out.push(Instruction::Ret {
+        value: Some(reg(0)),
+    });
+    let mut outer = Function::new(Signature::new("outer").with_return(I64));
+    outer.add_block(entry);
+    outer.add_block(again);
+    outer.add_block(out);
+    // inner adds 0..5 = 10, so the loop lands on 1100
+    let module = module_of(vec![outer, looping_sum("inner", 5)]);
+    assert_eq!(run(&module, "outer"), 1100);
+}
+
+#[test]
+fn narrow_value_in_a_register_reads_at_its_width() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(0),
+        src: imm(0x1_0000_0005),
+    });
+    entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: MirType::Scalar(ScalarType::I32),
+        dst: v(1),
+        lhs: reg(0),
+        rhs: imm(-10),
+    });
+    entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: MirType::Scalar(ScalarType::I32),
+        dst: v(2),
+        lhs: reg(1),
+        rhs: reg(1),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(2)),
+    });
+    let mut function =
+        Function::new(Signature::new("narrow").with_return(MirType::Scalar(ScalarType::I32)));
+    function.add_block(entry);
+    assert_eq!(run(&module_of(vec![function]), "narrow") as i32, -10);
 }
