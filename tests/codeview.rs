@@ -414,7 +414,7 @@ fn the_source_file_is_named_by_a_path_a_debugger_can_open() {
     let path = name_at(&strings, 1);
     assert!(path.ends_with("shapes.lamina"), "{path}");
     assert!(
-        path.starts_with('/'),
+        std::path::Path::new(&path).is_absolute(),
         "CodeView has no compilation directory, so the path has to be absolute: {path}"
     );
 }
