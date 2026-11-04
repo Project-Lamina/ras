@@ -20,8 +20,8 @@ use crate::{
     },
     error::RasError,
     object::{
-        ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest, ObjectWriter,
-        X86_64_SECREL32, object_writer_for_os,
+        COFF_IMGREL32, ExternalReloc, ObjectSymbol, ObjectWriteOptions, ObjectWriteRequest,
+        ObjectWriter, X86_64_SECREL32, object_writer_for_os,
     },
     parser::{AssemblyParser, DataExpression, Line, parse_data_expression},
     target::{ObjectFormat, object_format_for_os, unsupported_target_hint},
@@ -1781,6 +1781,13 @@ impl RasAssembler {
                                 }
                             };
                             (name.to_string(), kind)
+                        } else if let Some(name) = symbol.strip_suffix("@IMGREL") {
+                            if *width != 4 {
+                                return Err(RasError::EncodingError(
+                                    "an image-relative address needs a 4-byte field".into(),
+                                ));
+                            }
+                            (name.to_string(), COFF_IMGREL32)
                         } else {
                             let kind = match (arch, width) {
                                 (TargetArchitecture::X86_64, 1) => 14,

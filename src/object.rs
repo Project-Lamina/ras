@@ -398,8 +398,20 @@ impl ElfWriter {
     }
 }
 
+/// Only COFF has an image base to be relative to.
+fn refuse_image_relative(req: &ObjectWriteRequest<'_>, format: &str) -> Result<(), RasError> {
+    match req.relocations.iter().find(|r| r.kind == COFF_IMGREL32) {
+        Some(r) => Err(RasError::ObjectError(format!(
+            "image-relative address of {} is only supported in COFF objects, not {format}",
+            r.symbol
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl ObjectWriter for ElfWriter {
     fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+        refuse_image_relative(req, "ELF")?;
         if req.target_arch == TargetArchitecture::X86_64
             && let Some(r) = req.relocations.iter().find(|r| r.kind == X86_64_SECREL32)
         {
@@ -1641,6 +1653,7 @@ impl MachOWriter {
 
 impl ObjectWriter for MachOWriter {
     fn object_bytes(&mut self, req: &ObjectWriteRequest<'_>) -> Result<Vec<u8>, RasError> {
+        refuse_image_relative(req, "Mach-O")?;
         macho_object_bytes(req)
     }
 }
@@ -1652,6 +1665,8 @@ pub(crate) const X86_64_SECREL32: u32 = 270;
 /// real relocation of every architecture this writer serves so they cannot collide.
 pub(crate) const COFF_SECREL32: u32 = 0x1000_0001;
 pub(crate) const COFF_SECTION: u32 = 0x1000_0002;
+/// An address relative to the image base, which `.rva` and `@IMGREL` ask for.
+pub(crate) const COFF_IMGREL32: u32 = 0x1000_0003;
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
@@ -1676,6 +1691,7 @@ const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
 /// `IMAGE_REL_AMD64_SREL32`, and a test suite that spelled it symbolically agreed.
 const IMAGE_REL_AMD64_ADDR64: u16 = 1;
 const IMAGE_REL_AMD64_ADDR32: u16 = 2;
+const IMAGE_REL_AMD64_ADDR32NB: u16 = 3;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
 const IMAGE_REL_AMD64_SECREL: u16 = 0x000B;
 const IMAGE_REL_AMD64_SECTION: u16 = 0x000A;
@@ -1683,6 +1699,7 @@ const IMAGE_REL_AMD64_SECTION: u16 = 0x000A;
 /// Type indicators from the Microsoft PE/COFF specification, "COFF Relocations", ARM64
 /// processors. `IMAGE_REL_ARM64_ADDR64` is genuinely `0x000E` on this machine type.
 const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
+const IMAGE_REL_ARM64_ADDR32NB: u16 = 0x0002;
 const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
 const IMAGE_REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
 const IMAGE_REL_ARM64_PAGEOFFSET_12A: u16 = 0x0006;
@@ -1735,6 +1752,7 @@ fn coff_reloc_type(kind: u32, symbol: &str) -> Result<(u16, usize), RasError> {
         10 | 11 => Ok((IMAGE_REL_AMD64_ADDR32, 4)),
         X86_64_SECREL32 | COFF_SECREL32 => Ok((IMAGE_REL_AMD64_SECREL, 4)),
         COFF_SECTION => Ok((IMAGE_REL_AMD64_SECTION, 2)),
+        COFF_IMGREL32 => Ok((IMAGE_REL_AMD64_ADDR32NB, 4)),
         12 | 14 => Err(RasError::ObjectError(format!(
             "x86_64 relocation kind {kind} for {symbol} has no COFF equivalent"
         ))),
@@ -1784,6 +1802,7 @@ fn coff_arm64_reloc_type(
     let (ty, addend_place) = match kind {
         COFF_SECREL32 => (IMAGE_REL_ARM64_SECREL, CoffAddend::Field(4)),
         COFF_SECTION => (IMAGE_REL_ARM64_SECTION, CoffAddend::Field(2)),
+        COFF_IMGREL32 => (IMAGE_REL_ARM64_ADDR32NB, CoffAddend::Field(4)),
         257 => (IMAGE_REL_ARM64_ADDR64, CoffAddend::Field(8)),
         258 => (IMAGE_REL_ARM64_ADDR32, CoffAddend::Field(4)),
         275 => (IMAGE_REL_ARM64_PAGEBASE_REL21, CoffAddend::Instruction),
