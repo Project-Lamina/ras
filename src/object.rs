@@ -3690,4 +3690,33 @@ mod tests {
         assert_eq!(relocs[1].2, 0);
         assert_eq!(relocs[1].5, X86_64_RELOC_UNSIGNED);
     }
+
+    /// `__LD,__compact_unwind` is a regular section the linker reads and does not copy, so
+    /// it carries S_ATTR_DEBUG and a pointer relocation on each entry's function address.
+    #[test]
+    fn macho_compact_unwind_is_a_debug_section_with_pointer_relocations() {
+        let source = ".text\n_f:\nret\nLend:\n.section __LD,__compact_unwind,regular,debug\n.p2align 3\n.quad _f\n.long Lend-_f\n.long 16777216\n.quad 0\n.quad 0\n";
+        let mut ras =
+            crate::Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::MacOS).expect("ras");
+        let buf = ras.assemble_to_bytes(source).expect("assemble");
+
+        let index = (0..le32(&buf, 32 + 64) as usize)
+            .find(|&i| macho_section_name(&buf, i) == "__compact_unwind")
+            .expect("compact unwind section");
+        let header = macho_section_header(index);
+        assert_eq!(le32(&buf, header + 64), 0x0200_0000, "S_ATTR_DEBUG");
+        assert_eq!(le32(&buf, header + 52), 3, "eight-byte alignment");
+        let bytes = macho_section_bytes(&buf, index);
+        assert_eq!(bytes.len(), 32, "one entry");
+        assert_eq!(le32(bytes, 8), 1, "the assembler measured the length");
+        assert_eq!(le32(bytes, 12), 0x0100_0000, "the encoding is stored");
+        assert_eq!(&bytes[16..32], &[0u8; 16], "no personality and no LSDA");
+
+        let relocs = macho_reloc_fields(&buf, index);
+        assert_eq!(relocs.len(), 1, "only the function address relocates");
+        assert_eq!(relocs[0].0, 0);
+        assert_eq!(relocs[0].3, 3, "8-byte length");
+        assert_eq!(relocs[0].2, 0, "not pc-relative");
+        assert_eq!(relocs[0].5, X86_64_RELOC_UNSIGNED);
+    }
 }

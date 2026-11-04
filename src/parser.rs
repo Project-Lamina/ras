@@ -1213,6 +1213,7 @@ fn macho_section_type(fields: &[String]) -> Result<MachOSectionType, RasError> {
         attributes |= match attribute {
             "pure_instructions" => 0x8000_0000,
             "some_instructions" => 0x0000_0400,
+            "debug" => 0x0200_0000,
             other => {
                 return Err(RasError::ParseError(format!(
                     "unsupported Mach-O section attribute {other}"
@@ -1572,8 +1573,19 @@ mod tests {
         };
         assert!(err(".section __DATA,__bss,regular").contains("built in"));
         assert!(
-            err(".section __TEXT,__text,regular,some_instructions+pure_instructions+debug")
+            err(".section __TEXT,__text,regular,some_instructions+live_support")
                 .contains("attribute")
+        );
+        assert_eq!(
+            macho_parse(".section __LD,__compact_unwind,regular,debug")
+                .expect("compact unwind section")
+                .sections
+                .iter()
+                .find(|s| s.name == "__LD,__compact_unwind")
+                .and_then(|s| s.macho)
+                .map(|m| m.attributes),
+            Some(0x0200_0000),
+            "S_ATTR_DEBUG"
         );
         assert!(err(".section __DATA,__x,bogus").contains("section type bogus"));
         assert!(err(".section __DATA,__x\n.section __DATA,__x,zerofill").contains("redeclared"));
