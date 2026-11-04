@@ -1246,6 +1246,14 @@ fn macho_section_type(fields: &[String]) -> Result<MachOSectionType, RasError> {
         "thread_local_regular" => 0x11,
         "thread_local_zerofill" => 0x12,
         "thread_local_variables" => 0x13,
+        "cstring_literals" => 0x2,
+        "4byte_literals" => 0x3,
+        "8byte_literals" => 0x4,
+        "literal_pointers" => 0x5,
+        "mod_init_funcs" => 0x9,
+        "mod_term_funcs" => 0xa,
+        "coalesced" => 0xb,
+        "16byte_literals" => 0xe,
         other => {
             return Err(RasError::ParseError(format!(
                 "unsupported Mach-O section type {other}"
