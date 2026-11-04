@@ -1189,6 +1189,21 @@ fn encode_mir_instruction_with_context(
             reg_alloc.free_scratch(dst_reg_str);
         }
         lamina_mir::Instruction::Call { name, args, ret } => {
+            if assembler.target_os == lamina_platform::TargetOperatingSystem::MacOS
+                && encode_macos_io(
+                    assembler,
+                    name,
+                    args,
+                    ret.as_ref(),
+                    stack_slots,
+                    reg_alloc,
+                    &mut code,
+                    stack_size,
+                )?
+            {
+                return Ok(code);
+            }
+
             let _abi = AArch64ABI::new(assembler.target_os);
 
             let arg_regs = AArch64ABI::ARG_REGISTERS;

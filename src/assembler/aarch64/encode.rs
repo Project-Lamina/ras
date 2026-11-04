@@ -366,6 +366,138 @@ pub(super) fn encode_ubfm64(rd: u8, rn: u8, immr: u8, imms: u8) -> Vec<u8> {
     w.to_le_bytes().to_vec()
 }
 
+/// Byte I/O builtins as raw Darwin syscalls, same sequences as the AOT backend.
+/// Returns false when `name` is not one of them.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_macos_io(
+    assembler: &mut RasAssembler,
+    name: &str,
+    args: &[Operand],
+    ret: Option<&Register>,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<bool, RasError> {
+    const SUB_SP_16: u32 = 0xD100_43FF;
+    const ADD_SP_16: u32 = 0x9100_43FF;
+    const MOV_X0_0: u32 = 0xD280_0000;
+    const MOV_X0_1: u32 = 0xD280_0020;
+    const MOV_X1_SP: u32 = 0x9100_03E1;
+    const MOV_X2_1: u32 = 0xD280_0022;
+    const MOV_X16_READ: u32 = 0xD280_0070;
+    const MOV_X16_WRITE: u32 = 0xD280_0090;
+    const SVC_0: u32 = 0xD400_0001;
+    const MOV_X9_NEG2: u32 = 0x9280_0029;
+    const MOV_X9_NEG1: u32 = 0x9280_0009;
+    const CSEL_X0_X9_X0_CS: u32 = 0x9A80_2120;
+    const CSEL_X0_X9_X0_EQ: u32 = 0x9A80_0120;
+    const CMP_X0_0: u32 = 0xF100_001F;
+    const DMB_SY: u32 = 0xD503_3FBF;
+    const STRB_W9_SP: u32 = 0x3900_03E9;
+    const LDRB_W9_SP: u32 = 0x3940_03E9;
+    const CSINV_X0_X0_XZR_CC: u32 = 0xDA9F_3000;
+    const SUBS_X0_X0_1: u32 = 0xF100_0400;
+    const CSEL_X9_X9_X0_EQ: u32 = 0x9A80_0129;
+    // skips x16, svc and the five result words
+    const CBZ_X2_OVER_READ: u32 = 0xB400_0102;
+
+    fn words(code: &mut Vec<u8>, list: &[u32]) {
+        for word in list {
+            code.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    let mut load = |op: &Operand, dst: u8, code: &mut Vec<u8>, reg_alloc: &mut _| {
+        materialize_operand(assembler, op, dst, stack_slots, reg_alloc, code, stack_size)
+    };
+
+    match (name, args) {
+        ("lamina.writebyte", [value]) => {
+            words(code, &[SUB_SP_16]);
+            load(value, 9, code, reg_alloc)?;
+            words(
+                code,
+                &[
+                    STRB_W9_SP,
+                    MOV_X0_1,
+                    MOV_X1_SP,
+                    MOV_X2_1,
+                    MOV_X16_WRITE,
+                    SVC_0,
+                    MOV_X9_NEG2,
+                    CSEL_X0_X9_X0_CS,
+                    DMB_SY,
+                ],
+            );
+            if let Some(dst) = ret {
+                store_to_slot(code, "x0", dst, stack_slots)?;
+            }
+            words(code, &[ADD_SP_16]);
+        }
+        ("lamina.readbyte", []) => {
+            words(
+                code,
+                &[
+                    SUB_SP_16,
+                    MOV_X0_0,
+                    MOV_X1_SP,
+                    MOV_X2_1,
+                    MOV_X16_READ,
+                    SVC_0,
+                    CSINV_X0_X0_XZR_CC,
+                ],
+            );
+            if let Some(dst) = ret {
+                words(code, &[LDRB_W9_SP, SUBS_X0_X0_1, CSEL_X9_X9_X0_EQ]);
+                store_to_slot(code, "x9", dst, stack_slots)?;
+            }
+            words(code, &[ADD_SP_16]);
+        }
+        ("lamina.write", [pointer, length]) => {
+            load(pointer, 1, code, reg_alloc)?;
+            load(length, 2, code, reg_alloc)?;
+            words(
+                code,
+                &[
+                    MOV_X0_1,
+                    MOV_X16_WRITE,
+                    SVC_0,
+                    MOV_X9_NEG2,
+                    CSEL_X0_X9_X0_CS,
+                ],
+            );
+            if let Some(dst) = ret {
+                store_to_slot(code, "x0", dst, stack_slots)?;
+            }
+        }
+        ("lamina.read", [pointer, length]) => {
+            load(pointer, 1, code, reg_alloc)?;
+            load(length, 2, code, reg_alloc)?;
+            words(
+                code,
+                &[
+                    MOV_X0_0,
+                    CBZ_X2_OVER_READ,
+                    MOV_X16_READ,
+                    SVC_0,
+                    MOV_X9_NEG2,
+                    CSEL_X0_X9_X0_CS,
+                    CMP_X0_0,
+                    MOV_X9_NEG1,
+                    CSEL_X0_X9_X0_EQ,
+                ],
+            );
+            if let Some(dst) = ret {
+                store_to_slot(code, "x0", dst, stack_slots)?;
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {

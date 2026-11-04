@@ -267,3 +267,20 @@ fn int_convert_extends_and_truncates() {
         -128
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn writebyte_reports_one_byte_written() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Call {
+        name: "lamina.writebyte".to_string(),
+        args: vec![imm(10)],
+        ret: Some(v(0)),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(0)),
+    });
+    let mut function = Function::new(Signature::new("write").with_return(I64));
+    function.add_block(entry);
+    assert_eq!(run(&module_of(vec![function]), "write"), 1);
+}
