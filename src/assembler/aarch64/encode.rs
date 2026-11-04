@@ -598,6 +598,77 @@ pub(super) fn resolve_symbol(assembler: &mut RasAssembler, name: &str) -> Result
         .ok_or_else(|| RasError::EncodingError(format!("{symbol} not resolved")))
 }
 
+/// Give every global in the module storage and note its address next to the C symbols.
+///
+/// Compiled code holds these addresses and `ExecutableMemory` only owns the code, so
+/// the storage is leaked. It lasts as long as the process, like a linked program's data.
+#[cfg(feature = "encoder")]
+pub(super) fn allocate_globals(
+    assembler: &mut RasAssembler,
+    module: &lamina_mir::Module,
+) -> Result<(), RasError> {
+    let mut placed = Vec::with_capacity(module.globals.len());
+    for (name, global) in &module.globals {
+        if global.thread_local.is_some() {
+            return Err(RasError::EncodingError(format!(
+                "AArch64 JIT: thread-local global ${name} not supported"
+            )));
+        }
+        let size = global.size.max(1);
+        let layout = std::alloc::Layout::from_size_align(size, global.align.max(1))
+            .map_err(|e| RasError::EncodingError(format!("global ${name}: {e}")))?;
+        // SAFETY: the layout has a non-zero size.
+        let storage = unsafe { std::alloc::alloc_zeroed(layout) };
+        if storage.is_null() {
+            return Err(RasError::EncodingError(format!(
+                "AArch64 JIT: cannot allocate global ${name}"
+            )));
+        }
+        // SAFETY: fresh allocation of `size` bytes, never freed.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(storage, size) };
+        if let Some(initializer) = &global.initializer {
+            let Some(target) = bytes.get_mut(..initializer.len()) else {
+                return Err(RasError::EncodingError(format!(
+                    "AArch64 JIT: initializer of ${name} is larger than the global"
+                )));
+            };
+            target.copy_from_slice(initializer);
+        }
+        assembler
+            .function_pointers
+            .insert(name.clone(), storage as u64);
+        placed.push((global, bytes));
+    }
+    for (global, bytes) in placed {
+        for relocation in &global.relocations {
+            if module
+                .functions
+                .get(&relocation.symbol)
+                .is_some_and(|f| !f.blocks.is_empty())
+            {
+                return Err(RasError::EncodingError(format!(
+                    "AArch64 JIT: ${} holds the address of function @{}, not supported",
+                    global.name, relocation.symbol
+                )));
+            }
+            let address = resolve_symbol(assembler, &relocation.symbol)?;
+            let value = address.wrapping_add(relocation.addend as u64).to_le_bytes();
+            let slot = bytes
+                .get_mut(relocation.offset..relocation.offset + relocation.size)
+                .filter(|slot| slot.len() <= value.len())
+                .ok_or_else(|| {
+                    RasError::EncodingError(format!(
+                        "AArch64 JIT: bad relocation in ${}",
+                        global.name
+                    ))
+                })?;
+            let width = slot.len();
+            slot.copy_from_slice(&value[..width]);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {

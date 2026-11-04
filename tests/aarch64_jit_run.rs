@@ -5,11 +5,11 @@ use lamina_mir::{
     block::Block,
     function::{Function, Parameter, Signature},
     instruction::{AddressMode, Immediate, Instruction, IntBinOp, MemoryAttrs, Operand},
-    module::Module,
+    module::{Global, Module},
     register::{Register, VirtualReg},
     types::{MirType, ScalarType},
 };
-use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+use lamina_platform::{PointerWidth, TargetArchitecture, TargetOperatingSystem};
 use ras::{ExecutableMemory, RasAssembler};
 
 const I64: MirType = MirType::Scalar(ScalarType::I64);
@@ -350,4 +350,48 @@ fn extern_narrow_return_ignores_upper_bits() {
     let mut main = Function::new(Signature::new("main").with_return(I64));
     main.add_block(entry);
     assert_eq!(run(&module_of(vec![abs, main]), "main"), 7);
+}
+
+#[test]
+fn global_reads_initializer_and_keeps_stores() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::SymbolAddress {
+        dst: v(1),
+        symbol: "counter".to_string(),
+    });
+    entry.push(Instruction::Load {
+        ty: I64,
+        dst: v(2),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(3),
+        lhs: reg(2),
+        rhs: imm(2),
+    });
+    entry.push(Instruction::Store {
+        ty: I64,
+        src: reg(3),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::Load {
+        ty: I64,
+        dst: v(4),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(4)),
+    });
+    let mut function = Function::new(Signature::new("bump").with_return(I64));
+    function.add_block(entry);
+    let mut module = module_of(vec![function]);
+    let global = Global::new("counter", I64, PointerWidth::Bits64)
+        .with_initializer(40i64.to_le_bytes().to_vec());
+    module.globals.insert("counter".to_string(), global);
+    assert_eq!(run(&module, "bump"), 42);
 }

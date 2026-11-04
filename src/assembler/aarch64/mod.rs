@@ -37,6 +37,7 @@ pub fn compile_mir_aarch64_function(
     _function_name: Option<&str>,
 ) -> Result<(Vec<u8>, std::collections::HashMap<String, usize>), RasError> {
     let _abi = AArch64ABI::new(assembler.target_os);
+    allocate_globals(assembler, module)?;
     let mut code = Vec::new();
     let mut function_offsets: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -1496,6 +1497,32 @@ fn encode_mir_instruction_with_context(
                 let top_bit = (to_bytes * 8 - 1) as u8;
                 code.extend_from_slice(&encode_sbfm64(tmp_reg, tmp_reg, 0, top_bit));
             }
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
+        lamina_mir::Instruction::SymbolAddress { dst, symbol } => {
+            let address = match assembler.function_pointers.get(symbol.as_str()) {
+                Some(address) => *address,
+                None => {
+                    if function_offsets.contains_key(symbol) {
+                        return Err(RasError::EncodingError(format!(
+                            "AArch64 JIT: address of function @{} not supported",
+                            symbol
+                        )));
+                    }
+                    resolve_symbol(assembler, symbol)?
+                }
+            };
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            materialize_operand(
+                assembler,
+                &Operand::Immediate(Immediate::I64(address as i64)),
+                parse_register(tmp)?,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
             store_to_slot(&mut code, tmp, dst, stack_slots)?;
             reg_alloc.free_scratch(tmp);
         }
