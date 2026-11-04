@@ -18,6 +18,8 @@ pub struct ObjectWriteOptions {
     pub keep_locals: bool,
     /// Compile unit name used when the source declares no `.file` entry.
     pub dwarf_decl_file_name: String,
+    /// Name CodeView's `S_OBJNAME` gives this object.
+    pub debug_object_name: String,
     /// Symbols that define a function. Each is emitted as `STT_FUNC` with the byte
     /// length of its code, independently of whether debug info is requested.
     pub function_symbols: Vec<String>,
@@ -32,6 +34,7 @@ impl Default for ObjectWriteOptions {
             emit_minimal_dwarf_sections: false,
             keep_locals: false,
             dwarf_decl_file_name: "lamina.s".to_string(),
+            debug_object_name: "lamina.obj".to_string(),
             function_symbols: Vec::new(),
             debug_info: None,
         }
@@ -1644,6 +1647,12 @@ impl ObjectWriter for MachOWriter {
 
 pub(crate) const X86_64_SECREL32: u32 = 270;
 
+/// Fixup kinds CodeView needs that no ELF relocation number names: the offset of a
+/// symbol within its section, and that section's one-based index. Numbered above every
+/// real relocation of every architecture this writer serves so they cannot collide.
+pub(crate) const COFF_SECREL32: u32 = 0x1000_0001;
+pub(crate) const COFF_SECTION: u32 = 0x1000_0002;
+
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -1669,6 +1678,7 @@ const IMAGE_REL_AMD64_ADDR64: u16 = 1;
 const IMAGE_REL_AMD64_ADDR32: u16 = 2;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
 const IMAGE_REL_AMD64_SECREL: u16 = 0x000B;
+const IMAGE_REL_AMD64_SECTION: u16 = 0x000A;
 
 /// Type indicators from the Microsoft PE/COFF specification, "COFF Relocations", ARM64
 /// processors. `IMAGE_REL_ARM64_ADDR64` is genuinely `0x000E` on this machine type.
@@ -1680,6 +1690,8 @@ const IMAGE_REL_ARM64_PAGEOFFSET_12L: u16 = 0x0007;
 const IMAGE_REL_ARM64_ADDR64: u16 = 0x000E;
 const IMAGE_REL_ARM64_BRANCH19: u16 = 0x000F;
 const IMAGE_REL_ARM64_BRANCH14: u16 = 0x0010;
+const IMAGE_REL_ARM64_SECREL: u16 = 0x0008;
+const IMAGE_REL_ARM64_SECTION: u16 = 0x0013;
 
 const COFF_SECTION_HEADER_SIZE: usize = 40;
 const COFF_SYMBOL_SIZE: usize = 18;
@@ -1721,7 +1733,8 @@ fn coff_reloc_type(kind: u32, symbol: &str) -> Result<(u16, usize), RasError> {
     match kind {
         1 => Ok((IMAGE_REL_AMD64_ADDR64, 8)),
         10 | 11 => Ok((IMAGE_REL_AMD64_ADDR32, 4)),
-        X86_64_SECREL32 => Ok((IMAGE_REL_AMD64_SECREL, 4)),
+        X86_64_SECREL32 | COFF_SECREL32 => Ok((IMAGE_REL_AMD64_SECREL, 4)),
+        COFF_SECTION => Ok((IMAGE_REL_AMD64_SECTION, 2)),
         12 | 14 => Err(RasError::ObjectError(format!(
             "x86_64 relocation kind {kind} for {symbol} has no COFF equivalent"
         ))),
@@ -1769,6 +1782,8 @@ fn coff_arm64_reloc_type(
     addend: i64,
 ) -> Result<(u16, CoffAddend), RasError> {
     let (ty, addend_place) = match kind {
+        COFF_SECREL32 => (IMAGE_REL_ARM64_SECREL, CoffAddend::Field(4)),
+        COFF_SECTION => (IMAGE_REL_ARM64_SECTION, CoffAddend::Field(2)),
         257 => (IMAGE_REL_ARM64_ADDR64, CoffAddend::Field(8)),
         258 => (IMAGE_REL_ARM64_ADDR32, CoffAddend::Field(4)),
         275 => (IMAGE_REL_ARM64_PAGEBASE_REL21, CoffAddend::Instruction),
@@ -2169,10 +2184,10 @@ impl ObjectWriter for CoffWriter {
                     ))
                 })?;
             if let CoffAddend::Field(width) = addend_place {
-                let implicit = if width == 4 {
-                    i32::from_le_bytes(bytes.try_into().unwrap()) as i64
-                } else {
-                    i64::from_le_bytes(bytes.try_into().unwrap())
+                let implicit = match width {
+                    2 => i64::from(i16::from_le_bytes(bytes.try_into().unwrap())),
+                    4 => i64::from(i32::from_le_bytes(bytes.try_into().unwrap())),
+                    _ => i64::from_le_bytes(bytes.try_into().unwrap()),
                 };
                 let adjust = if x86 && ty == IMAGE_REL_AMD64_REL32 {
                     4
