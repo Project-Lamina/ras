@@ -147,7 +147,22 @@ fn register_offset_loads_match_clang_bytes() {
         \tldr s0, [x2, w3, sxtw #2]\n\
         \tldr q0, [x2, x3, lsl #4]\n\
         \tldr x1, [x2, #16]\n";
-    let guard = TempDir::new("ras-register-offset");
+    assert_matches_clang("ras-register-offset", source);
+}
+
+#[test]
+fn fmov_constants_match_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tfmov d0, #1.00000000\n\
+        \tfmov d1, #2.00000000\n\
+        \tfmov s2, #-0.5\n\
+        \tfmov d3, #31.0\n\
+        \tfmov s4, #0.125\n";
+    assert_matches_clang("ras-fmov-constant", source);
+}
+
+fn assert_matches_clang(tag: &str, source: &str) {
+    let guard = TempDir::new(tag);
     let dir = guard.path();
     let input = dir.join("input.s");
     fs::write(&input, source).expect("write assembly");
@@ -173,4 +188,34 @@ fn register_offset_loads_match_clang_bytes() {
         .expect("run clang");
     assert!(reference.status.success());
     assert_eq!(text_words(&ras_object), text_words(&clang_object));
+}
+
+#[test]
+fn zerofill_defines_zeroed_symbol_and_returns_to_section() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        .zerofill __DATA,__bss,_slot,16,3\n\
+        \t.globl _main\n\
+        \t.p2align 2\n\
+        _main:\n\
+        \tadrp x8, _slot@PAGE\n\
+        \tldr x0, [x8, _slot@PAGEOFF]\n\
+        \tadd x0, x0, #9\n\
+        \tret\n";
+    assert_eq!(exit_code("ras-zerofill", source), 9);
+}
+
+#[test]
+fn assignment_names_an_absolute_value() {
+    let source = "SIZE = 42\n\
+        \t.globl _main\n\
+        \t.p2align 2\n\
+        _main:\n\
+        \tadrp x8, _value@PAGE\n\
+        \tldr w0, [x8, _value@PAGEOFF]\n\
+        \tret\n\
+        \t.section __DATA,__data\n\
+        \t.p2align 2\n\
+        _value:\n\
+        \t.long SIZE\n";
+    assert_eq!(exit_code("ras-assignment", source), 42);
 }

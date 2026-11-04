@@ -232,6 +232,17 @@ impl AssemblyParser {
                 }
             }
 
+            // clang on Darwin names its DWARF lengths with `Lset0 = a-b`.
+            if self.darwin
+                && let Some((name, expression)) = line.split_once('=')
+                && !name.trim().contains(char::is_whitespace)
+            {
+                parse_data_expression(expression.trim())?;
+                self.aliases
+                    .push((symbol_name(name.trim())?.into(), expression.trim().into()));
+                continue;
+            }
+
             if line.starts_with('.') {
                 self.parse_directive(line)?;
             } else {
@@ -458,6 +469,23 @@ impl AssemblyParser {
                 parse_data_expression(expression.trim())?;
                 self.aliases
                     .push((symbol_name(name.trim())?.into(), expression.trim().into()));
+            }
+            ".zerofill" => {
+                // .zerofill segment,section[,symbol,size[,align]]
+                let fields: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
+                let [segment, section, rest @ ..] = fields.as_slice() else {
+                    return Err(RasError::ParseError("Invalid .zerofill operands".into()));
+                };
+                if let [symbol, size, align @ ..] = rest {
+                    let resume = self.current_section.clone();
+                    self.parse_directive(&format!(".section {segment},{section},zerofill"))?;
+                    if let [align] = align {
+                        self.parse_directive(&format!(".p2align {align}"))?;
+                    }
+                    self.parse_line_label(symbol)?;
+                    self.parse_directive(&format!(".zero {size}"))?;
+                    self.switch_back_to(resume);
+                }
             }
             ".comm" => {
                 let fields: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
@@ -917,6 +945,28 @@ impl AssemblyParser {
             }
         }
 
+        Ok(())
+    }
+
+    fn switch_back_to(&mut self, section: String) {
+        self.current_section = section.clone();
+        self.lines.push(Line::Section(section));
+    }
+
+    fn parse_line_label(&mut self, label: &str) -> Result<(), RasError> {
+        if !self.symbol_names.insert(label.to_string()) {
+            return Err(RasError::ParseError(format!(
+                "Symbol already defined: {label}"
+            )));
+        }
+        let global = self.pending_globals.remove(label);
+        let sym = Symbol {
+            name: label.to_string(),
+            global,
+            section: self.current_section.clone(),
+        };
+        self.symbols.push(sym.clone());
+        self.lines.push(Line::Label(sym));
         Ok(())
     }
 
