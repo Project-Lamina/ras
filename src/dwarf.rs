@@ -3,14 +3,18 @@
 //! Every address-sized field that names a section is emitted as a relocation
 //! against that section's symbol, so the linker can rebase the debug sections.
 
+pub use crate::debug::{
+    BaseType, DebugInfoRequest, DebugType, DeclSite, FormalParameter, Subprogram,
+};
 use crate::{
+    debug::{DebugSections, DebugSource, FunctionExtent, LocRow},
     error::RasError,
     object::ExternalReloc,
-    parser::{DebugFile, MachOSectionType, Section, SectionFlags},
+    parser::{MachOSectionType, Section, SectionFlags},
     target::ObjectFormat,
 };
 use lamina_platform::TargetArchitecture;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 const DW_TAG_COMPILE_UNIT: u64 = 0x11;
 const DW_TAG_FORMAL_PARAMETER: u64 = 0x05;
@@ -80,117 +84,15 @@ const LINE_RANGE: u8 = 14;
 const OPCODE_BASE: u8 = 13;
 const STANDARD_OPCODE_LENGTHS: [u8; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
 
-/// What the caller wants described in `.debug_info`, named in target-neutral terms.
-///
-/// A variable's location is deliberately absent: a backend that cannot say where a
-/// value lives after register allocation must leave it unsaid, and a debugger reads
-/// the silence as "optimized out". When backends can say, the location belongs on
-/// [`FormalParameter`] and on a `locals` list beside it, as a DWARF expression; the
-/// writer already gives every subprogram a `DW_AT_frame_base` for one to be relative to.
-#[derive(Debug, Clone, Default)]
-pub struct DebugInfoRequest {
-    /// Name and version of the producing compiler.
-    pub producer: Option<String>,
-    pub subprograms: Vec<Subprogram>,
-}
-
-/// One function. `name` is what a debugger shows; `symbol` is the label the object
-/// gives its code, for the platforms that spell the two differently — Mach-O's leading
-/// underscore. `None` means they agree. A function this object does not define is
-/// skipped rather than described without an address.
-#[derive(Debug, Clone)]
-pub struct Subprogram {
-    pub name: String,
-    pub symbol: Option<String>,
-    pub external: bool,
-    pub decl: Option<DeclSite>,
-    /// `None` for a function that returns nothing, or whose return type has no
-    /// description the writer can give honestly.
-    pub ret: Option<DebugType>,
-    pub params: Vec<FormalParameter>,
-    /// A trailing `...`, which the DWARF spells as unspecified parameters.
-    pub variadic: bool,
-}
-
-/// `file` is the number the source gave a `.file` directive, not the line table index.
-#[derive(Debug, Clone, Copy)]
-pub struct DeclSite {
-    pub file: u32,
-    pub line: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct FormalParameter {
-    pub name: Option<String>,
-    pub ty: Option<DebugType>,
-}
-
-/// A type a debugger can be told about without guessing. An aggregate whose members
-/// the caller cannot enumerate has no variant here on purpose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DebugType {
-    Base(BaseType),
-    /// A pointer to an unspecified type, which is all an untyped machine pointer is.
-    Pointer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BaseType {
-    Bool,
-    I8,
-    I16,
-    I32,
-    I64,
-    U8,
-    U16,
-    U32,
-    U64,
-    F32,
-    F64,
-}
-
-impl BaseType {
-    fn name(self) -> &'static str {
-        match self {
-            BaseType::Bool => "bool",
-            BaseType::I8 => "i8",
-            BaseType::I16 => "i16",
-            BaseType::I32 => "i32",
-            BaseType::I64 => "i64",
-            BaseType::U8 => "u8",
-            BaseType::U16 => "u16",
-            BaseType::U32 => "u32",
-            BaseType::U64 => "u64",
-            BaseType::F32 => "f32",
-            BaseType::F64 => "f64",
-        }
+/// DWARF's encoding attribute for a base type: how a debugger should interpret the
+/// bytes. DWARF 4 section 7.8, "Base type encodings".
+fn dwarf_encoding(base: BaseType) -> u64 {
+    match base {
+        BaseType::Bool => DW_ATE_BOOLEAN,
+        BaseType::I8 | BaseType::I16 | BaseType::I32 | BaseType::I64 => DW_ATE_SIGNED,
+        BaseType::U8 | BaseType::U16 | BaseType::U32 | BaseType::U64 => DW_ATE_UNSIGNED,
+        BaseType::F32 | BaseType::F64 => DW_ATE_FLOAT,
     }
-
-    fn byte_size(self) -> u8 {
-        match self {
-            BaseType::Bool | BaseType::I8 | BaseType::U8 => 1,
-            BaseType::I16 | BaseType::U16 => 2,
-            BaseType::I32 | BaseType::U32 | BaseType::F32 => 4,
-            BaseType::I64 | BaseType::U64 | BaseType::F64 => 8,
-        }
-    }
-
-    fn encoding(self) -> u64 {
-        match self {
-            BaseType::Bool => DW_ATE_BOOLEAN,
-            BaseType::I8 | BaseType::I16 | BaseType::I32 | BaseType::I64 => DW_ATE_SIGNED,
-            BaseType::U8 | BaseType::U16 | BaseType::U32 | BaseType::U64 => DW_ATE_UNSIGNED,
-            BaseType::F32 | BaseType::F64 => DW_ATE_FLOAT,
-        }
-    }
-}
-
-/// Where a function's code sits, resolved by the assembler after layout.
-#[derive(Debug, Clone)]
-pub(crate) struct FunctionExtent {
-    pub section: String,
-    pub start: u64,
-    pub length: u64,
 }
 
 /// The abbreviation table, interned as entries are needed. A DIE asks for the exact
@@ -241,20 +143,6 @@ impl Abbrevs {
     }
 }
 
-pub(crate) struct LocRow {
-    pub section: String,
-    pub offset: u64,
-    pub file: u32,
-    pub line: u32,
-    pub column: u32,
-    pub is_stmt: bool,
-}
-
-pub(crate) struct DebugSections {
-    pub sections: Vec<Section>,
-    pub relocs: Vec<ExternalReloc>,
-}
-
 fn absolute_kinds(arch: TargetArchitecture) -> Option<(u32, u32)> {
     match arch {
         TargetArchitecture::X86_64 => Some((1, 10)),
@@ -262,16 +150,6 @@ fn absolute_kinds(arch: TargetArchitecture) -> Option<(u32, u32)> {
         TargetArchitecture::Riscv64 => Some((2, 1)),
         _ => None,
     }
-}
-
-/// Everything the assembler resolved that the writer describes.
-pub(crate) struct DebugSource<'a> {
-    pub format: ObjectFormat,
-    pub sections: &'a [Section],
-    pub rows: &'a [LocRow],
-    pub files: &'a BTreeMap<u32, DebugFile>,
-    pub extents: &'a HashMap<String, FunctionExtent>,
-    pub request: Option<&'a DebugInfoRequest>,
 }
 
 pub(crate) fn build(
@@ -456,10 +334,7 @@ pub(crate) fn build(
             request
                 .subprograms
                 .iter()
-                .filter_map(|sub| {
-                    let symbol = sub.symbol.as_deref().unwrap_or(sub.name.as_str());
-                    Some((sub, extents.get(symbol)?))
-                })
+                .filter_map(|sub| Some((sub, extents.get(sub.object_symbol())?)))
                 .collect()
         })
         .unwrap_or_default();
@@ -544,7 +419,7 @@ pub(crate) fn build(
                 );
                 push_uleb(&mut info, code);
                 push_cstr(&mut info, base.name());
-                info.push(base.encoding() as u8);
+                info.push(dwarf_encoding(*base) as u8);
                 info.push(base.byte_size());
             }
             DebugType::Pointer => {

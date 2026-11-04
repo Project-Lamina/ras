@@ -5,6 +5,8 @@
 
 pub mod assembler;
 mod cfi;
+pub mod codeview;
+pub mod debug;
 pub mod dwarf;
 pub mod encoder;
 pub mod error;
@@ -16,7 +18,7 @@ pub mod target;
 mod test_support;
 
 pub use assembler::RasAssembler;
-pub use dwarf::{BaseType, DebugInfoRequest, DebugType, DeclSite, FormalParameter, Subprogram};
+pub use debug::{BaseType, DebugInfoRequest, DebugType, DeclSite, FormalParameter, Subprogram};
 pub use error::RasError;
 pub use object::ObjectWriteOptions;
 pub use runtime::{ExecutableMemory, RasRuntime};
