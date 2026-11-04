@@ -314,10 +314,59 @@ pub fn compile_mir_aarch64_function(
                         },
                     });
                 }
-                lamina_mir::Instruction::Switch { .. } => {
-                    return Err(RasError::EncodingError(
-                        "Switch terminator not yet supported by AArch64 JIT backend".to_string(),
-                    ));
+                lamina_mir::Instruction::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    let value_str = reg_alloc.alloc_scratch().unwrap_or("x9");
+                    let case_str = reg_alloc.alloc_scratch().unwrap_or("x10");
+                    let value_reg = parse_register(value_str)?;
+                    let case_reg = parse_register(case_str)?;
+                    materialize_operand(
+                        assembler,
+                        &lamina_mir::Operand::Register(value.clone()),
+                        value_reg,
+                        &stack_slots,
+                        &mut reg_alloc,
+                        &mut code,
+                        aligned_stack_size,
+                    )?;
+                    for (case_value, target) in cases {
+                        materialize_operand(
+                            assembler,
+                            &lamina_mir::Operand::Immediate(Immediate::I64(*case_value)),
+                            case_reg,
+                            &stack_slots,
+                            &mut reg_alloc,
+                            &mut code,
+                            aligned_stack_size,
+                        )?;
+                        // cmp value, case
+                        let cmp =
+                            0xEB00_001Fu32 | ((case_reg as u32) << 16) | ((value_reg as u32) << 5);
+                        code.extend_from_slice(&cmp.to_le_bytes());
+                        // b.ne over the branch below, B reaches further than B.cond
+                        code.extend_from_slice(&0x5400_0041u32.to_le_bytes());
+                        let patch_location = code.len();
+                        code.extend_from_slice(&0x1400_0000u32.to_le_bytes());
+                        branch_fixups.push(BranchFixup {
+                            patch_location,
+                            kind: BranchFixupKind::B {
+                                target: target.clone(),
+                            },
+                        });
+                    }
+                    reg_alloc.free_scratch(case_str);
+                    reg_alloc.free_scratch(value_str);
+                    let patch_location = code.len();
+                    code.extend_from_slice(&0x1400_0000u32.to_le_bytes());
+                    branch_fixups.push(BranchFixup {
+                        patch_location,
+                        kind: BranchFixupKind::B {
+                            target: default.clone(),
+                        },
+                    });
                 }
                 lamina_mir::Instruction::TailCall { name, args } => {
                     if name == "print" {

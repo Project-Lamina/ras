@@ -395,3 +395,34 @@ fn global_reads_initializer_and_keeps_stores() {
     module.globals.insert("counter".to_string(), global);
     assert_eq!(run(&module, "bump"), 42);
 }
+
+fn switch_on(value: i64) -> i64 {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(0),
+        src: imm(value),
+    });
+    entry.push(Instruction::Switch {
+        value: v(0),
+        cases: vec![(1, "one".to_string()), (-70000, "far".to_string())],
+        default: "other".to_string(),
+    });
+    let mut function = Function::new(Signature::new("switch").with_return(I64));
+    function.add_block(entry);
+    for (label, result) in [("one", 10), ("far", 20), ("other", 30)] {
+        let mut block = Block::new(label);
+        block.push(Instruction::Ret {
+            value: Some(imm(result)),
+        });
+        function.add_block(block);
+    }
+    run(&module_of(vec![function]), "switch")
+}
+
+#[test]
+fn switch_takes_matching_case_or_default() {
+    assert_eq!(switch_on(1), 10);
+    assert_eq!(switch_on(-70000), 20);
+    assert_eq!(switch_on(5), 30);
+}
