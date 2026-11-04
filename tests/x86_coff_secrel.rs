@@ -1,6 +1,7 @@
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
 
+const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
 const IMAGE_REL_AMD64_SECREL: u16 = 0x000b;
 const IMAGE_REL_AMD64_SREL32: u16 = 0x000e;
 
@@ -64,4 +65,39 @@ fn secrel32_emits_section_relative_type_not_srel32() {
     assert_eq!(relocs[0].0, 3);
     assert_eq!(relocs[1].0, 10);
     assert_eq!(relocs[1].2, 8);
+}
+
+#[test]
+fn rva_and_imgrel_emit_image_relative_addr32nb() {
+    let obj = assemble_windows(
+        ".text\n\
+         .globl f\n\
+         f:\n\
+             ret\n\
+         .Lend:\n\
+         .section .xdata,\"dr\"\n\
+         .Linfo:\n\
+             .long 0\n\
+         .section .pdata,\"dr\"\n\
+             .rva f, .Lend\n\
+             .long .Linfo@IMGREL\n",
+    );
+    let relocs = section_relocations(&obj, ".pdata");
+    assert_eq!(relocs.len(), 3, "{relocs:?}");
+    for (index, (offset, ty, _)) in relocs.iter().enumerate() {
+        assert_eq!(*ty, IMAGE_REL_AMD64_ADDR32NB, "{relocs:?}");
+        assert_eq!(*offset, 4 * index as u32, "{relocs:?}");
+    }
+}
+
+#[test]
+fn rva_is_refused_outside_coff() {
+    let error = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+        .unwrap()
+        .assemble_to_bytes(".text\n.globl f\nf:\n    ret\n.data\n    .rva f\n")
+        .expect_err("ELF has no image base");
+    assert!(
+        error.to_string().contains("only supported in COFF objects"),
+        "{error}"
+    );
 }

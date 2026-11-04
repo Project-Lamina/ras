@@ -161,6 +161,17 @@ fn an_absolute_pointer_becomes_addr64_with_the_addend_in_the_field() {
 }
 
 #[test]
+fn an_image_relative_address_becomes_addr32nb() {
+    let obj = object(".text\n.globl main\nmain:\n    ret\n.section .pdata,\"dr\"\n    .rva main\n");
+    let relocs = relocations(&obj);
+    assert_eq!(relocs.len(), 1);
+    assert_eq!(
+        (relocs[0].0.as_str(), relocs[0].2, relocs[0].3.as_str()),
+        (".pdata", 0x0002, "main")
+    );
+}
+
+#[test]
 fn instruction_relocations_leave_the_instruction_word_untouched() {
     let obj = object(".data\nmsg:\n    .byte 0\n.text\n.globl main\nmain:\n    adrp x0, msg\n");
     let text_header = (0..u16_at(&obj, 2) as usize)
