@@ -11,6 +11,9 @@ const LDR_SCALED_BASE: u32 = 0xF940_0000;
 const SUB_IMM_BASE: u32 = 0xD100_0000;
 // x17 is never a scratch in the JIT, x9 to x12 can hold live values here.
 const TEMP_RN: u32 = 17;
+const MOVZ_X_LSL16_BASE: u32 = 0xD2A0_0000;
+const MOVK_X_BASE: u32 = 0xF280_0000;
+const SUB_REG_BASE: u32 = 0xCB00_0000;
 
 /// Integer scalar load shape for JIT (GP registers only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +76,16 @@ fn str_scaled_base(kind: AArch64ScalarStKind) -> (u32, u32) {
     }
 }
 
+/// Point x17 at `rn - abs_offset`, for slots too far for an immediate `SUB`.
+fn far_base_below(code: &mut Vec<u8>, rn: u8, abs_offset: u32) {
+    let movz = MOVZ_X_LSL16_BASE | ((abs_offset >> 16) << 5) | TEMP_RN;
+    let movk = MOVK_X_BASE | ((abs_offset & 0xFFFF) << 5) | TEMP_RN;
+    let sub = SUB_REG_BASE | (TEMP_RN << 16) | ((rn as u32) << 5) | TEMP_RN;
+    code.extend_from_slice(&movz.to_le_bytes());
+    code.extend_from_slice(&movk.to_le_bytes());
+    code.extend_from_slice(&sub.to_le_bytes());
+}
+
 /// `LDUR` / scaled `LDR` / `SUB`+`LDUR` for scalar integer loads.
 pub fn encode_ldr_scalar(
     rt: u8,
@@ -101,13 +114,12 @@ pub fn encode_ldr_scalar(
     if offset < -256 {
         let abs_offset = (-offset) as u32;
         if abs_offset > 0xFFF {
-            return Err(RasError::EncodingError(format!(
-                "scalar LDR offset {} out of range",
-                offset
-            )));
+            far_base_below(&mut code, rn, abs_offset);
+        } else {
+            let sub_inst =
+                SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
+            code.extend_from_slice(&sub_inst.to_le_bytes());
         }
-        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
-        code.extend_from_slice(&sub_inst.to_le_bytes());
         let ldur = ldur_simm9_base(kind) | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&ldur.to_le_bytes());
         return Ok(code);
@@ -146,13 +158,12 @@ pub fn encode_str_scalar(
     if offset < -256 {
         let abs_offset = (-offset) as u32;
         if abs_offset > 0xFFF {
-            return Err(RasError::EncodingError(format!(
-                "scalar STR offset {} out of range",
-                offset
-            )));
+            far_base_below(&mut code, rn, abs_offset);
+        } else {
+            let sub_inst =
+                SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
+            code.extend_from_slice(&sub_inst.to_le_bytes());
         }
-        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
-        code.extend_from_slice(&sub_inst.to_le_bytes());
         let stur = stur_simm9_base(kind) | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&stur.to_le_bytes());
         return Ok(code);
@@ -181,13 +192,12 @@ pub fn encode_str_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
     if offset < -256 {
         let abs_offset = (-offset) as u32;
         if abs_offset > 0xFFF {
-            return Err(RasError::EncodingError(format!(
-                "STR offset {} out of range",
-                offset
-            )));
+            far_base_below(&mut code, rn, abs_offset);
+        } else {
+            let sub_inst =
+                SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
+            code.extend_from_slice(&sub_inst.to_le_bytes());
         }
-        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
-        code.extend_from_slice(&sub_inst.to_le_bytes());
         let stur = STUR_BASE | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&stur.to_le_bytes());
         return Ok(code);
@@ -216,13 +226,12 @@ pub fn encode_ldr_imm64(rt: u8, rn: u8, offset: i32) -> Result<Vec<u8>, RasError
     if offset < -256 {
         let abs_offset = (-offset) as u32;
         if abs_offset > 0xFFF {
-            return Err(RasError::EncodingError(format!(
-                "LDR offset {} out of range",
-                offset
-            )));
+            far_base_below(&mut code, rn, abs_offset);
+        } else {
+            let sub_inst =
+                SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
+            code.extend_from_slice(&sub_inst.to_le_bytes());
         }
-        let sub_inst = SUB_IMM_BASE | ((abs_offset & 0xFFF) << 10) | ((rn as u32) << 5) | TEMP_RN;
-        code.extend_from_slice(&sub_inst.to_le_bytes());
         let ldur = LDUR_BASE | (TEMP_RN << 5) | (rt as u32);
         code.extend_from_slice(&ldur.to_le_bytes());
         return Ok(code);

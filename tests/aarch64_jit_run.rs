@@ -131,3 +131,22 @@ fn stack_argument_lands_in_far_slot() {
 
     assert_eq!(run(&module_of(vec![callee, caller]), "caller"), 509);
 }
+
+#[test]
+fn frame_past_imm12_keeps_values() {
+    let mut entry = Block::new("entry");
+    fill_frame(&mut entry, 0..800);
+    entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(800),
+        lhs: reg(799),
+        rhs: reg(99),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(800)),
+    });
+    let mut function = Function::new(Signature::new("big").with_return(I64));
+    function.add_block(entry);
+    assert_eq!(run(&module_of(vec![function]), "big"), 898);
+}

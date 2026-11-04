@@ -10,6 +10,25 @@ use crate::encoder::aarch64::ldst_imm64::{
 use crate::error::RasError;
 use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
 
+/// `SUB`/`ADD` sp in up to two immediates: the low 12 bits and the next 12 shifted.
+fn adjust_sp(code: &mut Vec<u8>, size: usize, low: u32, high: u32) -> Result<(), RasError> {
+    if size > 0xFF_FFFF {
+        return Err(RasError::EncodingError(format!(
+            "Stack size {} too large for AArch64 JIT frame",
+            size
+        )));
+    }
+    if size >> 12 != 0 {
+        let inst = high | (((size >> 12) as u32) << 10);
+        code.extend_from_slice(&inst.to_le_bytes());
+    }
+    if size & 0xFFF != 0 {
+        let inst = low | (((size & 0xFFF) as u32) << 10);
+        code.extend_from_slice(&inst.to_le_bytes());
+    }
+    Ok(())
+}
+
 pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::new();
 
@@ -23,17 +42,7 @@ pub(super) fn encode_prologue(stack_size: usize) -> Result<Vec<u8>, RasError> {
     // The prologue already saved x29, x30 (16 bytes), maintaining alignment
     if stack_size > 0 {
         let aligned_size = (stack_size + 15) & !15;
-
-        if aligned_size > 0xFFF {
-            return Err(RasError::EncodingError(format!(
-                "Stack size {} (aligned: {}) too large for single SUB instruction",
-                stack_size, aligned_size
-            )));
-        }
-        // Encoding matches clang/llvm-mc:
-        //   sub sp, sp, #imm12  => 0xD10003FF | (imm12 << 10)
-        let sub_sp = 0xD100_03FFu32 | ((aligned_size as u32) << 10);
-        code.extend_from_slice(&sub_sp.to_le_bytes());
+        adjust_sp(&mut code, aligned_size, 0xD100_03FF, 0xD140_03FF)?;
     }
 
     Ok(code)
@@ -44,16 +53,7 @@ pub(super) fn encode_epilogue(aligned_stack_size: usize) -> Result<Vec<u8>, RasE
     let mut code = Vec::new();
 
     if aligned_stack_size > 0 {
-        if aligned_stack_size > 0xFFF {
-            return Err(RasError::EncodingError(format!(
-                "stack restore too large for single ADD: {}",
-                aligned_stack_size
-            )));
-        }
-        // Encoding matches clang/llvm-mc:
-        //   add sp, sp, #imm12  => 0x910003FF | (imm12 << 10)
-        let add_sp = 0x9100_03FFu32 | ((aligned_stack_size as u32) << 10);
-        code.extend_from_slice(&add_sp.to_le_bytes());
+        adjust_sp(&mut code, aligned_stack_size, 0x9100_03FF, 0x9140_03FF)?;
     }
 
     let ldp = enc_ldp_post_64(29, 30, 31, 16)?;
