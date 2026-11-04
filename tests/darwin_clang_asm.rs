@@ -83,3 +83,13 @@ fn darwin_exception_tables_are_refused_by_name() {
     let stderr = String::from_utf8_lossy(&assemble.stderr);
     assert!(stderr.contains("Mach-O exception tables"), "{stderr}");
 }
+
+#[test]
+fn darwin_semicolon_starts_a_comment() {
+    let source = "\t.globl _main ; -- Begin function main\n\
+        \t.p2align 2 ; -- Begin\n\
+        _main: ; @main\n\
+        \tmov w0, #7 ; =0x7\n\
+        \tret\n";
+    assert_eq!(exit_code("ras-darwin-semicolon", source), 7);
+}

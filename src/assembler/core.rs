@@ -325,6 +325,10 @@ impl RasAssembler {
         };
         let (asm_text, internal_prefix) = crate::cfi::lower(asm_text, self.target_arch)?;
         let comment_markers: &'static [&'static str] = match self.target_arch {
+            // clang on Darwin writes `;` comments, GAS elsewhere reads `;` as a separator.
+            TargetArchitecture::Aarch64 if self.target_os == TargetOperatingSystem::MacOS => {
+                &["//", ";"]
+            }
             TargetArchitecture::Aarch64 => &["//"],
             // `#` introduces an A32 immediate, so ARM comments start with `@`.
             TargetArchitecture::Armv7 => &["@", "//"],
