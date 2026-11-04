@@ -7,7 +7,9 @@
 #[cfg(feature = "nightly")]
 use crate::encoder::arx64::Arx64Encoder;
 use crate::{
-    dwarf::{self, FunctionExtent, LocRow},
+    codeview,
+    debug::{DebugSource, FunctionExtent, LocRow},
+    dwarf,
     encoder::{
         aarch64::AArch64Encoder,
         armv7::Armv7Encoder,
@@ -671,26 +673,35 @@ impl RasAssembler {
                 symbol.attributes.size = Some(extent.length.to_string());
             }
         }
-        if let Some(format @ (ObjectFormat::Elf | ObjectFormat::MachO)) =
-            object_format_for_os(self.target_os)
-        {
-            let debug = dwarf::build(
-                self.target_arch,
-                &dwarf::DebugSource {
+        let debug = match object_format_for_os(self.target_os) {
+            Some(format) => {
+                let source = DebugSource {
                     format,
                     sections: &sections,
                     rows: &loc_rows,
                     files: &parsed.files,
                     extents: &extents,
                     request: self.object_write_options.debug_info.as_ref(),
-                },
-                &self.object_write_options.dwarf_decl_file_name,
-                self.object_write_options.emit_minimal_dwarf_sections,
-            )?;
-            if let Some(debug) = debug {
-                sections.extend(debug.sections);
-                relocs.extend(debug.relocs);
+                };
+                match format {
+                    ObjectFormat::Elf | ObjectFormat::MachO => dwarf::build(
+                        self.target_arch,
+                        &source,
+                        &self.object_write_options.dwarf_decl_file_name,
+                        self.object_write_options.emit_minimal_dwarf_sections,
+                    )?,
+                    ObjectFormat::Coff => codeview::build(
+                        self.target_arch,
+                        &source,
+                        &self.object_write_options.debug_object_name,
+                    )?,
+                }
             }
+            None => None,
+        };
+        if let Some(debug) = debug {
+            sections.extend(debug.sections);
+            relocs.extend(debug.relocs);
         }
         if self.target_arch == TargetArchitecture::Armv7 && !parsed.arm_attributes.is_empty() {
             sections.push(crate::parser::Section {
