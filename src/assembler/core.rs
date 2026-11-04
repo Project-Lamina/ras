@@ -31,7 +31,8 @@ const R_386_32: u32 = 1;
 /// R_386_PC32 and R_X86_64_PC32: the two architectures number it alike.
 const R_X86_PC32: u32 = 2;
 const R_386_16: u32 = 20;
-const R_386_8: u32 = 23;
+/// Intel i386 psABI, relocation types: 22. 23 is `R_386_PC8`.
+const R_386_8: u32 = 22;
 const R_ARM_ABS32: u32 = 2;
 const R_ARM_REL32: u32 = 3;
 const R_ARM_CALL: u32 = 28;
@@ -2935,6 +2936,24 @@ fn absolute_expression(
 #[cfg(test)]
 mod layout_cache_tests {
     use super::*;
+
+    #[test]
+    fn relocation_types_are_the_values_the_psabis_give_them() {
+        assert_eq!(R_386_32, 1);
+        assert_eq!(R_X86_PC32, 2);
+        assert_eq!(R_386_16, 20);
+        assert_eq!(R_386_8, 22);
+        assert_eq!(R_ARM_ABS32, 2);
+        assert_eq!(R_ARM_REL32, 3);
+        assert_eq!(R_ARM_CALL, 28);
+        assert_eq!(R_ARM_JUMP24, 29);
+        assert_eq!(R_ARM_MOVW_ABS_NC, 43);
+        assert_eq!(R_ARM_MOVT_ABS, 44);
+        assert_eq!(R_X86_64_TPOFF32, 23);
+        assert_eq!(R_X86_64_TPOFF64, 18);
+        assert_eq!(R_X86_64_GOTTPOFF, 22);
+        assert_eq!(R_X86_64_REX_GOTPCRELX, 42);
+    }
 
     fn relaxation_source() -> String {
         let mut text = String::from("f:\n    jne .Lend\n");

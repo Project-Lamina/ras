@@ -1635,11 +1635,16 @@ const IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
 
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
 
+/// Type indicators from the Microsoft PE/COFF specification, "COFF Relocations", x64
+/// processors. `IMAGE_REL_AMD64_SECREL` was once `0x000E`, which is
+/// `IMAGE_REL_AMD64_SREL32`, and a test suite that spelled it symbolically agreed.
 const IMAGE_REL_AMD64_ADDR64: u16 = 1;
 const IMAGE_REL_AMD64_ADDR32: u16 = 2;
 const IMAGE_REL_AMD64_REL32: u16 = 4;
 const IMAGE_REL_AMD64_SECREL: u16 = 0x000B;
 
+/// Type indicators from the Microsoft PE/COFF specification, "COFF Relocations", ARM64
+/// processors. `IMAGE_REL_ARM64_ADDR64` is genuinely `0x000E` on this machine type.
 const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
 const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
 const IMAGE_REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
@@ -2246,6 +2251,45 @@ mod tests {
     use crate::test_support::TempDir;
 
     use super::*;
+
+    #[test]
+    fn test_amd64_relocation_types_are_the_values_the_pe_spec_gives_them() {
+        assert_eq!(IMAGE_REL_AMD64_ADDR64, 0x0001);
+        assert_eq!(IMAGE_REL_AMD64_ADDR32, 0x0002);
+        assert_eq!(IMAGE_REL_AMD64_REL32, 0x0004);
+        assert_eq!(IMAGE_REL_AMD64_SECREL, 0x000B);
+    }
+
+    #[test]
+    fn test_arm64_relocation_types_are_the_values_the_pe_spec_gives_them() {
+        assert_eq!(IMAGE_REL_ARM64_ADDR32, 0x0001);
+        assert_eq!(IMAGE_REL_ARM64_BRANCH26, 0x0003);
+        assert_eq!(IMAGE_REL_ARM64_PAGEBASE_REL21, 0x0004);
+        assert_eq!(IMAGE_REL_ARM64_PAGEOFFSET_12A, 0x0006);
+        assert_eq!(IMAGE_REL_ARM64_PAGEOFFSET_12L, 0x0007);
+        assert_eq!(IMAGE_REL_ARM64_ADDR64, 0x000E);
+        assert_eq!(IMAGE_REL_ARM64_BRANCH19, 0x000F);
+        assert_eq!(IMAGE_REL_ARM64_BRANCH14, 0x0010);
+    }
+
+    #[test]
+    fn test_i386_relocation_types_are_the_values_the_psabi_gives_them() {
+        assert_eq!(R_386_32, 1);
+        assert_eq!(R_386_PC32, 2);
+        assert_eq!(R_386_PLT32, 4);
+        assert_eq!(R_386_16, 20);
+        assert_eq!(R_386_8, 22);
+    }
+
+    #[test]
+    fn test_arm_relocation_types_are_the_values_the_psabi_gives_them() {
+        assert_eq!(R_ARM_ABS32, 2);
+        assert_eq!(R_ARM_REL32, 3);
+        assert_eq!(R_ARM_CALL, 28);
+        assert_eq!(R_ARM_JUMP24, 29);
+        assert_eq!(R_ARM_MOVW_ABS_NC, 43);
+        assert_eq!(R_ARM_MOVT_ABS, 44);
+    }
 
     #[test]
     fn test_elf64_x86_64_write() {
