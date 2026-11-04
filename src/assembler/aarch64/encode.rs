@@ -498,6 +498,46 @@ pub(super) fn encode_macos_io(
     Ok(true)
 }
 
+/// This encoder passes every value as one register word. Refuse what the AOT
+/// backend passes any other way, so the caller falls back instead of running bad code.
+#[cfg(feature = "encoder")]
+pub(super) fn reject_unmodelled_abi(func: &lamina_mir::Function) -> Result<(), RasError> {
+    let name = &func.sig.name;
+    let refuse = |what: &str| {
+        Err(RasError::EncodingError(format!(
+            "AArch64 JIT: @{name} has {what}, not supported"
+        )))
+    };
+    if func.sig.params.iter().any(|p| p.aggregate.is_some()) {
+        return refuse("an aggregate parameter");
+    }
+    if func.sig.ret_aggregate.is_some() || func.sig.sret_claimed {
+        return refuse("an aggregate return");
+    }
+    if !func.variadic_wide_arguments.is_empty() || !func.variadic_wide_results.is_empty() {
+        return refuse("a wide variadic value");
+    }
+    // A slot that is also a parameter or call result holds a value split over registers.
+    let mut slots = std::collections::HashSet::new();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let lamina_mir::Instruction::StackAddr { slot, .. } = &inst.instr {
+            slots.insert(*slot);
+        }
+    }
+    let is_slot = |reg: &Register| matches!(reg, Register::Virtual(v) if slots.contains(v));
+    if func.sig.params.iter().any(|p| is_slot(&p.reg)) {
+        return refuse("a parameter held in memory");
+    }
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let lamina_mir::Instruction::Call { ret: Some(ret), .. } = &inst.instr
+            && is_slot(ret)
+        {
+            return refuse("a call result held in memory");
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {

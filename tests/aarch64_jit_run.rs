@@ -284,3 +284,26 @@ fn writebyte_reports_one_byte_written() {
     function.add_block(entry);
     assert_eq!(run(&module_of(vec![function]), "write"), 1);
 }
+
+#[test]
+fn aggregate_abi_is_refused_not_miscompiled() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::StackAddr {
+        dst: v(1),
+        slot: VirtualReg::gpr(0),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(imm(0)),
+    });
+    let mut function = Function::new(
+        Signature::new("wide")
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    function.add_block(entry);
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    let error = assembler
+        .compile_mir_to_binary_function(&module_of(vec![function]), None)
+        .expect_err("refused");
+    assert!(error.to_string().contains("held in memory"), "{error}");
+}

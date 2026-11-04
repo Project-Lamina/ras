@@ -78,6 +78,7 @@ pub fn compile_mir_aarch64_function(
         let func = module.functions.get(func_name).ok_or_else(|| {
             RasError::EncodingError(format!("Function '{}' not found in module", func_name))
         })?;
+        reject_unmodelled_abi(func)?;
 
         function_offsets.insert(func_name.clone(), code.len());
         let mut reg_alloc = A64RegAlloc::new();
