@@ -1,8 +1,9 @@
 //! The 32-bit x86 encoder and the ELF32 objects it writes.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
+#[cfg(target_arch = "x86_64")]
 use std::process::Command;
 
 mod common;

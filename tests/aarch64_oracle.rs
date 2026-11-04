@@ -1,6 +1,5 @@
-//! These compare ras against GNU binutils and clang on ELF objects, so they
-//! only run where both the reference assembler and the format are available.
-#![cfg(target_os = "linux")]
+//! These compare ras against clang on ELF objects.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;

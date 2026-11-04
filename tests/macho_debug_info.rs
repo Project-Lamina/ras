@@ -2,9 +2,9 @@
 //!
 //! Mach-O spells a debug section `__DWARF,__debug_*` and marks it `S_ATTR_DEBUG`, and
 //! its linker drops those sections rather than relocating them, so the only relocation
-//! left is the one that names code. There is no Mac here: every assertion below is a
-//! structural one, and nothing in this file claims a debugger ran.
-#![cfg(target_os = "linux")]
+//! left is the one that names code. Every assertion below is a structural one, and
+//! nothing in this file claims a debugger ran.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::{
@@ -81,7 +81,13 @@ fn which(tool: &str) -> Option<String> {
             return Some(name);
         }
     }
-    None
+    // Xcode keeps its LLVM tools out of PATH.
+    let output = Command::new("xcrun")
+        .args(["--find", tool])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[test]

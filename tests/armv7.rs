@@ -1,5 +1,5 @@
 //! The ARMv7-A (A32) encoder and the ELF32 ARM objects it writes.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
 use ras::Ras;
