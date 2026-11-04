@@ -911,7 +911,7 @@ impl AArch64Encoder {
                         DataKind::D => 0x1e60_1000,
                         _ => return Err(error("fmov constant takes s or d register")),
                     };
-                    return Ok(((base | (fmov_imm8(constant)? << 13) | rd) as u32)
+                    return Ok((base | (fmov_imm8(constant)? << 13) | rd)
                         .to_le_bytes()
                         .to_vec());
                 }
