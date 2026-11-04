@@ -1372,6 +1372,30 @@ fn encode_mir_instruction_with_context(
                 }
             }
         }
+        lamina_mir::Instruction::Copy { ty, dst, src }
+        | lamina_mir::Instruction::Bitcast {
+            to: ty, dst, src, ..
+        } => {
+            if ty.is_vector() || ty.size_bytes(lamina_platform::PointerWidth::Bits64) > 8 {
+                return Err(RasError::EncodingError(format!(
+                    "AArch64 JIT: copy of {:?} not supported",
+                    ty
+                )));
+            }
+            // A slot holds the whole value, so moving all 8 bytes keeps every width.
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            materialize_operand(
+                assembler,
+                src,
+                parse_register(tmp)?,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
         lamina_mir::Instruction::Jmp { .. } => {
             return Err(RasError::EncodingError(
                 "Jmp must be handled at block/terminator level (bug: reached instruction encoder)"

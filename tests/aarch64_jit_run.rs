@@ -150,3 +150,30 @@ fn frame_past_imm12_keeps_values() {
     function.add_block(entry);
     assert_eq!(run(&module_of(vec![function]), "big"), 898);
 }
+
+#[test]
+fn copy_and_bitcast_move_the_value() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(0),
+        src: imm(41),
+    });
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(1),
+        src: reg(0),
+    });
+    entry.push(Instruction::Bitcast {
+        from: I64,
+        to: I64,
+        dst: v(2),
+        src: reg(1),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(2)),
+    });
+    let mut function = Function::new(Signature::new("copy").with_return(I64));
+    function.add_block(entry);
+    assert_eq!(run(&module_of(vec![function]), "copy"), 41);
+}

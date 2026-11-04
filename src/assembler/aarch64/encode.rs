@@ -336,6 +336,26 @@ pub(super) fn emit_indexed_address(
     Ok(())
 }
 
+/// Store a scratch register in the slot of `dst`.
+#[cfg(feature = "encoder")]
+pub(super) fn store_to_slot(
+    code: &mut Vec<u8>,
+    src_reg: &str,
+    dst: &Register,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+) -> Result<(), RasError> {
+    let Register::Virtual(vreg) = dst else {
+        return Err(RasError::EncodingError(
+            "AArch64 JIT: physical destination not supported".into(),
+        ));
+    };
+    let offset = stack_slots.get(vreg).ok_or_else(|| {
+        RasError::EncodingError(format!("No stack slot for virtual register: {:?}", vreg))
+    })?;
+    code.extend_from_slice(&encode_str(src_reg, 29, *offset)?);
+    Ok(())
+}
+
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {
