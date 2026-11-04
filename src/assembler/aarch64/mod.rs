@@ -8,9 +8,7 @@ mod operand;
 use encode::*;
 use operand::*;
 
-use crate::encoder::aarch64::fixed::{
-    encode_and_rrr, encode_msub, encode_msub_w,
-};
+use crate::encoder::aarch64::fixed::{encode_and_rrr, encode_msub, encode_msub_w};
 use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_codegen::aarch64::{A64RegAlloc, AArch64ABI, FrameMap};
 use lamina_mir::{
@@ -767,6 +765,26 @@ fn encode_mir_instruction_with_context(
                         &mut code,
                         stack_size,
                     )?;
+
+                    // A narrow value is held sign extended. What reads it as unsigned, and a
+                    // shift amount, must only see the bits of the type.
+                    let bits = match ty {
+                        MirType::Scalar(ScalarType::I8) => Some(8u8),
+                        MirType::Scalar(ScalarType::I16) => Some(16u8),
+                        _ => None,
+                    };
+                    if let Some(bits) = bits {
+                        if matches!(op, IntBinOp::UDiv | IntBinOp::URem | IntBinOp::LShr) {
+                            code.extend_from_slice(&encode_ubfm64(lhs_reg, lhs_reg, 0, bits - 1));
+                        }
+                        if matches!(op, IntBinOp::UDiv | IntBinOp::URem) {
+                            code.extend_from_slice(&encode_ubfm64(rhs_reg, rhs_reg, 0, bits - 1));
+                        }
+                        if matches!(op, IntBinOp::Shl | IntBinOp::LShr | IntBinOp::AShr) {
+                            let top = bits.trailing_zeros() as u8 - 1;
+                            code.extend_from_slice(&encode_ubfm64(rhs_reg, rhs_reg, 0, top));
+                        }
+                    }
 
                     match op {
                         IntBinOp::URem | IntBinOp::SRem => {

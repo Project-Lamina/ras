@@ -685,3 +685,67 @@ fn int_to_float_and_back_through_f32() {
     });
     assert_eq!(f64::from_bits(bits as u64), -3.0);
 }
+
+fn narrow_op(op: IntBinOp, ty: ScalarType, lhs: i64, rhs: i64) -> i64 {
+    let ty = MirType::Scalar(ty);
+    block_result(|entry| {
+        let address = VirtualReg::gpr(50);
+        entry.push(Instruction::StackAddr {
+            dst: v(1),
+            slot: address,
+        });
+        entry.push(Instruction::Store {
+            ty,
+            src: imm(lhs),
+            addr: at_v1(0),
+            attrs: MemoryAttrs::default(),
+        });
+        entry.push(Instruction::Load {
+            ty,
+            dst: v(2),
+            addr: at_v1(0),
+            attrs: MemoryAttrs::default(),
+        });
+        entry.push(Instruction::IntBinary {
+            op,
+            ty,
+            dst: v(3),
+            lhs: reg(2),
+            rhs: imm(rhs),
+        });
+        entry.push(Instruction::IntConvert {
+            from: ty,
+            to: I64,
+            signed: false,
+            dst: v(4),
+            src: reg(3),
+        });
+        ret(entry, 4);
+    })
+}
+
+#[test]
+fn narrow_unsigned_division_reads_the_type_bits() {
+    assert_eq!(narrow_op(IntBinOp::UDiv, ScalarType::I16, 50000, 2), 25000);
+    assert_eq!(
+        narrow_op(IntBinOp::URem, ScalarType::I16, 50000, 7),
+        50000 % 7
+    );
+    assert_eq!(narrow_op(IntBinOp::UDiv, ScalarType::I8, 200, 3), 66);
+}
+
+#[test]
+fn narrow_shifts_read_the_type_bits_and_mask_the_amount() {
+    assert_eq!(
+        narrow_op(IntBinOp::LShr, ScalarType::I16, 0xF000, 4),
+        0x0F00
+    );
+    assert_eq!(narrow_op(IntBinOp::LShr, ScalarType::I8, 0x80, 9), 0x40);
+    assert_eq!(narrow_op(IntBinOp::Shl, ScalarType::I8, 1, 9), 2);
+    assert_eq!(narrow_op(IntBinOp::AShr, ScalarType::I8, 0x80, 1), 0xC0);
+}
+
+#[test]
+fn bool_arithmetic_is_byte_wide_like_the_aot_backend() {
+    assert_eq!(narrow_op(IntBinOp::Add, ScalarType::I1, 1, 1), 2);
+}
