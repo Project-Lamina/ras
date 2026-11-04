@@ -30,6 +30,10 @@ name = "aarch64_oracle"
 required-features = ["encoder"]
 
 [[test]]
+name = "aarch64_jit_run"
+required-features = ["encoder"]
+
+[[test]]
 name = "riscv_oracle"
 required-features = ["encoder"]
 

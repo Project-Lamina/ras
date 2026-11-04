@@ -9,7 +9,8 @@ const LDUR_BASE: u32 = 0xF840_0000;
 const STR_SCALED_BASE: u32 = 0xF900_0000;
 const LDR_SCALED_BASE: u32 = 0xF940_0000;
 const SUB_IMM_BASE: u32 = 0xD100_0000;
-const TEMP_RN: u32 = 10;
+// x17 is never a scratch in the JIT, x9 to x12 can hold live values here.
+const TEMP_RN: u32 = 17;
 
 /// Integer scalar load shape for JIT (GP registers only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
