@@ -132,7 +132,8 @@ const R_386_32: u32 = 1;
 const R_386_PC32: u32 = 2;
 const R_386_PLT32: u32 = 4;
 const R_386_16: u32 = 20;
-const R_386_8: u32 = 23;
+/// Intel i386 psABI, relocation types: 22. 23 is `R_386_PC8`.
+const R_386_8: u32 = 22;
 
 const R_ARM_ABS32: u32 = 2;
 const R_ARM_REL32: u32 = 3;
