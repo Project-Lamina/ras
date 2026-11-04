@@ -6,7 +6,8 @@
 use crate::{
     error::RasError,
     object::ExternalReloc,
-    parser::{DebugFile, Section, SectionFlags},
+    parser::{DebugFile, MachOSectionType, Section, SectionFlags},
+    target::ObjectFormat,
 };
 use lamina_platform::TargetArchitecture;
 use std::collections::{BTreeMap, HashMap};
@@ -53,8 +54,12 @@ const DW_ATE_UNSIGNED: u64 = 0x07;
 
 const DW_OP_CALL_FRAME_CFA: u8 = 0x9c;
 
-/// Every ELF target this writer serves addresses with 64 bits.
+/// Every target this writer serves addresses with 64 bits.
 const ADDRESS_SIZE: u8 = 8;
+
+/// `S_ATTR_DEBUG`. Mach-O requires it on every section of the `__DWARF` segment, and
+/// it is what tells `ld` to leave the section out of the linked image.
+const MACHO_DEBUG_ATTRIBUTE: u32 = 0x0200_0000;
 
 /// Lamina's scalars follow C's conventions for width, signedness and float format,
 /// which is what a debugger reads this field for. Nothing here claims C semantics
@@ -89,11 +94,14 @@ pub struct DebugInfoRequest {
     pub subprograms: Vec<Subprogram>,
 }
 
-/// One function. `name` is the symbol as it appears in the object; a name this object
-/// does not define is skipped rather than described without an address.
+/// One function. `name` is what a debugger shows; `symbol` is the label the object
+/// gives its code, for the platforms that spell the two differently — Mach-O's leading
+/// underscore. `None` means they agree. A function this object does not define is
+/// skipped rather than described without an address.
 #[derive(Debug, Clone)]
 pub struct Subprogram {
     pub name: String,
+    pub symbol: Option<String>,
     pub external: bool,
     pub decl: Option<DeclSite>,
     /// `None` for a function that returns nothing, or whose return type has no
@@ -258,6 +266,7 @@ fn absolute_kinds(arch: TargetArchitecture) -> Option<(u32, u32)> {
 
 /// Everything the assembler resolved that the writer describes.
 pub(crate) struct DebugSource<'a> {
+    pub format: ObjectFormat,
     pub sections: &'a [Section],
     pub rows: &'a [LocRow],
     pub files: &'a BTreeMap<u32, DebugFile>,
@@ -272,24 +281,24 @@ pub(crate) fn build(
     always_emit: bool,
 ) -> Result<Option<DebugSections>, RasError> {
     let DebugSource {
+        format,
         sections,
         rows,
         files,
         extents,
         request,
     } = *source;
+    let macho = format == ObjectFormat::MachO;
     let Some((abs64, abs32)) = absolute_kinds(arch) else {
         return Ok(None);
     };
     if rows.is_empty() && !always_emit {
         return Ok(None);
     }
-    if sections.iter().any(|s| {
-        matches!(
-            s.name.as_str(),
-            ".debug_line" | ".debug_info" | ".debug_abbrev"
-        )
-    }) {
+    if sections
+        .iter()
+        .any(|s| s.name.starts_with(".debug_") || s.name.starts_with("__DWARF,"))
+    {
         return Err(RasError::ObjectError(
             "source defines .debug_* sections; ras cannot add .loc DWARF beside them".into(),
         ));
@@ -447,7 +456,10 @@ pub(crate) fn build(
             request
                 .subprograms
                 .iter()
-                .filter_map(|sub| Some((sub, extents.get(sub.name.as_str())?)))
+                .filter_map(|sub| {
+                    let symbol = sub.symbol.as_deref().unwrap_or(sub.name.as_str());
+                    Some((sub, extents.get(symbol)?))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -624,51 +636,60 @@ pub(crate) fn build(
     info[..4].copy_from_slice(&info_unit_length.to_le_bytes());
 
     let mut relocs = Vec::new();
-    for (position, symbol, width, addend) in line_relocs {
+    let mut add = |section: &str, position: usize, symbol: String, width: u8, addend: i64| {
+        // Mach-O's linker does not relocate the `__DWARF` sections: it drops them, and
+        // `dsymutil` reads the objects themselves. An offset from one debug section of
+        // this object into another is therefore already final, and the only addresses
+        // that still need a relocation are the ones that name code.
+        if macho && symbol.starts_with(".debug_") {
+            return;
+        }
         relocs.push(reloc(
+            &debug_section_name(macho, section),
+            position,
+            &symbol,
+            width,
+            addend,
+            abs64,
+            abs32,
+        ));
+    };
+    for (position, symbol, width, addend) in line_relocs {
+        add(
             ".debug_line",
             4 + program_start + position,
-            &symbol,
+            symbol,
             width,
             addend,
-            abs64,
-            abs32,
-        ));
+        );
     }
     for (position, symbol, width, addend) in info_relocs {
-        relocs.push(reloc(
-            ".debug_info",
-            position,
-            &symbol,
-            width,
-            addend,
-            abs64,
-            abs32,
-        ));
+        add(".debug_info", position, symbol, width, addend);
     }
     for (position, symbol, width, addend) in range_relocs {
-        relocs.push(reloc(
-            ".debug_ranges",
-            position,
-            &symbol,
-            width,
-            addend,
-            abs64,
-            abs32,
-        ));
+        add(".debug_ranges", position, symbol, width, addend);
     }
     let mut out_sections = vec![
-        section(".debug_line", debug_line_unit),
-        section(".debug_abbrev", abbrev),
-        section(".debug_info", info),
+        section(macho, ".debug_line", debug_line_unit),
+        section(macho, ".debug_abbrev", abbrev),
+        section(macho, ".debug_info", info),
     ];
     if ranged {
-        out_sections.push(section(".debug_ranges", ranges));
+        out_sections.push(section(macho, ".debug_ranges", ranges));
     }
     Ok(Some(DebugSections {
         sections: out_sections,
         relocs,
     }))
+}
+
+/// `.debug_info` is `__DWARF,__debug_info` in a Mach-O object. The bytes are the same.
+fn debug_section_name(macho: bool, elf: &str) -> String {
+    if macho {
+        format!("__DWARF,__{}", &elf[1..])
+    } else {
+        elf.to_string()
+    }
 }
 
 fn reloc(
@@ -692,10 +713,10 @@ fn reloc(
     }
 }
 
-fn section(name: &str, data: Vec<u8>) -> Section {
+fn section(macho: bool, name: &str, data: Vec<u8>) -> Section {
     Section {
         group: None,
-        name: name.into(),
+        name: debug_section_name(macho, name),
         flags: SectionFlags {
             alloc: false,
             exec: false,
@@ -704,7 +725,10 @@ fn section(name: &str, data: Vec<u8>) -> Section {
         },
         data,
         alignment: 1,
-        macho: None,
+        macho: macho.then_some(MachOSectionType {
+            kind: 0,
+            attributes: MACHO_DEBUG_ATTRIBUTE,
+        }),
     }
 }
 

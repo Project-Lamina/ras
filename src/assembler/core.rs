@@ -671,10 +671,13 @@ impl RasAssembler {
                 symbol.attributes.size = Some(extent.length.to_string());
             }
         }
-        if object_format_for_os(self.target_os) == Some(ObjectFormat::Elf) {
+        if let Some(format @ (ObjectFormat::Elf | ObjectFormat::MachO)) =
+            object_format_for_os(self.target_os)
+        {
             let debug = dwarf::build(
                 self.target_arch,
                 &dwarf::DebugSource {
+                    format,
                     sections: &sections,
                     rows: &loc_rows,
                     files: &parsed.files,

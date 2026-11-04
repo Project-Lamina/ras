@@ -38,6 +38,7 @@ fn request() -> DebugInfoRequest {
         subprograms: vec![
             Subprogram {
                 name: "twice".into(),
+                symbol: None,
                 external: true,
                 decl: Some(DeclSite { file: 1, line: 1 }),
                 ret: Some(DebugType::Base(BaseType::I32)),
@@ -49,6 +50,7 @@ fn request() -> DebugInfoRequest {
             },
             Subprogram {
                 name: "half".into(),
+                symbol: None,
                 external: false,
                 decl: Some(DeclSite { file: 1, line: 6 }),
                 ret: Some(DebugType::Base(BaseType::I32)),
@@ -62,6 +64,7 @@ fn request() -> DebugInfoRequest {
             // rather than described without an address.
             Subprogram {
                 name: "absent".into(),
+                symbol: None,
                 external: true,
                 decl: None,
                 ret: None,
