@@ -135,7 +135,7 @@ mod windows_loader {
 pub struct RasAssembler {
     pub(crate) target_arch: TargetArchitecture,
     pub(crate) target_os: TargetOperatingSystem,
-    encoder: Box<dyn InstructionEncoder>,
+    pub(crate) encoder: Box<dyn InstructionEncoder>,
     object_writer: Box<dyn ObjectWriter>,
     object_write_options: ObjectWriteOptions,
     pub(crate) function_pointers: HashMap<String, u64>,

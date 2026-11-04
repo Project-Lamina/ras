@@ -134,6 +134,9 @@ pub(super) fn materialize_return_value(
                     code.extend_from_slice(&encode_ldr_typed("w0", 29, offset, ret_ty)?);
                     code.extend_from_slice(&encode_sbfm64(0, 0, 0, 31));
                 }
+                MirType::Scalar(ScalarType::F32 | ScalarType::F64) => {
+                    code.extend_from_slice(&encode_ldr("x0", 29, offset)?);
+                }
                 _ => {
                     return Err(RasError::EncodingError(format!(
                         "AArch64 JIT: unsupported return type {:?}",
@@ -167,11 +170,9 @@ pub(super) fn materialize_operand(
                 Immediate::I16(v) => *v as i64 as u64,
                 Immediate::I32(v) => *v as i64 as u64,
                 Immediate::I64(v) => *v as u64,
-                _ => {
-                    return Err(RasError::EncodingError(
-                        "Floating-point immediates not yet supported".to_string(),
-                    ));
-                }
+                // A float travels as its bits in a general register.
+                Immediate::F32(v) => u64::from(v.to_bits()),
+                Immediate::F64(v) => v.to_bits(),
             };
 
             if imm_val <= 0xFFFF {

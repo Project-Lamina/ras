@@ -9,12 +9,13 @@ use encode::*;
 use operand::*;
 
 use crate::encoder::aarch64::fixed::{
-    encode_and_rrr, encode_and_w_rrr, encode_msub, encode_msub_w,
+    encode_and_rrr, encode_msub, encode_msub_w,
 };
 use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_codegen::aarch64::{A64RegAlloc, AArch64ABI, FrameMap};
 use lamina_mir::{
-    AddressMode, Immediate, IntBinOp, IntCmpOp, MirType, Operand, Register, ScalarType,
+    AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, IntBinOp, IntCmpOp, MirType,
+    Operand, Register, ScalarType,
 };
 
 #[cfg(feature = "encoder")]
@@ -835,14 +836,6 @@ fn encode_mir_instruction_with_context(
                         }
                     }
 
-                    if matches!(ty, MirType::Scalar(ScalarType::I1)) {
-                        let mask_str = reg_alloc.alloc_scratch().unwrap_or("x13");
-                        let mask_reg = parse_register(mask_str)?;
-                        code.extend_from_slice(&mov_imm_to_w(mask_reg, 1));
-                        code.extend_from_slice(&encode_and_w_rrr(dst_reg, dst_reg, mask_reg));
-                        reg_alloc.free_scratch(mask_str);
-                    }
-
                     if let Register::Virtual(vreg) = dst
                         && let Some(offset) = stack_slots.get(vreg)
                     {
@@ -1584,6 +1577,273 @@ fn encode_mir_instruction_with_context(
             )?;
             store_to_slot(&mut code, tmp, dst, stack_slots)?;
             reg_alloc.free_scratch(tmp);
+        }
+        lamina_mir::Instruction::FloatBinary {
+            op,
+            ty,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            let prefix = float_register_prefix(ty)?;
+            let left = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let right = reg_alloc.alloc_scratch().unwrap_or("x11");
+            let (left_reg, right_reg) = (parse_register(left)?, parse_register(right)?);
+            materialize_operand(
+                assembler,
+                lhs,
+                left_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            materialize_operand(
+                assembler,
+                rhs,
+                right_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            encode_float_in(assembler, &mut code, prefix, 0, left_reg)?;
+            encode_float_in(assembler, &mut code, prefix, 1, right_reg)?;
+            let mnemonic = match op {
+                FloatBinOp::FAdd => "fadd",
+                FloatBinOp::FSub => "fsub",
+                FloatBinOp::FMul => "fmul",
+                FloatBinOp::FDiv => "fdiv",
+            };
+            encode_text(
+                assembler,
+                &mut code,
+                &format!("{mnemonic} {prefix}0, {prefix}0, {prefix}1"),
+            )?;
+            encode_float_out(assembler, &mut code, prefix, left_reg)?;
+            store_to_slot(&mut code, left, dst, stack_slots)?;
+            reg_alloc.free_scratch(left);
+            reg_alloc.free_scratch(right);
+        }
+        lamina_mir::Instruction::FloatUnary { op, ty, dst, src } => {
+            let prefix = float_register_prefix(ty)?;
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let tmp_reg = parse_register(tmp)?;
+            materialize_operand(
+                assembler,
+                src,
+                tmp_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            encode_float_in(assembler, &mut code, prefix, 0, tmp_reg)?;
+            let mnemonic = match op {
+                FloatUnOp::FNeg => "fneg",
+                FloatUnOp::FSqrt => "fsqrt",
+            };
+            encode_text(
+                assembler,
+                &mut code,
+                &format!("{mnemonic} {prefix}0, {prefix}0"),
+            )?;
+            encode_float_out(assembler, &mut code, prefix, tmp_reg)?;
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
+        lamina_mir::Instruction::FloatCmp {
+            op,
+            ty,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            let prefix = float_register_prefix(ty)?;
+            let left = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let right = reg_alloc.alloc_scratch().unwrap_or("x11");
+            let (left_reg, right_reg) = (parse_register(left)?, parse_register(right)?);
+            materialize_operand(
+                assembler,
+                lhs,
+                left_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            materialize_operand(
+                assembler,
+                rhs,
+                right_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            encode_float_in(assembler, &mut code, prefix, 0, left_reg)?;
+            encode_float_in(assembler, &mut code, prefix, 1, right_reg)?;
+            encode_text(assembler, &mut code, &format!("fcmp {prefix}0, {prefix}1"))?;
+            // Same conditions as the AOT backend: an unordered compare is false, ne true.
+            let condition = match op {
+                FloatCmpOp::Eq => "eq",
+                FloatCmpOp::Ne => "ne",
+                FloatCmpOp::Lt => "mi",
+                FloatCmpOp::Le => "ls",
+                FloatCmpOp::Gt => "gt",
+                FloatCmpOp::Ge => "ge",
+            };
+            encode_text(assembler, &mut code, &format!("cset {left}, {condition}"))?;
+            store_to_slot(&mut code, left, dst, stack_slots)?;
+            reg_alloc.free_scratch(left);
+            reg_alloc.free_scratch(right);
+        }
+        lamina_mir::Instruction::IntToFloat {
+            from,
+            to,
+            signed,
+            dst,
+            src,
+        } => {
+            let prefix = float_register_prefix(to)?;
+            let from_bytes = from.size_bytes(lamina_platform::PointerWidth::Bits64);
+            if from_bytes > 8 {
+                return Err(RasError::EncodingError(format!(
+                    "AArch64 JIT: IntToFloat from {:?} not supported",
+                    from
+                )));
+            }
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let tmp_reg = parse_register(tmp)?;
+            materialize_operand(
+                assembler,
+                src,
+                tmp_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            if from_bytes < 8 {
+                let top_bit = (from_bytes * 8 - 1) as u8;
+                code.extend_from_slice(&if *signed {
+                    encode_sbfm64(tmp_reg, tmp_reg, 0, top_bit)
+                } else {
+                    encode_ubfm64(tmp_reg, tmp_reg, 0, top_bit)
+                });
+            }
+            let mnemonic = if *signed { "scvtf" } else { "ucvtf" };
+            encode_text(
+                assembler,
+                &mut code,
+                &format!("{mnemonic} {prefix}0, {tmp}"),
+            )?;
+            encode_float_out(assembler, &mut code, prefix, tmp_reg)?;
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
+        lamina_mir::Instruction::FloatConvert { from, to, dst, src } => {
+            let (from_prefix, to_prefix) =
+                (float_register_prefix(from)?, float_register_prefix(to)?);
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let tmp_reg = parse_register(tmp)?;
+            materialize_operand(
+                assembler,
+                src,
+                tmp_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            if from_prefix != to_prefix {
+                encode_float_in(assembler, &mut code, from_prefix, 0, tmp_reg)?;
+                encode_text(
+                    assembler,
+                    &mut code,
+                    &format!("fcvt {to_prefix}0, {from_prefix}0"),
+                )?;
+                encode_float_out(assembler, &mut code, to_prefix, tmp_reg)?;
+            }
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
+        lamina_mir::Instruction::FloatToInt {
+            from,
+            to,
+            signed,
+            dst,
+            src,
+        } => {
+            let prefix = float_register_prefix(from)?;
+            let bits = to.size_bytes(lamina_platform::PointerWidth::Bits64) * 8;
+            if bits > 64 {
+                return Err(RasError::EncodingError(format!(
+                    "AArch64 JIT: FloatToInt to {:?} not supported",
+                    to
+                )));
+            }
+            let value = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let limit = reg_alloc.alloc_scratch().unwrap_or("x11");
+            let (value_reg, limit_reg) = (parse_register(value)?, parse_register(limit)?);
+            materialize_operand(
+                assembler,
+                src,
+                value_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            encode_float_in(assembler, &mut code, prefix, 0, value_reg)?;
+            let mnemonic = if *signed { "fcvtzs" } else { "fcvtzu" };
+            let (v32, l32) = (format!("w{value_reg}"), format!("w{limit_reg}"));
+            if bits == 64 {
+                encode_text(
+                    assembler,
+                    &mut code,
+                    &format!("{mnemonic} {value}, {prefix}0"),
+                )?;
+            } else {
+                encode_text(
+                    assembler,
+                    &mut code,
+                    &format!("{mnemonic} {v32}, {prefix}0"),
+                )?;
+                if bits < 32 {
+                    let (minimum, maximum) = if *signed {
+                        (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+                    } else {
+                        (0, (1i64 << bits) - 1)
+                    };
+                    code.extend_from_slice(&mov_imm_to_w(limit_reg, maximum as i32));
+                    encode_text(assembler, &mut code, &format!("cmp {v32}, {l32}"))?;
+                    let keep = if *signed { "le" } else { "ls" };
+                    encode_text(
+                        assembler,
+                        &mut code,
+                        &format!("csel {v32}, {v32}, {l32}, {keep}"),
+                    )?;
+                    if *signed {
+                        code.extend_from_slice(&mov_imm_to_w(limit_reg, minimum as i32));
+                        encode_text(assembler, &mut code, &format!("cmp {v32}, {l32}"))?;
+                        encode_text(
+                            assembler,
+                            &mut code,
+                            &format!("csel {v32}, {v32}, {l32}, ge"),
+                        )?;
+                    }
+                }
+                let top_bit = (bits - 1) as u8;
+                code.extend_from_slice(&if *signed {
+                    encode_sbfm64(value_reg, value_reg, 0, top_bit)
+                } else {
+                    encode_ubfm64(value_reg, value_reg, 0, top_bit)
+                });
+            }
+            store_to_slot(&mut code, value, dst, stack_slots)?;
+            reg_alloc.free_scratch(value);
+            reg_alloc.free_scratch(limit);
         }
         lamina_mir::Instruction::Jmp { .. } => {
             return Err(RasError::EncodingError(

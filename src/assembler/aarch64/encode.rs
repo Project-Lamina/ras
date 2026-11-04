@@ -2,6 +2,7 @@
 
 use super::operand::materialize_operand;
 use crate::assembler::core::RasAssembler;
+use crate::encoder::ParsedInstruction;
 use crate::encoder::aarch64::fixed::{enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr};
 use crate::encoder::aarch64::ldst_imm64::{
     AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
@@ -202,9 +203,8 @@ pub(super) fn mir_scalar_ld_kind(
         MirType::Scalar(ScalarType::I16) => Ok(AArch64ScalarLdKind::I16S),
         MirType::Scalar(ScalarType::I32) => Ok(AArch64ScalarLdKind::I32S),
         MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(AArch64ScalarLdKind::I64),
-        MirType::Scalar(ScalarType::F32 | ScalarType::F64) => Err(RasError::EncodingError(
-            "AArch64 JIT Load of floating-point type is not supported".into(),
-        )),
+        MirType::Scalar(ScalarType::F32) => Ok(AArch64ScalarLdKind::I32S),
+        MirType::Scalar(ScalarType::F64) => Ok(AArch64ScalarLdKind::I64),
         _ => Err(RasError::EncodingError(format!(
             "AArch64 JIT Load: unsupported MIR type {:?}",
             ty
@@ -220,9 +220,8 @@ pub(super) fn mir_scalar_st_kind(
         MirType::Scalar(ScalarType::I16) => Ok(AArch64ScalarStKind::I16),
         MirType::Scalar(ScalarType::I32) => Ok(AArch64ScalarStKind::I32),
         MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(AArch64ScalarStKind::I64),
-        MirType::Scalar(ScalarType::F32 | ScalarType::F64) => Err(RasError::EncodingError(
-            "AArch64 JIT Store of floating-point type is not supported".into(),
-        )),
+        MirType::Scalar(ScalarType::F32) => Ok(AArch64ScalarStKind::I32),
+        MirType::Scalar(ScalarType::F64) => Ok(AArch64ScalarStKind::I64),
         _ => Err(RasError::EncodingError(format!(
             "AArch64 JIT Store: unsupported MIR type {:?}",
             ty
@@ -805,6 +804,73 @@ pub(super) fn allocate_globals(
         }
     }
     Ok(())
+}
+
+/// Encode one instruction through the text encoder, which already knows the float forms.
+#[cfg(feature = "encoder")]
+pub(super) fn encode_text(
+    assembler: &mut RasAssembler,
+    code: &mut Vec<u8>,
+    line: &str,
+) -> Result<(), RasError> {
+    let (opcode, operands) = line.split_once(' ').unwrap_or((line, ""));
+    let bytes = assembler.encoder.encode_instruction(&ParsedInstruction {
+        opcode: opcode.to_string(),
+        operands: operands
+            .split(',')
+            .map(str::trim)
+            .filter(|operand| !operand.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })?;
+    code.extend_from_slice(&bytes);
+    Ok(())
+}
+
+/// `s` or `d` for a float type, refusing anything else.
+#[cfg(feature = "encoder")]
+pub(super) fn float_register_prefix(ty: &MirType) -> Result<&'static str, RasError> {
+    match ty {
+        MirType::Scalar(ScalarType::F32) => Ok("s"),
+        MirType::Scalar(ScalarType::F64) => Ok("d"),
+        _ => Err(RasError::EncodingError(format!(
+            "AArch64 JIT: {:?} is not a scalar float",
+            ty
+        ))),
+    }
+}
+
+/// Move float bits from a general register into `s<index>` or `d<index>`.
+#[cfg(feature = "encoder")]
+pub(super) fn encode_float_in(
+    assembler: &mut RasAssembler,
+    code: &mut Vec<u8>,
+    prefix: &str,
+    index: u8,
+    general: u8,
+) -> Result<(), RasError> {
+    let source = if prefix == "s" { "w" } else { "x" };
+    encode_text(
+        assembler,
+        code,
+        &format!("fmov {prefix}{index}, {source}{general}"),
+    )
+}
+
+/// Move float bits from `s0` or `d0` back to a general register.
+#[cfg(feature = "encoder")]
+pub(super) fn encode_float_out(
+    assembler: &mut RasAssembler,
+    code: &mut Vec<u8>,
+    prefix: &str,
+    general: u8,
+) -> Result<(), RasError> {
+    let target = if prefix == "s" { "w" } else { "x" };
+    encode_text(
+        assembler,
+        code,
+        &format!("fmov {target}{general}, {prefix}0"),
+    )
 }
 
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {

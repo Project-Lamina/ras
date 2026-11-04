@@ -4,7 +4,10 @@
 use lamina_mir::{
     block::Block,
     function::{Function, Parameter, Signature},
-    instruction::{AddressMode, Immediate, Instruction, IntBinOp, IntCmpOp, MemoryAttrs, Operand},
+    instruction::{
+        AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp, IntCmpOp,
+        MemoryAttrs, Operand,
+    },
     module::{Global, Module},
     register::{Register, VirtualReg},
     types::{MirType, ScalarType},
@@ -558,4 +561,127 @@ fn narrow_value_in_a_register_reads_at_its_width() {
         Function::new(Signature::new("narrow").with_return(MirType::Scalar(ScalarType::I32)));
     function.add_block(entry);
     assert_eq!(run(&module_of(vec![function]), "narrow") as i32, -10);
+}
+
+const F64_TY: MirType = MirType::Scalar(ScalarType::F64);
+const F32_TY: MirType = MirType::Scalar(ScalarType::F32);
+
+fn f64_imm(value: f64) -> Operand {
+    Operand::Immediate(Immediate::F64(value))
+}
+
+/// Run a block that ends by returning a register, as its raw 64 bits.
+fn block_result(build: impl FnOnce(&mut Block)) -> i64 {
+    let mut entry = Block::new("entry");
+    build(&mut entry);
+    let mut function = Function::new(Signature::new("result").with_return(I64));
+    function.add_block(entry);
+    run(&module_of(vec![function]), "result")
+}
+
+fn ret(entry: &mut Block, id: u32) {
+    entry.push(Instruction::Ret {
+        value: Some(reg(id)),
+    });
+}
+
+#[test]
+fn float_arithmetic_and_constants() {
+    let bits = block_result(|entry| {
+        entry.push(Instruction::FloatBinary {
+            op: FloatBinOp::FMul,
+            ty: F64_TY,
+            dst: v(0),
+            lhs: f64_imm(1.5),
+            rhs: f64_imm(4.0),
+        });
+        entry.push(Instruction::FloatBinary {
+            op: FloatBinOp::FSub,
+            ty: F64_TY,
+            dst: v(1),
+            lhs: reg(0),
+            rhs: f64_imm(0.25),
+        });
+        entry.push(Instruction::FloatUnary {
+            op: FloatUnOp::FNeg,
+            ty: F64_TY,
+            dst: v(2),
+            src: reg(1),
+        });
+        ret(entry, 2);
+    });
+    assert_eq!(f64::from_bits(bits as u64), -5.75);
+}
+
+fn compares(op: FloatCmpOp, lhs: f64, rhs: f64) -> i64 {
+    block_result(|entry| {
+        entry.push(Instruction::FloatCmp {
+            op,
+            ty: F64_TY,
+            dst: v(0),
+            lhs: f64_imm(lhs),
+            rhs: f64_imm(rhs),
+        });
+        ret(entry, 0);
+    })
+}
+
+#[test]
+fn float_compares_are_false_on_nan_except_ne() {
+    for (op, less_than) in [
+        (FloatCmpOp::Eq, 0),
+        (FloatCmpOp::Ne, 1),
+        (FloatCmpOp::Lt, 1),
+        (FloatCmpOp::Le, 1),
+        (FloatCmpOp::Gt, 0),
+        (FloatCmpOp::Ge, 0),
+    ] {
+        assert_eq!(compares(op, 1.0, 2.0), less_than, "{op:?}");
+        let on_nan = i64::from(matches!(op, FloatCmpOp::Ne));
+        assert_eq!(compares(op, f64::NAN, 2.0), on_nan, "{op:?} nan");
+    }
+}
+
+fn to_int(to: ScalarType, signed: bool, value: f64) -> i64 {
+    block_result(|entry| {
+        entry.push(Instruction::FloatToInt {
+            from: F64_TY,
+            to: MirType::Scalar(to),
+            signed,
+            dst: v(0),
+            src: f64_imm(value),
+        });
+        ret(entry, 0);
+    })
+}
+
+#[test]
+fn float_to_int_truncates_and_saturates() {
+    assert_eq!(to_int(ScalarType::I64, true, -2.9), -2);
+    assert_eq!(to_int(ScalarType::I64, true, f64::NAN), 0);
+    assert_eq!(to_int(ScalarType::I8, true, 1000.0), 127);
+    assert_eq!(to_int(ScalarType::I8, true, -1000.0), -128);
+    assert_eq!(to_int(ScalarType::I8, false, 1000.0), 255);
+    assert_eq!(to_int(ScalarType::I32, true, 3e10), i64::from(i32::MAX));
+}
+
+#[test]
+fn int_to_float_and_back_through_f32() {
+    let bits = block_result(|entry| {
+        entry.push(Instruction::IntToFloat {
+            from: I64,
+            to: F32_TY,
+            signed: true,
+            dst: v(0),
+            src: imm(-3),
+        });
+        entry.push(Instruction::FloatConvert {
+            from: F32_TY,
+            to: F64_TY,
+            dst: v(1),
+            src: reg(0),
+        });
+        ret(entry, 1);
+    });
+    assert_eq!(f64::from_bits(bits as u64), -3.0);
 }
