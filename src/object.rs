@@ -928,6 +928,8 @@ const ARM64_RELOC_UNSIGNED: u32 = 0;
 const ARM64_RELOC_BRANCH26: u32 = 2;
 const ARM64_RELOC_PAGE21: u32 = 3;
 const ARM64_RELOC_PAGEOFF12: u32 = 4;
+const ARM64_RELOC_GOT_LOAD_PAGE21: u32 = 5;
+const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6;
 const ARM64_RELOC_TLVP_LOAD_PAGE21: u32 = 8;
 const ARM64_RELOC_TLVP_LOAD_PAGEOFF12: u32 = 9;
 const ARM64_RELOC_ADDEND: u32 = 10;
@@ -978,7 +980,10 @@ fn arm64_reloc_spec(kind: u32) -> Result<MachORelocSpec, RasError> {
         259 => Ok(spec(ARM64_RELOC_UNSIGNED, 1, false)),
         282 | 283 => Ok(spec(ARM64_RELOC_BRANCH26, 2, true)),
         275 => Ok(spec(ARM64_RELOC_PAGE21, 2, true)),
-        277 => Ok(spec(ARM64_RELOC_PAGEOFF12, 2, false)),
+        // Darwin has one page offset relocation, the linker reads the scale off the instruction.
+        277 | 278 | 284 | 285 | 286 | 299 => Ok(spec(ARM64_RELOC_PAGEOFF12, 2, false)),
+        311 => Ok(spec(ARM64_RELOC_GOT_LOAD_PAGE21, 2, true)),
+        312 => Ok(spec(ARM64_RELOC_GOT_LOAD_PAGEOFF12, 2, false)),
         313 => Ok(spec(ARM64_RELOC_TLVP_LOAD_PAGE21, 2, true)),
         314 => Ok(spec(ARM64_RELOC_TLVP_LOAD_PAGEOFF12, 2, false)),
         _ => Err(RasError::ObjectError(format!(

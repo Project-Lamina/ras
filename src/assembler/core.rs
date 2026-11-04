@@ -1345,6 +1345,10 @@ impl RasAssembler {
                                 )));
                             } else if let Some(symbol) = page_operand.strip_suffix("@TLVPPAGE") {
                                 (symbol, 313)
+                            } else if let Some(symbol) = page_operand.strip_suffix("@GOTPAGE") {
+                                (symbol, 311)
+                            } else if let Some(symbol) = page_operand.strip_suffix("@PAGE") {
+                                (symbol, 275)
                             } else {
                                 (page_operand, 275)
                             };
@@ -1462,6 +1466,49 @@ impl RasAssembler {
                                 word: if wide { 0x9100_0000 } else { 0x1100_0000 } | (rn << 5) | rd,
                                 bits: 0,
                                 kind,
+                                relocate: true,
+                            })
+                        } else if matches!(
+                            opcode.as_str(),
+                            "ldr"
+                                | "str"
+                                | "ldrb"
+                                | "strb"
+                                | "ldrh"
+                                | "strh"
+                                | "ldrsb"
+                                | "ldrsh"
+                                | "ldrsw"
+                        ) && operands.len() == 3
+                            && operands[1].starts_with('[')
+                            && (operands[2].ends_with("@PAGEOFF]")
+                                || operands[2].ends_with("@GOTPAGEOFF]"))
+                        {
+                            let target = operands[2].trim_end_matches(']');
+                            let got = target.ends_with("@GOTPAGEOFF");
+                            let symbol = target
+                                .strip_suffix("@GOTPAGEOFF")
+                                .or_else(|| target.strip_suffix("@PAGEOFF"))
+                                .unwrap_or_default();
+                            let (symbol, addend) = split_addend(symbol)?;
+                            let bytes = self.encoder.encode_instruction(&ParsedInstruction {
+                                opcode: opcode.clone(),
+                                operands: vec![operands[0].clone(), format!("{}]", operands[1])],
+                            })?;
+                            let word = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| {
+                                RasError::EncodingError("short load/store encoding".into())
+                            })?);
+                            Some(PatchPoint::AArch64 {
+                                offset: current_offset,
+                                target: symbol.to_string(),
+                                addend,
+                                word,
+                                bits: 0,
+                                kind: if got {
+                                    312
+                                } else {
+                                    aarch64_page_offset_kind(word)
+                                },
                                 relocate: true,
                             })
                         } else if opcode == "ldr"
@@ -2612,6 +2659,19 @@ fn aarch64_compare_branch(
 }
 
 /// Splits a trailing decimal or hex `+N` or `-N` displacement off a symbol operand.
+/// The page offset relocation a load or store word needs, by the size it accesses.
+fn aarch64_page_offset_kind(word: u32) -> u32 {
+    let vector = word & (1 << 26) != 0;
+    let opc = (word >> 22) & 3;
+    match word >> 30 {
+        0 if vector && opc >= 2 => 299,
+        0 => 278,
+        1 => 284,
+        2 => 285,
+        _ => 286,
+    }
+}
+
 fn aarch64_adrp_destination(reg: &str) -> Result<u32, RasError> {
     match crate::encoder::aarch64::gpr(reg)? {
         (rd, true) if reg != "sp" => Ok(rd),
