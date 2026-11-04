@@ -3560,6 +3560,43 @@ mod tests {
     }
 
     #[test]
+    fn coff_weak_default_is_named_after_the_first_strong_external() {
+        let sections = [coff_section(".text", true, false, vec![0x90, 0xc3])];
+        let mut weak = coff_symbol("wf", true, ".text", 1);
+        weak.attributes.weak = true;
+        let mut other = coff_symbol("other", true, ".text", 0);
+        other.attributes.weak = true;
+        let mut quiet = coff_symbol("quiet", true, ".text", 0);
+        quiet.attributes.hidden = true;
+        let names = |symbols: &[ObjectSymbol]| -> Vec<String> {
+            coff_parse(&coff_object(&sections, symbols, &[]))
+                .symbols
+                .into_iter()
+                .filter(|s| s.name.starts_with(".weak.wf"))
+                .map(|s| s.name)
+                .collect()
+        };
+        // Weak, file-local, undefined and common symbols do not name the default.
+        assert_eq!(
+            names(&[
+                other.clone(),
+                quiet.clone(),
+                coff_symbol("ext", true, "", 0),
+                coff_symbol("c", true, "*COM*", 8),
+                coff_symbol("first", true, ".text", 0),
+                coff_symbol("second", true, ".text", 1),
+                weak.clone(),
+            ]),
+            [".weak.wf.default.first"]
+        );
+        assert_eq!(
+            names(&[coff_symbol("second", true, ".text", 1), weak.clone()]),
+            [".weak.wf.default.second"]
+        );
+        assert_eq!(names(&[other, quiet, weak]), [".weak.wf.default"]);
+    }
+
+    #[test]
     fn coff_visibility_that_is_not_exported_becomes_a_static_symbol() {
         for set in [
             |a: &mut crate::parser::SymbolAttributes| a.hidden = true,
