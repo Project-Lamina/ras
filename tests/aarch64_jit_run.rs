@@ -307,3 +307,47 @@ fn aggregate_abi_is_refused_not_miscompiled() {
         .expect_err("refused");
     assert!(error.to_string().contains("held in memory"), "{error}");
 }
+
+#[test]
+fn extern_declaration_calls_the_loaded_symbol() {
+    let mut labs = Function::new(
+        Signature::new("labs")
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    labs.blocks.clear();
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Call {
+        name: "labs".to_string(),
+        args: vec![imm(-42)],
+        ret: Some(v(0)),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(0)),
+    });
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.add_block(entry);
+    assert_eq!(run(&module_of(vec![labs, main]), "main"), 42);
+}
+
+#[test]
+fn extern_narrow_return_ignores_upper_bits() {
+    let mut abs = Function::new(
+        Signature::new("abs")
+            .with_params(vec![Parameter::new(v(0), MirType::Scalar(ScalarType::I32))])
+            .with_return(MirType::Scalar(ScalarType::I32)),
+    );
+    abs.blocks.clear();
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Call {
+        name: "abs".to_string(),
+        args: vec![imm(-7)],
+        ret: Some(v(0)),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(0)),
+    });
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.add_block(entry);
+    assert_eq!(run(&module_of(vec![abs, main]), "main"), 7);
+}

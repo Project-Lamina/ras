@@ -42,7 +42,13 @@ pub fn compile_mir_aarch64_function(
         std::collections::HashMap::new();
 
     // Always compile all functions (needed for internal function calls)
-    let mut all_function_names: Vec<String> = module.functions.keys().cloned().collect();
+    // A function with no blocks is an extern declaration, its code lives in a loaded library.
+    let mut all_function_names: Vec<String> = module
+        .functions
+        .iter()
+        .filter(|(_, func)| !func.blocks.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
     all_function_names.sort();
 
     // Pre-calculate function offsets (estimate) to handle recursive calls
@@ -1359,10 +1365,28 @@ fn encode_mir_instruction_with_context(
                     || (!name.starts_with('@')
                         && function_offsets.contains_key(&format!("@{}", name)));
                 if !is_internal {
-                    return Err(RasError::EncodingError(format!(
-                        "External function call '{}' requires runtime resolution (not implemented for AArch64 JIT)",
-                        name
-                    )));
+                    let ret_ty = extern_return_type(assembler, name, args.len())?;
+                    let address = resolve_symbol(assembler, name)?;
+                    materialize_operand(
+                        assembler,
+                        &Operand::Immediate(Immediate::I64(address as i64)),
+                        16,
+                        stack_slots,
+                        reg_alloc,
+                        &mut code,
+                        stack_size,
+                    )?;
+                    code.extend_from_slice(&encode_blr(16)?);
+                    if let Some(dst) = ret {
+                        // C leaves the bits above a narrow return undefined.
+                        if let Some(bytes @ 1..=4) =
+                            ret_ty.map(|ty| ty.size_bytes(lamina_platform::PointerWidth::Bits64))
+                        {
+                            code.extend_from_slice(&encode_sbfm64(0, 0, 0, (bytes * 8 - 1) as u8));
+                        }
+                        store_to_slot(&mut code, "x0", dst, stack_slots)?;
+                    }
+                    return Ok(code);
                 }
 
                 let bl_pc = current_offset + code.len();

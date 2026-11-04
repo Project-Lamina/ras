@@ -538,6 +538,66 @@ pub(super) fn reject_unmodelled_abi(func: &lamina_mir::Function) -> Result<(), R
     Ok(())
 }
 
+/// The return type of a declared extern, once its signature fits this encoder.
+#[cfg(feature = "encoder")]
+pub(super) fn extern_return_type(
+    assembler: &RasAssembler,
+    name: &str,
+    arg_count: usize,
+) -> Result<Option<MirType>, RasError> {
+    let module = assembler.current_module.ok_or_else(|| {
+        RasError::EncodingError("AArch64 JIT: no module for extern call".to_string())
+    })?;
+    // SAFETY: compile_mir_to_binary_function sets this from the module it is still borrowing.
+    let module = unsafe { &*module };
+    let refuse = |what: &str| {
+        Err(RasError::EncodingError(format!(
+            "AArch64 JIT: extern call to @{name}: {what}"
+        )))
+    };
+    let Some(func) = module
+        .functions
+        .get(name)
+        .or_else(|| module.functions.get(name.trim_start_matches('@')))
+    else {
+        return refuse("no declaration in this module");
+    };
+    if func.sig.variadic {
+        return refuse("variadic call not supported");
+    }
+    // Darwin packs narrow stack arguments, register words do not model that.
+    if arg_count > 8 {
+        return refuse("stack arguments not supported");
+    }
+    if func
+        .sig
+        .params
+        .iter()
+        .any(|p| p.ty.is_float() || p.ty.is_vector())
+        || func
+            .sig
+            .ret_ty
+            .is_some_and(|ty| ty.is_float() || ty.is_vector())
+    {
+        return refuse("float or vector values not supported");
+    }
+    Ok(func.sig.ret_ty)
+}
+
+/// The address of a C symbol loaded in this process.
+#[cfg(feature = "encoder")]
+pub(super) fn resolve_symbol(assembler: &mut RasAssembler, name: &str) -> Result<u64, RasError> {
+    let symbol = name.trim_start_matches('@');
+    if !assembler.function_pointers.contains_key(symbol) {
+        assembler.register_function(symbol)?;
+    }
+    assembler
+        .function_pointers
+        .get(symbol)
+        .copied()
+        .ok_or_else(|| RasError::EncodingError(format!("{symbol} not resolved")))
+}
+
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {
