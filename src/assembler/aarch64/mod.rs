@@ -23,6 +23,8 @@ struct BlFixup {
     patch_location: usize,
     /// Target function name as referenced by MIR (may include or omit '@').
     target_name: String,
+    /// Set when the word is `ADR` of this register instead of `BL`.
+    adr_register: Option<u8>,
 }
 
 #[cfg(feature = "encoder")]
@@ -429,6 +431,7 @@ pub fn compile_mir_aarch64_function(
                     tail_b_fixups.push(BlFixup {
                         patch_location: b_pc,
                         target_name: name.clone(),
+                        adr_register: None,
                     });
                 }
                 lamina_mir::Instruction::Unreachable => {
@@ -512,7 +515,19 @@ pub fn compile_mir_aarch64_function(
                 delta
             )));
         }
-        let word = 0x9400_0000u32 | ((imm26 as u32) & 0x03FF_FFFF);
+        let word = match fixup.adr_register {
+            Some(register) => {
+                if !(-(1i64 << 20)..(1i64 << 20)).contains(&delta) {
+                    return Err(RasError::EncodingError(format!(
+                        "ADR target out of range (delta={} bytes)",
+                        delta
+                    )));
+                }
+                let (low, high) = ((delta & 3) as u32, ((delta >> 2) & 0x7_FFFF) as u32);
+                0x1000_0000u32 | (low << 29) | (high << 5) | u32::from(register)
+            }
+            None => 0x9400_0000u32 | ((imm26 as u32) & 0x03FF_FFFF),
+        };
         if fixup.patch_location + 4 > code.len() {
             return Err(RasError::EncodingError(format!(
                 "BL patch location out of bounds: {} (len={})",
@@ -1284,6 +1299,23 @@ fn encode_mir_instruction_with_context(
 
             let _abi = AArch64ABI::new(assembler.target_os);
 
+            let internal = function_offsets.contains_key(name)
+                || (name.starts_with('@') && function_offsets.contains_key(&name[1..]))
+                || (!name.starts_with('@') && function_offsets.contains_key(&format!("@{}", name)));
+            if !internal && name != "print" {
+                encode_extern_call(
+                    assembler,
+                    name,
+                    args,
+                    ret.as_ref(),
+                    stack_slots,
+                    reg_alloc,
+                    &mut code,
+                    stack_size,
+                )?;
+                return Ok(code);
+            }
+
             let arg_regs = AArch64ABI::ARG_REGISTERS;
             for (i, arg) in args.iter().enumerate().take(8) {
                 let arg_reg_str = arg_regs[i];
@@ -1436,28 +1468,10 @@ fn encode_mir_instruction_with_context(
                     || (!name.starts_with('@')
                         && function_offsets.contains_key(&format!("@{}", name)));
                 if !is_internal {
-                    let ret_ty = extern_return_type(assembler, name, args.len())?;
-                    let address = resolve_symbol(assembler, name)?;
-                    materialize_operand(
-                        assembler,
-                        &Operand::Immediate(Immediate::I64(address as i64)),
-                        16,
-                        stack_slots,
-                        reg_alloc,
-                        &mut code,
-                        stack_size,
-                    )?;
-                    code.extend_from_slice(&encode_blr(16)?);
-                    if let Some(dst) = ret {
-                        // C leaves the bits above a narrow return undefined.
-                        if let Some(bytes @ 1..=4) =
-                            ret_ty.map(|ty| ty.size_bytes(lamina_platform::PointerWidth::Bits64))
-                        {
-                            code.extend_from_slice(&encode_sbfm64(0, 0, 0, (bytes * 8 - 1) as u8));
-                        }
-                        store_to_slot(&mut code, "x0", dst, stack_slots)?;
-                    }
-                    return Ok(code);
+                    return Err(RasError::EncodingError(format!(
+                        "AArch64 JIT: extern call to @{} reached the internal call path",
+                        name
+                    )));
                 }
 
                 let bl_pc = current_offset + code.len();
@@ -1465,6 +1479,7 @@ fn encode_mir_instruction_with_context(
                 bl_fixups.push(BlFixup {
                     patch_location: bl_pc,
                     target_name: name.clone(),
+                    adr_register: None,
                 });
 
                 if stack_space > 0 {
@@ -1575,10 +1590,16 @@ fn encode_mir_instruction_with_context(
                 Some(address) => *address,
                 None => {
                     if function_offsets.contains_key(symbol) {
-                        return Err(RasError::EncodingError(format!(
-                            "AArch64 JIT: address of function @{} not supported",
-                            symbol
-                        )));
+                        let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+                        bl_fixups.push(BlFixup {
+                            patch_location: current_offset + code.len(),
+                            target_name: symbol.clone(),
+                            adr_register: Some(parse_register(tmp)?),
+                        });
+                        code.extend_from_slice(&0x1000_0000u32.to_le_bytes());
+                        store_to_slot(&mut code, tmp, dst, stack_slots)?;
+                        reg_alloc.free_scratch(tmp);
+                        return Ok(code);
                     }
                     resolve_symbol(assembler, symbol)?
                 }
@@ -1862,6 +1883,62 @@ fn encode_mir_instruction_with_context(
             store_to_slot(&mut code, value, dst, stack_slots)?;
             reg_alloc.free_scratch(value);
             reg_alloc.free_scratch(limit);
+        }
+        lamina_mir::Instruction::CallIndirect {
+            target,
+            arg_types,
+            args,
+            variadic_fixed,
+            ret,
+            ret_ty,
+        } => {
+            // The target may be C, whose floats and variadics travel differently from here.
+            if variadic_fixed.is_some()
+                || args.len() > 8
+                || arg_types.iter().any(|ty| ty.is_float() || ty.is_vector())
+                || ret_ty.is_some_and(|ty| ty.is_float() || ty.is_vector())
+            {
+                return Err(RasError::EncodingError(
+                    "AArch64 JIT: indirect call with float, vector, variadic or stack arguments not supported"
+                        .to_string(),
+                ));
+            }
+            for (index, arg) in args.iter().enumerate() {
+                materialize_operand(
+                    assembler,
+                    arg,
+                    index as u8,
+                    stack_slots,
+                    reg_alloc,
+                    &mut code,
+                    stack_size,
+                )?;
+            }
+            materialize_operand(
+                assembler,
+                target,
+                16,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            code.extend_from_slice(&encode_blr(16)?);
+            if let Some(dst) = ret {
+                if let Some(ty) = ret_ty {
+                    let bytes = ty.size_bytes(lamina_platform::PointerWidth::Bits64);
+                    if bytes > 8 {
+                        return Err(RasError::EncodingError(format!(
+                            "AArch64 JIT: indirect call returning {:?} not supported",
+                            ty
+                        )));
+                    }
+                    if bytes < 8 {
+                        code.extend_from_slice(&encode_sbfm64(0, 0, 0, (bytes * 8 - 1) as u8));
+                    }
+                }
+                store_to_slot(&mut code, "x0", dst, stack_slots)?;
+            }
         }
         lamina_mir::Instruction::Jmp { .. } => {
             return Err(RasError::EncodingError(

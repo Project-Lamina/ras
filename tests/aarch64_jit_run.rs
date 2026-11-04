@@ -749,3 +749,110 @@ fn narrow_shifts_read_the_type_bits_and_mask_the_amount() {
 fn bool_arithmetic_is_byte_wide_like_the_aot_backend() {
     assert_eq!(narrow_op(IntBinOp::Add, ScalarType::I1, 1, 1), 2);
 }
+
+#[test]
+fn extern_float_goes_through_float_registers() {
+    let mut ldexp = Function::new(
+        Signature::new("ldexp")
+            .with_params(vec![
+                Parameter::new(v(0), F64_TY),
+                Parameter::new(v(1), MirType::Scalar(ScalarType::I32)),
+            ])
+            .with_return(F64_TY),
+    );
+    ldexp.blocks.clear();
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Call {
+        name: "ldexp".to_string(),
+        args: vec![f64_imm(1.5), imm(3)],
+        ret: Some(v(0)),
+    });
+    ret(&mut entry, 0);
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.add_block(entry);
+    let bits = run(&module_of(vec![ldexp, main]), "main");
+    assert_eq!(f64::from_bits(bits as u64), 12.0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn variadic_arguments_go_on_the_stack_on_darwin() {
+    let mut snprintf = Function::new(
+        Signature::new("snprintf")
+            .with_params(vec![
+                Parameter::new(v(0), MirType::Scalar(ScalarType::Ptr)),
+                Parameter::new(v(1), I64),
+                Parameter::new(v(2), MirType::Scalar(ScalarType::Ptr)),
+            ])
+            .with_return(MirType::Scalar(ScalarType::I32)),
+    );
+    snprintf.sig.variadic = true;
+    snprintf.blocks.clear();
+
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::StackAddr {
+        dst: v(1),
+        slot: VirtualReg::gpr(50),
+    });
+    entry.push(Instruction::SymbolAddress {
+        dst: v(2),
+        symbol: "format".to_string(),
+    });
+    entry.push(Instruction::Call {
+        name: "snprintf".to_string(),
+        args: vec![reg(1), imm(32), reg(2), imm(123), imm(-45)],
+        ret: Some(v(3)),
+    });
+    ret(&mut entry, 3);
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.stack_reservations.insert(VirtualReg::gpr(50), 4);
+    main.add_block(entry);
+    let mut module = module_of(vec![snprintf, main]);
+    let format = Global::new("format", I64, PointerWidth::Bits64)
+        .with_layout(10, 1)
+        .with_initializer(b"%lld|%lld\0".to_vec());
+    module.globals.insert("format".to_string(), format);
+    // "123|-45"
+    assert_eq!(run(&module, "main"), 7);
+}
+
+fn two_functions_with_pointer_call() -> Module {
+    let mut seven = Function::new(
+        Signature::new("seven")
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    let mut seven_entry = Block::new("entry");
+    seven_entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(1),
+        lhs: reg(0),
+        rhs: imm(7),
+    });
+    ret(&mut seven_entry, 1);
+    seven.add_block(seven_entry);
+
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::SymbolAddress {
+        dst: v(0),
+        symbol: "seven".to_string(),
+    });
+    entry.push(Instruction::CallIndirect {
+        target: reg(0),
+        arg_types: vec![I64],
+        args: vec![imm(35)],
+        variadic_fixed: None,
+        ret: Some(v(1)),
+        ret_ty: Some(I64),
+    });
+    ret(&mut entry, 1);
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.add_block(entry);
+    module_of(vec![seven, main])
+}
+
+#[test]
+fn function_address_and_indirect_call() {
+    assert_eq!(run(&two_functions_with_pointer_call(), "main"), 42);
+}

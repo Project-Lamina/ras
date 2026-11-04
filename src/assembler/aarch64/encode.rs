@@ -675,13 +675,20 @@ pub(super) fn reject_unmodelled_abi(func: &lamina_mir::Function) -> Result<(), R
     Ok(())
 }
 
-/// The return type of a declared extern, once its signature fits this encoder.
+/// Call a C symbol: integers in x0-x7, floats in d0-d7, and on Darwin every variadic
+/// argument on the stack in its own 8 bytes.
 #[cfg(feature = "encoder")]
-pub(super) fn extern_return_type(
-    assembler: &RasAssembler,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_extern_call(
+    assembler: &mut RasAssembler,
     name: &str,
-    arg_count: usize,
-) -> Result<Option<MirType>, RasError> {
+    args: &[Operand],
+    ret: Option<&Register>,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
     let module = assembler.current_module.ok_or_else(|| {
         RasError::EncodingError("AArch64 JIT: no module for extern call".to_string())
     })?;
@@ -699,26 +706,94 @@ pub(super) fn extern_return_type(
     else {
         return refuse("no declaration in this module");
     };
-    if func.sig.variadic {
-        return refuse("variadic call not supported");
+    let sig = &func.sig;
+    if sig.variadic && assembler.target_os != lamina_platform::TargetOperatingSystem::MacOS {
+        return refuse("variadic call is only written for Darwin");
     }
-    // Darwin packs narrow stack arguments, register words do not model that.
-    if arg_count > 8 {
-        return refuse("stack arguments not supported");
+    let fixed = sig.params.len();
+    if args.len() < fixed || (!sig.variadic && args.len() != fixed) {
+        return refuse("argument count does not match the declaration");
     }
-    if func
-        .sig
-        .params
-        .iter()
-        .any(|p| p.ty.is_float() || p.ty.is_vector())
-        || func
-            .sig
-            .ret_ty
-            .is_some_and(|ty| ty.is_float() || ty.is_vector())
-    {
-        return refuse("float or vector values not supported");
+    if sig.params.iter().any(|p| p.ty.is_vector()) || sig.ret_ty.is_some_and(|t| t.is_vector()) {
+        return refuse("vector values not supported");
     }
-    Ok(func.sig.ret_ty)
+
+    let (mut next_general, mut next_float) = (0u8, 0u8);
+    for (param, arg) in sig.params.iter().zip(args) {
+        if param.ty.is_float() {
+            if next_float == 8 {
+                return refuse("float stack arguments not supported");
+            }
+            let prefix = float_register_prefix(&param.ty)?;
+            materialize_operand(assembler, arg, 16, stack_slots, reg_alloc, code, stack_size)?;
+            encode_float_in(assembler, code, prefix, next_float, 16)?;
+            next_float += 1;
+        } else {
+            if next_general == 8 {
+                // Darwin packs narrow stack arguments, register words do not model that.
+                return refuse("stack arguments not supported");
+            }
+            materialize_operand(
+                assembler,
+                arg,
+                next_general,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            next_general += 1;
+        }
+    }
+
+    let variadic = &args[fixed..];
+    let area = (variadic.len() * 8 + 15) & !15;
+    if area > 0xFFF {
+        return refuse("too many variadic arguments");
+    }
+    if area > 0 {
+        let sub = 0xD100_03FFu32 | ((area as u32) << 10);
+        code.extend_from_slice(&sub.to_le_bytes());
+        for (index, arg) in variadic.iter().enumerate() {
+            materialize_operand(assembler, arg, 16, stack_slots, reg_alloc, code, stack_size)?;
+            code.extend_from_slice(&encode_str_imm64(16, 31, (index * 8) as i32)?);
+        }
+    }
+
+    let address = resolve_symbol(assembler, name)?;
+    materialize_operand(
+        assembler,
+        &Operand::Immediate(Immediate::I64(address as i64)),
+        16,
+        stack_slots,
+        reg_alloc,
+        code,
+        stack_size,
+    )?;
+    code.extend_from_slice(&encode_blr(16)?);
+    if area > 0 {
+        let add = 0x9100_03FFu32 | ((area as u32) << 10);
+        code.extend_from_slice(&add.to_le_bytes());
+    }
+
+    if let Some(dst) = ret {
+        match sig.ret_ty {
+            Some(ty) if ty.is_float() => {
+                let prefix = float_register_prefix(&ty)?;
+                encode_float_out(assembler, code, prefix, 0)?;
+            }
+            // C leaves the bits above a narrow return undefined.
+            Some(ty) => {
+                let bytes = ty.size_bytes(lamina_platform::PointerWidth::Bits64);
+                if (1..=4).contains(&bytes) {
+                    code.extend_from_slice(&encode_sbfm64(0, 0, 0, (bytes * 8 - 1) as u8));
+                }
+            }
+            None => {}
+        }
+        store_to_slot(code, "x0", dst, stack_slots)?;
+    }
+    Ok(())
 }
 
 /// The address of a C symbol loaded in this process.
