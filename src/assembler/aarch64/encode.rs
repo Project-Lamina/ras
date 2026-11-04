@@ -356,6 +356,16 @@ pub(super) fn store_to_slot(
     Ok(())
 }
 
+/// UBFM Xd, Xn, #immr, #imms (64-bit); used for zero-extension of low (imms+1) bits.
+pub(super) fn encode_ubfm64(rd: u8, rn: u8, immr: u8, imms: u8) -> Vec<u8> {
+    let w = 0xD340_0000u32
+        | ((immr as u32) << 16)
+        | ((imms as u32) << 10)
+        | ((rn as u32) << 5)
+        | (rd as u32);
+    w.to_le_bytes().to_vec()
+}
+
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
     let reg = reg.trim_start_matches('%');
     match reg {

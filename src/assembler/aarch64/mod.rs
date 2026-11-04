@@ -1417,6 +1417,48 @@ fn encode_mir_instruction_with_context(
             store_to_slot(&mut code, tmp, dst, stack_slots)?;
             reg_alloc.free_scratch(tmp);
         }
+        lamina_mir::Instruction::IntConvert {
+            from,
+            to,
+            signed,
+            dst,
+            src,
+        } => {
+            let width = lamina_platform::PointerWidth::Bits64;
+            let (from_bytes, to_bytes) = (from.size_bytes(width), to.size_bytes(width));
+            if from_bytes > 8 || to_bytes > 8 {
+                return Err(RasError::EncodingError(format!(
+                    "AArch64 JIT: IntConvert {:?} to {:?} not supported",
+                    from, to
+                )));
+            }
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let tmp_reg = parse_register(tmp)?;
+            materialize_operand(
+                assembler,
+                src,
+                tmp_reg,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+            let kept = from_bytes.min(to_bytes);
+            if kept < 8 {
+                let top_bit = (kept * 8 - 1) as u8;
+                code.extend_from_slice(&if *signed {
+                    encode_sbfm64(tmp_reg, tmp_reg, 0, top_bit)
+                } else {
+                    encode_ubfm64(tmp_reg, tmp_reg, 0, top_bit)
+                });
+            }
+            if to_bytes < 8 {
+                let top_bit = (to_bytes * 8 - 1) as u8;
+                code.extend_from_slice(&encode_sbfm64(tmp_reg, tmp_reg, 0, top_bit));
+            }
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
         lamina_mir::Instruction::Jmp { .. } => {
             return Err(RasError::EncodingError(
                 "Jmp must be handled at block/terminator level (bug: reached instruction encoder)"

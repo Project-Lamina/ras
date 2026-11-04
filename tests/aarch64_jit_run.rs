@@ -226,3 +226,44 @@ fn stack_addr_reaches_reserved_block() {
     function.add_block(entry);
     assert_eq!(run(&module_of(vec![function]), "block"), 42);
 }
+
+fn convert(from: ScalarType, to: ScalarType, signed: bool, value: i64) -> i64 {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Copy {
+        ty: I64,
+        dst: v(0),
+        src: imm(value),
+    });
+    entry.push(Instruction::IntConvert {
+        from: MirType::Scalar(from),
+        to: MirType::Scalar(to),
+        signed,
+        dst: v(1),
+        src: reg(0),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(1)),
+    });
+    let mut function = Function::new(Signature::new("convert").with_return(I64));
+    function.add_block(entry);
+    run(&module_of(vec![function]), "convert")
+}
+
+#[test]
+fn int_convert_extends_and_truncates() {
+    assert_eq!(convert(ScalarType::I8, ScalarType::I64, true, 0xFF), -1);
+    assert_eq!(convert(ScalarType::I8, ScalarType::I64, false, 0xFF), 0xFF);
+    assert_eq!(
+        convert(ScalarType::I32, ScalarType::I64, true, 0xFFFF_FFFF),
+        -1
+    );
+    assert_eq!(
+        convert(ScalarType::I32, ScalarType::I64, false, 0xFFFF_FFFF),
+        0xFFFF_FFFF
+    );
+    assert_eq!(convert(ScalarType::I64, ScalarType::I8, true, 0x1_7F), 0x7F);
+    assert_eq!(
+        convert(ScalarType::I64, ScalarType::I8, false, 0x1_80),
+        -128
+    );
+}
