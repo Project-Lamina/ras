@@ -445,6 +445,19 @@ fn shifted_register(shift: Option<&str>, wide: bool) -> Result<(u32, u32), RasEr
     Ok((kind, amount as u32))
 }
 
+/// The 8-bit form of an `fmov` constant: sign, low 3 exponent bits, top 4 mantissa bits.
+fn fmov_imm8(text: &str) -> Result<u32, RasError> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| error(format!("Invalid fmov constant: {text}")))?;
+    let bits = value.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    if bits & 0x0000_ffff_ffff_ffff != 0 || !(0x3fc..=0x403).contains(&exponent) {
+        return Err(error(format!("fmov cannot encode constant: {text}")));
+    }
+    Ok((((bits >> 63) << 7) | ((exponent & 7) << 4) | ((bits >> 48) & 0xf)) as u32)
+}
+
 pub(crate) fn condition(text: &str) -> Result<u32, RasError> {
     [
         "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
@@ -890,6 +903,17 @@ impl AArch64Encoder {
             "fmov" => {
                 if is_stack_pointer(arg(0)?) || is_stack_pointer(arg(1)?) {
                     return Err(error("fmov cannot take the stack pointer"));
+                }
+                if let Some(constant) = arg(1)?.strip_prefix('#') {
+                    let (rd, kind) = data_reg(arg(0)?)?;
+                    let base = match kind {
+                        DataKind::S => 0x1e20_1000,
+                        DataKind::D => 0x1e60_1000,
+                        _ => return Err(error("fmov constant takes s or d register")),
+                    };
+                    return Ok(((base | (fmov_imm8(constant)? << 13) | rd) as u32)
+                        .to_le_bytes()
+                        .to_vec());
                 }
                 let base = match (arg(0)?.chars().next(), arg(1)?.chars().next()) {
                     (Some('d'), Some('x')) => 0x9e67_0000,
