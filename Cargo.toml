@@ -19,9 +19,9 @@ name = "ras"
 path = "src/lib.rs"
 
 [dependencies]
-lamina-platform = "0.2.0"
-lamina-mir = { version = "0.2.0", optional = true }
-lamina-codegen = "0.2.0"
+lamina-platform = "0.2.1"
+lamina-mir = { version = "0.2.1", optional = true }
+lamina-codegen = "0.2.1"
 libc = "0.2"
 log = "0.4"
 
