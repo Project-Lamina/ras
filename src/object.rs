@@ -1847,9 +1847,14 @@ fn coff_weak_aux(default_index: u32) -> [u8; COFF_SYMBOL_SIZE] {
 
 /// The name of the default definition a weak external falls back to. COFF holds
 /// the definition under this name and leaves the weak name undefined, so a
-/// strong definition anywhere else in the link wins.
-fn coff_weak_default_name(name: &str) -> String {
-    format!(".weak.{name}")
+/// strong definition anywhere else in the link wins. link.exe takes only an
+/// external default, so the name carries the first strong external of the object,
+/// as LLVM does, to keep it apart from the default another object gives `name`.
+fn coff_weak_default_name(name: &str, unique: Option<&str>) -> String {
+    match unique {
+        Some(unique) => format!(".weak.{name}.default.{unique}"),
+        None => format!(".weak.{name}.default"),
+    }
 }
 
 /// COFF has no symbol visibility. The only thing it can say about a symbol that
@@ -2037,6 +2042,16 @@ impl ObjectWriter for CoffWriter {
             .filter(|r| !r.section_symbol)
             .map(|r| r.symbol.as_str())
             .collect();
+        let weak_unique = req
+            .symbols
+            .iter()
+            .find(|s| {
+                s.global
+                    && !s.attributes.weak
+                    && !coff_is_file_local(&s.attributes)
+                    && !matches!(s.section.as_str(), "" | "*COM*")
+            })
+            .map(|s| s.name.as_str());
         let mut symbol_index: HashMap<&str, u32> = HashMap::new();
         for sym in req.symbols {
             let wanted = referenced.contains(sym.name.as_str())
@@ -2079,11 +2094,11 @@ impl ObjectWriter for CoffWriter {
                 let default_index = nsyms;
                 sym_bytes.extend_from_slice(&coff_symbol_entry(
                     &mut strtab,
-                    &coff_weak_default_name(&sym.name),
+                    &coff_weak_default_name(&sym.name, weak_unique),
                     value,
                     section,
                     ty,
-                    IMAGE_SYM_CLASS_STATIC,
+                    IMAGE_SYM_CLASS_EXTERNAL,
                     0,
                 ));
                 symbol_index.insert(sym.name.as_str(), nsyms + 1);
@@ -3463,9 +3478,9 @@ mod tests {
         let default = obj
             .symbols
             .iter()
-            .position(|s| s.name == ".weak.wf")
+            .position(|s| s.name == ".weak.wf.default.main")
             .expect("default definition");
-        assert_eq!(obj.symbols[default].class, IMAGE_SYM_CLASS_STATIC);
+        assert_eq!(obj.symbols[default].class, IMAGE_SYM_CLASS_EXTERNAL);
         assert_eq!(obj.symbols[default].section, 1);
         assert_eq!(obj.symbols[default].value, 1);
 
@@ -3531,7 +3546,7 @@ mod tests {
         let default = obj
             .symbols
             .iter()
-            .position(|s| s.name == ".weak.maybe")
+            .position(|s| s.name == ".weak.maybe.default.main")
             .expect("default definition");
         assert_eq!(obj.symbols[default].section, IMAGE_SYM_ABSOLUTE);
         assert_eq!(obj.symbols[default].value, 0);
@@ -3542,6 +3557,43 @@ mod tests {
             u32::from_le_bytes(raw[weak_index + 1][0..4].try_into().unwrap()),
             default as u32
         );
+    }
+
+    #[test]
+    fn coff_weak_default_is_named_after_the_first_strong_external() {
+        let sections = [coff_section(".text", true, false, vec![0x90, 0xc3])];
+        let mut weak = coff_symbol("wf", true, ".text", 1);
+        weak.attributes.weak = true;
+        let mut other = coff_symbol("other", true, ".text", 0);
+        other.attributes.weak = true;
+        let mut quiet = coff_symbol("quiet", true, ".text", 0);
+        quiet.attributes.hidden = true;
+        let names = |symbols: &[ObjectSymbol]| -> Vec<String> {
+            coff_parse(&coff_object(&sections, symbols, &[]))
+                .symbols
+                .into_iter()
+                .filter(|s| s.name.starts_with(".weak.wf"))
+                .map(|s| s.name)
+                .collect()
+        };
+        // Weak, file-local, undefined and common symbols do not name the default.
+        assert_eq!(
+            names(&[
+                other.clone(),
+                quiet.clone(),
+                coff_symbol("ext", true, "", 0),
+                coff_symbol("c", true, "*COM*", 8),
+                coff_symbol("first", true, ".text", 0),
+                coff_symbol("second", true, ".text", 1),
+                weak.clone(),
+            ]),
+            [".weak.wf.default.first"]
+        );
+        assert_eq!(
+            names(&[coff_symbol("second", true, ".text", 1), weak.clone()]),
+            [".weak.wf.default.second"]
+        );
+        assert_eq!(names(&[other, quiet, weak]), [".weak.wf.default"]);
     }
 
     #[test]

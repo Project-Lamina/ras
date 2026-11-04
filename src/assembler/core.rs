@@ -325,6 +325,7 @@ impl RasAssembler {
         };
         let mut parsed = AssemblyParser::new()
             .with_darwin_directives(self.target_os == TargetOperatingSystem::MacOS)
+            .with_coff_directives(self.target_os == TargetOperatingSystem::Windows)
             .with_line_comments(comment_markers)
             .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;

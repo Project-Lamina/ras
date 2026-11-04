@@ -140,6 +140,8 @@ pub struct AssemblyParser {
     arm_attributes: Vec<(u32, ArmAttributeValue)>,
     /// Darwin reads the third `.comm` operand and `.align` as log2 exponents.
     darwin: bool,
+    /// COFF reads `.section` flags with its own letters, not ELF's.
+    coff: bool,
     line_comments: &'static [&'static str],
 }
 
@@ -169,12 +171,18 @@ impl AssemblyParser {
             coff_def: None,
             arm_attributes: Vec::new(),
             darwin: false,
+            coff: false,
             line_comments: &["#", "//"],
         }
     }
 
     pub fn with_darwin_directives(mut self, darwin: bool) -> Self {
         self.darwin = darwin;
+        self
+    }
+
+    pub fn with_coff_directives(mut self, coff: bool) -> Self {
+        self.coff = coff;
         self
     }
 
@@ -417,20 +425,24 @@ impl AssemblyParser {
                             None
                         },
                         name: name.to_string(),
-                        flags: SectionFlags {
-                            alloc: explicit.map_or(
-                                !name.starts_with(".debug") && name != ".note.GNU-stack",
-                                |f| f.contains('a'),
-                            ),
-                            exec: explicit
-                                .map_or(name == ".text" || macho_exec, |f| f.contains('x')),
-                            write: explicit.map_or(
-                                matches!(name, ".data" | ".bss" | ".tdata" | ".tbss")
-                                    || name.starts_with("__DATA,"),
-                                |f| f.contains('w'),
-                            ),
-                            tls: explicit
-                                .map_or(matches!(name, ".tdata" | ".tbss"), |f| f.contains('T')),
+                        flags: match explicit {
+                            Some(f) if self.coff => coff_section_flags(name, f),
+                            _ => SectionFlags {
+                                alloc: explicit.map_or(
+                                    !name.starts_with(".debug") && name != ".note.GNU-stack",
+                                    |f| f.contains('a'),
+                                ),
+                                exec: explicit
+                                    .map_or(name == ".text" || macho_exec, |f| f.contains('x')),
+                                write: explicit.map_or(
+                                    matches!(name, ".data" | ".bss" | ".tdata" | ".tbss")
+                                        || name.starts_with("__DATA,"),
+                                    |f| f.contains('w'),
+                                ),
+                                tls: explicit.map_or(matches!(name, ".tdata" | ".tbss"), |f| {
+                                    f.contains('T')
+                                }),
+                            },
                         },
                         data: Vec::new(),
                         alignment: 1,
@@ -1256,6 +1268,20 @@ fn macho_section_type(fields: &[String]) -> Result<MachOSectionType, RasError> {
         };
     }
     Ok(MachOSectionType { kind, attributes })
+}
+
+/// COFF `.section` flags as gas and LLVM read them: `x` is code, `x` or `r` make the
+/// section read-only unless `w` is also given, and `D` or a `.debug` name makes it
+/// discardable. `a` has no meaning on COFF, and thread-local data is marked by the
+/// `.tls$` name, not a flag.
+fn coff_section_flags(name: &str, flags: &str) -> SectionFlags {
+    let exec = flags.contains('x');
+    SectionFlags {
+        alloc: !flags.contains('D') && !name.starts_with(".debug"),
+        exec,
+        write: flags.contains('w') || !(exec || flags.contains('r')),
+        tls: false,
+    }
 }
 
 fn split_operands(text: &str) -> Vec<String> {
