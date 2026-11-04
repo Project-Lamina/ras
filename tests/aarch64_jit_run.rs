@@ -4,7 +4,7 @@
 use lamina_mir::{
     block::Block,
     function::{Function, Parameter, Signature},
-    instruction::{Immediate, Instruction, IntBinOp, Operand},
+    instruction::{AddressMode, Immediate, Instruction, IntBinOp, MemoryAttrs, Operand},
     module::Module,
     register::{Register, VirtualReg},
     types::{MirType, ScalarType},
@@ -55,6 +55,14 @@ fn run(module: &Module, entry: &str) -> i64 {
     let start = unsafe { memory.code_start().add(offsets[entry]) };
     let function: unsafe extern "C" fn() -> i64 = unsafe { std::mem::transmute(start) };
     unsafe { function() }
+}
+
+fn at_v1(offset: i16) -> AddressMode {
+    AddressMode::BaseOffset {
+        address_space: Default::default(),
+        base: v(1),
+        offset,
+    }
 }
 
 fn module_of(functions: Vec<Function>) -> Module {
@@ -176,4 +184,45 @@ fn copy_and_bitcast_move_the_value() {
     let mut function = Function::new(Signature::new("copy").with_return(I64));
     function.add_block(entry);
     assert_eq!(run(&module_of(vec![function]), "copy"), 41);
+}
+
+#[test]
+fn stack_addr_reaches_reserved_block() {
+    let slot = VirtualReg::gpr(0);
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::StackAddr { dst: v(1), slot });
+    for (offset, value) in [(0i16, 5i64), (24, 37)] {
+        entry.push(Instruction::Store {
+            ty: I64,
+            src: imm(value),
+            addr: at_v1(offset),
+            attrs: MemoryAttrs::default(),
+        });
+    }
+    entry.push(Instruction::Load {
+        ty: I64,
+        dst: v(2),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::Load {
+        ty: I64,
+        dst: v(3),
+        addr: at_v1(24),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(4),
+        lhs: reg(2),
+        rhs: reg(3),
+    });
+    entry.push(Instruction::Ret {
+        value: Some(reg(4)),
+    });
+    let mut function = Function::new(Signature::new("block").with_return(I64));
+    function.stack_reservations.insert(slot, 3);
+    function.add_block(entry);
+    assert_eq!(run(&module_of(vec![function]), "block"), 42);
 }

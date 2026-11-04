@@ -1396,6 +1396,27 @@ fn encode_mir_instruction_with_context(
             store_to_slot(&mut code, tmp, dst, stack_slots)?;
             reg_alloc.free_scratch(tmp);
         }
+        lamina_mir::Instruction::StackAddr { dst, slot } => {
+            let offset = stack_slots.get(slot).copied().ok_or_else(|| {
+                RasError::EncodingError(format!("No stack slot for virtual register: {:?}", slot))
+            })?;
+            let tmp = reg_alloc.alloc_scratch().unwrap_or("x10");
+            let tmp_reg = parse_register(tmp)?;
+            // add tmp, x29, #0
+            let mov_fp = 0x9100_03A0u32 | (tmp_reg as u32);
+            code.extend_from_slice(&mov_fp.to_le_bytes());
+            apply_i32_offset_to_reg(
+                assembler,
+                reg_alloc,
+                stack_slots,
+                stack_size,
+                &mut code,
+                tmp_reg,
+                offset,
+            )?;
+            store_to_slot(&mut code, tmp, dst, stack_slots)?;
+            reg_alloc.free_scratch(tmp);
+        }
         lamina_mir::Instruction::Jmp { .. } => {
             return Err(RasError::EncodingError(
                 "Jmp must be handled at block/terminator level (bug: reached instruction encoder)"
