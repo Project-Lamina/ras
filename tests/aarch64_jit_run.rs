@@ -2762,3 +2762,32 @@ fn indirect_call_returns_a_float_immediate_from_a_jit_function() {
         assert_eq!(run(&module, "main") as u64, expected, "{name}");
     }
 }
+
+#[test]
+fn va_start_and_va_arg_are_refused_not_miscompiled() {
+    // The JIT's own calls pass every argument in a register by position. Darwin's va_list
+    // reads variadic arguments from the stack, so a variadic function here is refused.
+    let mut entry = Block::new("entry");
+    entry.push(slot_addr(1, 50));
+    entry.push(Instruction::VaStart { ap: reg(1) });
+    entry.push(Instruction::VaArg {
+        ty: I64,
+        dst: v(2),
+        ap: reg(1),
+    });
+    ret(&mut entry, 2);
+    let mut function = Function::new(
+        Signature::new("sum_args")
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    function.sig.variadic = true;
+    function.stack_reservations.insert(VirtualReg::gpr(50), 3);
+    function.add_block(entry);
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    assert!(
+        assembler
+            .compile_mir_to_binary_function(&module_of(vec![function]), None)
+            .is_err()
+    );
+}
