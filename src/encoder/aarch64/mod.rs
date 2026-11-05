@@ -1470,6 +1470,15 @@ mod exclusive_tests {
         assert_eq!(word("fmul.2d", &["v2", "v3", "v4"]), 0x6E64_DC62);
         assert_eq!(word("dup.4s", &["v0", "w12"]), 0x4E04_0D80);
         assert_eq!(word("dup.2d", &["v2", "x3"]), 0x4E08_0C62);
+        assert_eq!(word("dup", &["v0.4s", "v1.s[2]"]), 0x4E14_0420);
+        assert_eq!(word("dup", &["v0.2d", "v1.d[1]"]), 0x4E18_0420);
+        assert_eq!(word("dup", &["v0.8b", "v1.b[7]"]), 0x0E0F_0420);
+        assert_eq!(word("dup", &["v0.16b", "v1.b[15]"]), 0x4E1F_0420);
+        assert_eq!(word("dup", &["v0.4h", "v1.h[0]"]), 0x0E02_0420);
+        assert_eq!(
+            word("dup.2s", &["v0", "v1[1]"]),
+            word("dup", &["v0.2s", "v1.s[1]"])
+        );
         assert_eq!(word("mov.s", &["w12", "v0[3]"]), 0x0E1C_3C0C);
         assert_eq!(word("mov.s", &["v0[1]", "w10"]), 0x4E0C_1D40);
         assert_eq!(word("mov", &["w11", "v0.s[0]"]), 0x0E04_3C0B);
@@ -1555,6 +1564,10 @@ mod exclusive_tests {
             ("movi", &["v0.4s", "#0x100"]),
             ("movi", &["v0.4s", "1"]),
             ("movi", &["v0.4s"]),
+            ("dup", &["v0.2s", "v1.d[1]"]),
+            ("dup", &["v0.4s", "v1.h[2]"]),
+            ("dup", &["v0.4s", "v1.s[4]"]),
+            ("dup", &["v0.4s", "v1.4s"]),
             ("ld1", &["{ v0.4s, v2.4s }", "[x0]"]),
             ("ld1", &["{ v0.4s, v1.8h }", "[x0]"]),
             ("ld1", &["{ v0.4s }", "[x0], #16"]),

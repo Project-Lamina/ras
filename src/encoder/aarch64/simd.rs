@@ -206,6 +206,7 @@ fn split_vector(text: &str) -> Option<(&str, &str)> {
 pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
     let vector_first = p.first().is_some_and(|s| s.starts_with('v'));
     let word = match op {
+        "dup" if vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => dup_element(p)?,
         "dup" if vector_first => dup_general(p)?,
         "ins" => ins_general(p)?,
         "umov" => umov(p)?,
@@ -323,6 +324,18 @@ fn dup_general(p: &[String]) -> Result<u32, RasError> {
         )));
     }
     Ok(0x0E00_0C00 | arrangement.q() | (Lane::imm5(lane, 0) << 16) | (rn << 5) | rd)
+}
+
+/// DUP (element), 0 Q 0 01110 000 imm5 0 0000 1 Rn Rd: copies one lane to
+/// every lane. The element's lane size must be the destination's.
+fn dup_element(p: &[String]) -> Result<u32, RasError> {
+    let p = exact(p, 2)?;
+    let (rd, arrangement) = vector_register(&p[0])?;
+    let (rn, lane, index) = element(&p[1])?;
+    if lane != arrangement.lane() {
+        return Err(error(format!("dup {} needs a {} element", p[0], p[0])));
+    }
+    Ok(0x0E00_0400 | arrangement.q() | (lane.imm5(index) << 16) | (rn << 5) | rd)
 }
 
 /// INS (general), 0 1 0 01110 000 imm5 0 0011 1 Rn Rd.

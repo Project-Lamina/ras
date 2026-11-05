@@ -277,6 +277,19 @@ fn neon_structure_loads_and_stores_match_clang_bytes() {
     assert_matches_clang("ras-neon-ld1", source);
 }
 
+#[test]
+fn neon_dup_element_matches_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tdup.4s v0, v1[2]\n\
+        \tdup.2d v2, v3[1]\n\
+        \tdup.8b v4, v5[7]\n\
+        \tdup.16b v6, v7[15]\n\
+        \tdup.8h v8, v9[3]\n\
+        \tdup.4h v10, v11[0]\n\
+        \tdup.2s v12, v13[1]\n";
+    assert_matches_clang("ras-neon-dup", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();
