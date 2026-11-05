@@ -240,6 +240,26 @@ fn neon_fmov_high_doubleword_matches_clang_bytes() {
     assert_matches_clang("ras-neon-fmov", source);
 }
 
+#[test]
+fn neon_movi_matches_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tmovi.2d v0, #0\n\
+        \tmovi.16b v1, #0\n\
+        \tmovi.8b v2, #0xff\n\
+        \tmovi.4s v3, #1\n\
+        \tmovi.4s v4, #0x1, lsl #8\n\
+        \tmovi.4s v5, #0x3, lsl #16\n\
+        \tmovi.2s v6, #0x3, lsl #24\n\
+        \tmovi.8h v7, #0x2, lsl #8\n\
+        \tmovi.4h v8, #0x2\n\
+        \tmovi.2d v9, #0xff00ff00ff00ff00\n\
+        \tmovi.2d v10, #0xffffffffffffffff\n\
+        \tmovi.2d v11, #0x00ff00ff00ff00ff\n\
+        \tmovi.16b v12, #0x42\n\
+        \tmovi.4s v13, #0\n";
+    assert_matches_clang("ras-neon-movi", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();

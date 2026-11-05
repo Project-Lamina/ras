@@ -1411,6 +1411,21 @@ mod exclusive_tests {
         );
         assert_eq!(word("fmov", &["x0", "v1.d[1]"]), 0x9EAE_0020);
         assert_eq!(word("fmov", &["v1.d[1]", "x0"]), 0x9EAF_0001);
+        assert_eq!(word("movi", &["v0.2d", "#0"]), 0x6F00_E400);
+        assert_eq!(word("movi", &["v0.16b", "#0"]), 0x4F00_E400);
+        assert_eq!(word("movi", &["v0.8b", "#0xff"]), 0x0F07_E7E0);
+        assert_eq!(word("movi", &["v1.4s", "#1"]), 0x4F00_0421);
+        assert_eq!(word("movi", &["v1.4s", "#0x1", "lsl #8"]), 0x4F00_2421);
+        assert_eq!(word("movi", &["v1.8h", "#0x2", "lsl #8"]), 0x4F00_A441);
+        assert_eq!(word("movi", &["v1.4h", "#0x2"]), 0x0F00_8441);
+        assert_eq!(word("movi", &["v1.2s", "#0x3"]), 0x0F00_0461);
+        assert_eq!(word("movi", &["v1.2d", "#0xff00ff00ff00ff00"]), 0x6F05_E541);
+        assert_eq!(word("movi", &["v1.2d", "#0xffffffffffffffff"]), 0x6F07_E7E1);
+        assert_eq!(word("movi", &["v1.16b", "#0x42"]), 0x4F02_E441);
+        assert_eq!(
+            word("movi.4s", &["v1", "#1"]),
+            word("movi", &["v1.4s", "#1"])
+        );
         assert_eq!(
             word("fmov.d", &["x0", "v1[1]"]),
             word("fmov", &["x0", "v1.d[1]"])
@@ -1510,6 +1525,17 @@ mod exclusive_tests {
             ("fmov", &["x0", "v1.s[1]"]),
             ("fmov", &["v1.d[1]", "w0"]),
             ("fmov", &["d0", "v1.d[1]"]),
+            ("movi", &["v0.8b", "#256"]),
+            ("movi", &["v0.16b", "#0x100"]),
+            ("movi", &["v0.2d", "#1"]),
+            ("movi", &["v0.2d", "#-1"]),
+            ("movi", &["v0.2d", "#0x1ff"]),
+            ("movi", &["v0.4s", "#0x3", "lsl #4"]),
+            ("movi", &["v0.4s", "#0x3", "lsl #32"]),
+            ("movi", &["v0.8b", "#0x3", "lsl #8"]),
+            ("movi", &["v0.4s", "#0x100"]),
+            ("movi", &["v0.4s", "1"]),
+            ("movi", &["v0.4s"]),
         ];
         for (op, operands) in refused {
             let inst = ParsedInstruction {

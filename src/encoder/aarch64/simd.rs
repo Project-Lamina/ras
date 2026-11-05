@@ -213,6 +213,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         "addv" => addv(p)?,
         "fmov" if p.iter().any(|s| s.starts_with('v')) => fmov_lane(p)?,
         "ext" if vector_first => ext_vector(p)?,
+        "movi" if vector_first => movi_vector(p)?,
         "faddp" if !vector_first => faddp_scalar(p)?,
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
         "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
@@ -360,6 +361,86 @@ fn fmov_lane(p: &[String]) -> Result<u32, RasError> {
     } else {
         0x9EAE_0000 | (number << 5) | gpr
     })
+}
+
+/// MOVI (vector immediate), 0 Q op 0111100000 abc cmode 01 defgh Rd. The
+/// eight-bit immediate is split as abc:defgh, and cmode and op select how it is
+/// expanded: a byte, a halfword or word shifted by a multiple of 8 bits, or,
+/// with op set, a mask of whole bytes for a doubleword.
+fn movi_vector(p: &[String]) -> Result<u32, RasError> {
+    if !(2..=3).contains(&p.len()) {
+        return Err(error(format!(
+            "Expected 2 or 3 operands, found {}",
+            p.len()
+        )));
+    }
+    let (rd, arrangement) = vector_register(&p[0])?;
+    let value = p[1]
+        .strip_prefix('#')
+        .and_then(|digits| crate::parser::parse_integer(digits).ok())
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| error(format!("Expected an unsigned immediate: {}", p[1])))?;
+    let shift = match p.get(2) {
+        None => 0,
+        Some(text) => text
+            .strip_prefix("lsl")
+            .and_then(|amount| super::immediate(amount).ok())
+            .ok_or_else(|| error(format!("Expected lsl #<n>: {text}")))?,
+    };
+    let (op, cmode, imm8) = match arrangement {
+        Arrangement::B8
+        | Arrangement::B16
+        | Arrangement::H4
+        | Arrangement::H8
+        | Arrangement::S2
+        | Arrangement::S4
+            if !(0..=255).contains(&value) =>
+        {
+            return Err(error(format!(
+                "movi immediate must be in 0..=255: {}",
+                p[1]
+            )));
+        }
+        Arrangement::B8 | Arrangement::B16 if shift == 0 => (0, 0b1110, value as u32),
+        Arrangement::H4 | Arrangement::H8 if shift == 0 => (0, 0b1000, value as u32),
+        Arrangement::H4 | Arrangement::H8 if shift == 8 => (0, 0b1010, value as u32),
+        Arrangement::S2 | Arrangement::S4 if matches!(shift, 0 | 8 | 16 | 24) => {
+            (0, (shift as u32 / 8) << 1, value as u32)
+        }
+        Arrangement::D2 if shift == 0 => (1, 0b1110, byte_mask(value)?),
+        _ => {
+            return Err(error(format!(
+                "movi cannot shift this arrangement by {shift}: {}",
+                p[0]
+            )));
+        }
+    };
+    Ok(0x0F00_0400
+        | arrangement.q()
+        | (op << 29)
+        | ((imm8 >> 5) << 16)
+        | (cmode << 12)
+        | ((imm8 & 0x1F) << 5)
+        | rd)
+}
+
+/// The eight-bit mask whose bits select the 0xff bytes of a doubleword, for
+/// the MOVI form that expands each bit to a byte.
+fn byte_mask(value: i128) -> Result<u32, RasError> {
+    let value = u64::try_from(value).map_err(|_| {
+        error(format!(
+            "movi.2d immediate is wider than 64 bits: {value:#x}"
+        ))
+    })?;
+    let mut mask = 0;
+    for byte in 0..8 {
+        match (value >> (8 * byte)) & 0xFF {
+            0x00 => {}
+            0xFF => mask |= 1 << byte,
+            _ => return Err(error(format!("movi.2d bytes must be 00 or ff: {value:#x}"))),
+        }
+    }
+    Ok(mask)
 }
 
 /// EXT, 0 Q 10 1110 00 0 Rm 0 imm4 0 Rn Rd: bytes taken from the pair
