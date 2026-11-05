@@ -5,8 +5,8 @@ use lamina_mir::{
     block::Block,
     function::{Function, Parameter, Signature},
     instruction::{
-        AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp, IntCmpOp,
-        IntOverflowOp, IntUnOp, MemoryAttrs, Operand,
+        AddressMode, AtomicBinOp, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction,
+        IntBinOp, IntCmpOp, IntOverflowOp, IntUnOp, MemoryAttrs, MemoryOrdering, Operand,
     },
     module::{Global, Module},
     register::{Register, VirtualReg},
@@ -1225,4 +1225,401 @@ fn int_overflow_hand_checked_boundaries() {
             "{op} {ty:?} signed={signed} {lhs} {rhs}"
         );
     }
+}
+
+const ALL_WIDTHS: [ScalarType; 4] = [
+    ScalarType::I8,
+    ScalarType::I16,
+    ScalarType::I32,
+    ScalarType::I64,
+];
+
+/// The value a `ty` holds after storing `raw`, read back sign-extended.
+fn canonical(ty: ScalarType, raw: i64) -> i64 {
+    MirType::Scalar(ty).signed_integer(raw, PointerWidth::Bits64)
+}
+
+fn mask_of(ty: ScalarType) -> u64 {
+    match ty {
+        ScalarType::I8 => 0xFF,
+        ScalarType::I16 => 0xFFFF,
+        ScalarType::I32 => 0xFFFF_FFFF,
+        _ => u64::MAX,
+    }
+}
+
+fn slot_addr(dst: u32, slot: u32) -> Instruction {
+    Instruction::StackAddr {
+        dst: v(dst),
+        slot: VirtualReg::gpr(slot),
+    }
+}
+
+fn at_base(base: u32) -> AddressMode {
+    AddressMode::BaseOffset {
+        address_space: Default::default(),
+        base: v(base),
+        offset: 0,
+    }
+}
+
+fn widen(entry: &mut Block, ty: ScalarType, src: u32, dst: u32) {
+    entry.push(Instruction::IntConvert {
+        from: MirType::Scalar(ty),
+        to: I64,
+        signed: true,
+        dst: v(dst),
+        src: reg(src),
+    });
+}
+
+/// A function that makes its result from `body`, which runs after the slot is set up.
+fn atomic_function(name: &str, body: impl FnOnce(&mut Block)) -> Function {
+    let mut entry = Block::new("entry");
+    entry.push(slot_addr(1, 50));
+    body(&mut entry);
+    let mut function = Function::new(Signature::new(name).with_return(I64));
+    function.stack_reservations.insert(VirtualReg::gpr(50), 1);
+    function.add_block(entry);
+    function
+}
+
+#[test]
+fn atomic_load_and_store_round_trip_every_width_and_ordering() {
+    use MemoryOrdering::{Acquire, Relaxed, Release, SeqCst};
+    let values: [i64; 6] = [0, 1, -1, 0x7F, -0x8000, 0x1234_5678_9ABC_DEF0];
+    let orderings = [(Relaxed, Relaxed), (Release, Acquire), (SeqCst, SeqCst)];
+    let mut functions = Vec::new();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for ty in ALL_WIDTHS {
+        for (store_order, load_order) in orderings {
+            for (index, &value) in values.iter().enumerate() {
+                let name = format!("rt{}", functions.len());
+                let from_register = index % 2 == 1;
+                functions.push(atomic_function(&name, |entry| {
+                    let stored = if from_register {
+                        entry.push(Instruction::Copy {
+                            ty: I64,
+                            dst: v(5),
+                            src: imm(value),
+                        });
+                        reg(5)
+                    } else {
+                        typed_imm(ty, value)
+                    };
+                    entry.push(Instruction::AtomicStore {
+                        ty: MirType::Scalar(ty),
+                        src: stored,
+                        addr: at_base(1),
+                        ordering: store_order,
+                    });
+                    entry.push(Instruction::AtomicLoad {
+                        ty: MirType::Scalar(ty),
+                        dst: v(2),
+                        addr: at_base(1),
+                        ordering: load_order,
+                    });
+                    widen(entry, ty, 2, 3);
+                    ret(entry, 3);
+                }));
+                names.push(name);
+                expected.push((ty, store_order, load_order, value, canonical(ty, value)));
+            }
+        }
+    }
+    let got = run_named(functions, &names);
+    for (index, (ty, store_order, load_order, value, want)) in expected.iter().enumerate() {
+        assert_eq!(
+            got[index], *want,
+            "{ty:?} store {store_order:?} load {load_order:?} of {value:#x}"
+        );
+    }
+}
+
+fn atomic_binop(op: AtomicBinOp, a: i64, b: i64) -> i64 {
+    match op {
+        AtomicBinOp::Add => a.wrapping_add(b),
+        AtomicBinOp::Sub => a.wrapping_sub(b),
+        AtomicBinOp::And => a & b,
+        AtomicBinOp::Or => a | b,
+        AtomicBinOp::Xor => a ^ b,
+        AtomicBinOp::Exchange => b,
+    }
+}
+
+#[test]
+fn atomic_binary_returns_old_and_stores_new_at_every_width() {
+    use AtomicBinOp::{Add, And, Exchange, Or, Sub, Xor};
+    let ops = [Add, Sub, And, Or, Xor, Exchange];
+    let values: [i64; 8] = [0, 1, -1, 0x7F, -0x80, 0x100, 0x7FFF_FFFF, i64::MIN];
+    let mut functions = Vec::new();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for ty in ALL_WIDTHS {
+        for op in ops {
+            for (i, &a) in values.iter().enumerate() {
+                for (j, &b) in values.iter().enumerate() {
+                    // Old value and stored value are read by two functions over the same setup.
+                    let build = |name: &str, read_old: bool| {
+                        atomic_function(name, |entry| {
+                            entry.push(Instruction::AtomicStore {
+                                ty: MirType::Scalar(ty),
+                                src: typed_imm(ty, a),
+                                addr: at_base(1),
+                                ordering: MemoryOrdering::Relaxed,
+                            });
+                            let value = if (i + j) % 2 == 0 {
+                                typed_imm(ty, b)
+                            } else {
+                                entry.push(Instruction::Copy {
+                                    ty: I64,
+                                    dst: v(6),
+                                    src: imm(b),
+                                });
+                                reg(6)
+                            };
+                            entry.push(Instruction::AtomicBinary {
+                                op,
+                                ty: MirType::Scalar(ty),
+                                dst: v(2),
+                                addr: at_base(1),
+                                value,
+                                ordering: MemoryOrdering::SeqCst,
+                            });
+                            if read_old {
+                                widen(entry, ty, 2, 3);
+                            } else {
+                                entry.push(Instruction::AtomicLoad {
+                                    ty: MirType::Scalar(ty),
+                                    dst: v(4),
+                                    addr: at_base(1),
+                                    ordering: MemoryOrdering::Acquire,
+                                });
+                                widen(entry, ty, 4, 3);
+                            }
+                            ret(entry, 3);
+                        })
+                    };
+                    let old_name = format!("bin{}", functions.len());
+                    functions.push(build(&old_name, true));
+                    names.push(old_name);
+                    let new_name = format!("bin{}", functions.len());
+                    functions.push(build(&new_name, false));
+                    names.push(new_name);
+                    let result = atomic_binop(op, a, b);
+                    expected.push((ty, op, a, b, canonical(ty, a), canonical(ty, result)));
+                }
+            }
+        }
+    }
+    let got = run_named(functions, &names);
+    for (index, (ty, op, a, b, old, new)) in expected.iter().enumerate() {
+        assert_eq!(got[2 * index], *old, "{op} old {ty:?} {a:#x} {b:#x}");
+        assert_eq!(got[2 * index + 1], *new, "{op} new {ty:?} {a:#x} {b:#x}");
+    }
+}
+
+#[test]
+fn compare_exchange_swaps_only_on_a_width_match() {
+    let values: [i64; 5] = [0, 1, -1, 0x7F, -0x80];
+    let mut functions = Vec::new();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for ty in ALL_WIDTHS {
+        for &current in &values {
+            for &wanted in &values {
+                // Narrow expected values also come with bits above the width set.
+                let expected_raw = if ty == ScalarType::I64 {
+                    wanted
+                } else {
+                    wanted ^ 0x1234_5600_0000_0000
+                };
+                let desired = 42;
+                let build = |name: &str, read_old: bool| {
+                    atomic_function(name, |entry| {
+                        entry.push(Instruction::AtomicStore {
+                            ty: MirType::Scalar(ty),
+                            src: typed_imm(ty, current),
+                            addr: at_base(1),
+                            ordering: MemoryOrdering::Relaxed,
+                        });
+                        entry.push(Instruction::Copy {
+                            ty: I64,
+                            dst: v(5),
+                            src: imm(expected_raw),
+                        });
+                        entry.push(Instruction::AtomicCompareExchange {
+                            ty: MirType::Scalar(ty),
+                            dst: v(2),
+                            addr: at_base(1),
+                            expected: reg(5),
+                            desired: typed_imm(ty, desired),
+                            success_ordering: MemoryOrdering::SeqCst,
+                            failure_ordering: MemoryOrdering::Acquire,
+                        });
+                        if read_old {
+                            widen(entry, ty, 2, 3);
+                        } else {
+                            entry.push(Instruction::AtomicLoad {
+                                ty: MirType::Scalar(ty),
+                                dst: v(4),
+                                addr: at_base(1),
+                                ordering: MemoryOrdering::SeqCst,
+                            });
+                            widen(entry, ty, 4, 3);
+                        }
+                        ret(entry, 3);
+                    })
+                };
+                let old_name = format!("cas{}", functions.len());
+                functions.push(build(&old_name, true));
+                names.push(old_name);
+                let new_name = format!("cas{}", functions.len());
+                functions.push(build(&new_name, false));
+                names.push(new_name);
+                let matched =
+                    (canonical(ty, current) as u64 & mask_of(ty)) == (wanted as u64 & mask_of(ty));
+                let after = if matched {
+                    canonical(ty, desired)
+                } else {
+                    canonical(ty, current)
+                };
+                expected.push((ty, current, wanted, canonical(ty, current), after));
+            }
+        }
+    }
+    let got = run_named(functions, &names);
+    for (index, (ty, current, wanted, old, after)) in expected.iter().enumerate() {
+        assert_eq!(got[2 * index], *old, "cas old {ty:?} {current} {wanted}");
+        assert_eq!(
+            got[2 * index + 1],
+            *after,
+            "cas new {ty:?} {current} {wanted}"
+        );
+    }
+}
+
+/// A function taking an address and adding one to the cell there, atomically.
+fn bump_function(name: &str, ty: ScalarType) -> Function {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::AtomicBinary {
+        op: AtomicBinOp::Add,
+        ty: MirType::Scalar(ty),
+        dst: v(1),
+        addr: at_base(0),
+        value: typed_imm(ty, 1),
+        ordering: MemoryOrdering::SeqCst,
+    });
+    ret(&mut entry, 1);
+    let mut function = Function::new(
+        Signature::new(name)
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    function.add_block(entry);
+    function
+}
+
+#[test]
+fn atomic_add_from_several_threads_loses_no_increment() {
+    let module = module_of(vec![bump_function("bump64", ScalarType::I64)]);
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    let (code, offsets) = assembler
+        .compile_mir_to_binary_function(&module, None)
+        .expect("compile");
+    let mut memory = ExecutableMemory::allocate_writable(code.len()).expect("allocate");
+    memory.write_code(&code).expect("write");
+    memory.make_executable().expect("protect");
+    let base = memory.code_start() as usize;
+    let wide = base + offsets["bump64"];
+    let wide_fn: unsafe extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(wide) };
+    let cell = Box::into_raw(Box::new(0i64)) as usize;
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(move || {
+                for _ in 0..2000 {
+                    unsafe { wide_fn(cell as i64) };
+                }
+            });
+        }
+    });
+    let total = unsafe { *Box::from_raw(cell as *mut i64) };
+    assert_eq!(total, 8000);
+}
+
+#[test]
+fn narrow_atomic_add_leaves_neighbouring_bytes_alone() {
+    let module = module_of(vec![bump_function("bump8", ScalarType::I8)]);
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    let (code, offsets) = assembler
+        .compile_mir_to_binary_function(&module, None)
+        .expect("compile");
+    let mut memory = ExecutableMemory::allocate_writable(code.len()).expect("allocate");
+    memory.write_code(&code).expect("write");
+    memory.make_executable().expect("protect");
+    let start = memory.code_start() as usize + offsets["bump8"];
+    let bump: unsafe extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(start) };
+    let cell = Box::into_raw(Box::new(0xAAAA_AAAA_AAAA_AA00u64)) as usize;
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(move || {
+                for _ in 0..1000 {
+                    unsafe { bump(cell as i64) };
+                }
+            });
+        }
+    });
+    let after = unsafe { *Box::from_raw(cell as *mut u64) };
+    // 4000 increments of one byte wrap to 160 and touch nothing else.
+    assert_eq!(after, 0xAAAA_AAAA_AAAA_AAA0);
+}
+
+#[test]
+fn atomic_orderings_the_mir_rejects_are_refused() {
+    let refuse = |instruction: Instruction| {
+        let mut entry = Block::new("entry");
+        entry.push(slot_addr(1, 50));
+        entry.push(instruction);
+        entry.push(Instruction::Ret { value: None });
+        let mut function = Function::new(Signature::new("bad").with_return(I64));
+        function.stack_reservations.insert(VirtualReg::gpr(50), 1);
+        function.add_block(entry);
+        let module = module_of(vec![function]);
+        let mut assembler =
+            RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+        assembler
+            .compile_mir_to_binary_function(&module, None)
+            .is_err()
+    };
+    let i64ty = MirType::Scalar(ScalarType::I64);
+    assert!(refuse(Instruction::AtomicLoad {
+        ty: i64ty,
+        dst: v(2),
+        addr: at_v1(0),
+        ordering: MemoryOrdering::Release,
+    }));
+    assert!(refuse(Instruction::AtomicStore {
+        ty: i64ty,
+        src: imm(1),
+        addr: at_v1(0),
+        ordering: MemoryOrdering::Acquire,
+    }));
+    assert!(refuse(Instruction::AtomicCompareExchange {
+        ty: i64ty,
+        dst: v(2),
+        addr: at_v1(0),
+        expected: imm(0),
+        desired: imm(1),
+        success_ordering: MemoryOrdering::Relaxed,
+        failure_ordering: MemoryOrdering::Release,
+    }));
+    assert!(refuse(Instruction::AtomicBinary {
+        op: AtomicBinOp::Add,
+        ty: MirType::Scalar(ScalarType::F64),
+        dst: v(2),
+        addr: at_v1(0),
+        value: Operand::Immediate(Immediate::F64(1.0)),
+        ordering: MemoryOrdering::SeqCst,
+    }));
 }

@@ -1167,6 +1167,87 @@ fn encode_mir_instruction_with_context(
                 stack_size,
             )?;
         }
+        lamina_mir::Instruction::AtomicLoad {
+            ty,
+            dst,
+            addr,
+            ordering,
+        } => {
+            encode_atomic_load(
+                assembler,
+                ty,
+                dst,
+                addr,
+                *ordering,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
+        lamina_mir::Instruction::AtomicStore {
+            ty,
+            src,
+            addr,
+            ordering,
+        } => {
+            encode_atomic_store(
+                assembler,
+                ty,
+                src,
+                addr,
+                *ordering,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
+        lamina_mir::Instruction::AtomicBinary {
+            op,
+            ty,
+            dst,
+            addr,
+            value,
+            ..
+        } => {
+            encode_atomic_binary(
+                assembler,
+                *op,
+                ty,
+                dst,
+                addr,
+                value,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
+        lamina_mir::Instruction::AtomicCompareExchange {
+            ty,
+            dst,
+            addr,
+            expected,
+            desired,
+            success_ordering,
+            failure_ordering,
+        } => {
+            encode_atomic_compare_exchange(
+                assembler,
+                ty,
+                dst,
+                addr,
+                expected,
+                desired,
+                *success_ordering,
+                *failure_ordering,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
         lamina_mir::Instruction::IntUnary { op, ty, dst, src } => {
             encode_int_unary(
                 assembler,

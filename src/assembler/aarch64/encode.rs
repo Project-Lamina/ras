@@ -11,7 +11,7 @@ use crate::encoder::aarch64::ldst_imm64::{
     encode_str_imm64, encode_str_scalar,
 };
 use crate::error::RasError;
-use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
+use lamina_mir::{AddressMode, Immediate, MirType, Operand, Register, ScalarType};
 
 /// `SUB`/`ADD` sp in up to two immediates: the low 12 bits and the next 12 shifted.
 fn adjust_sp(code: &mut Vec<u8>, size: usize, low: u32, high: u32) -> Result<(), RasError> {
@@ -1258,4 +1258,307 @@ pub(super) fn encode_int_overflow(
         }
     }
     store_to_slot(code, "x11", dst, stack_slots)
+}
+
+/// Size field of the load-acquire, store-release and exclusive families: 0 byte, 1 half,
+/// 2 word, 3 doubleword.
+#[cfg(feature = "encoder")]
+fn atomic_size_field(ty: &MirType) -> Result<u32, RasError> {
+    Ok(match int_width_bits(ty)? {
+        8 => 0,
+        16 => 1,
+        32 => 2,
+        _ => 3,
+    })
+}
+
+/// Compute the address of an atomic access into x16, the one register the atomic
+/// sequences keep it in.
+#[cfg(feature = "encoder")]
+fn encode_atomic_address(
+    assembler: &mut RasAssembler,
+    addr: &AddressMode,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    match addr {
+        AddressMode::BaseOffset { base, offset, .. } => {
+            let (base_reg, scratch) = load_base_gpr(base, stack_slots, reg_alloc, code)?;
+            code.extend_from_slice(&encode_mov_x(16, base_reg));
+            if let Some(s) = scratch {
+                reg_alloc.free_scratch(s);
+            }
+            apply_i32_offset_to_reg(
+                assembler,
+                reg_alloc,
+                stack_slots,
+                stack_size,
+                code,
+                16,
+                i32::from(*offset),
+            )
+        }
+        AddressMode::BaseIndexScale {
+            base,
+            index,
+            scale,
+            offset,
+            ..
+        } => {
+            let log2 = match *scale {
+                1 => 0u16,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                _ => {
+                    return Err(RasError::EncodingError(format!(
+                        "Unsupported address scale {} (expected 1,2,4,8)",
+                        scale
+                    )));
+                }
+            };
+            emit_indexed_address(
+                assembler,
+                base,
+                index,
+                log2,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+                "x16",
+            )?;
+            apply_i32_offset_to_reg(
+                assembler,
+                reg_alloc,
+                stack_slots,
+                stack_size,
+                code,
+                16,
+                i32::from(*offset),
+            )
+        }
+    }
+}
+
+/// Sign-extend a narrow value that a zero-extending exclusive or acquire load left in x10,
+/// the way `Load` leaves it.
+#[cfg(feature = "encoder")]
+fn sign_extend_narrow_x10(code: &mut Vec<u8>, ty: &MirType) -> Result<(), RasError> {
+    let bits = int_width_bits(ty)?;
+    if bits < 64 {
+        code.extend_from_slice(&encode_sbfm64(10, 10, 0, bits - 1));
+    }
+    Ok(())
+}
+
+/// Load-acquire (`ldar`) for acquire and seq_cst, plain load for relaxed.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_atomic_load(
+    assembler: &mut RasAssembler,
+    ty: &MirType,
+    dst: &Register,
+    addr: &AddressMode,
+    ordering: lamina_mir::MemoryOrdering,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    use lamina_mir::MemoryOrdering::{Acquire, Relaxed, SeqCst};
+    let size = atomic_size_field(ty)?;
+    match ordering {
+        Relaxed => {
+            encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+            code.extend_from_slice(&encode_ldr_typed("x10", 16, 0, ty)?);
+        }
+        Acquire | SeqCst => {
+            encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+            code.extend_from_slice(&word_bytes(0x08DF_FC00 | (size << 30) | (16 << 5) | 10));
+            sign_extend_narrow_x10(code, ty)?;
+        }
+        _ => {
+            return Err(RasError::EncodingError(format!(
+                "AArch64 JIT: atomic load with {ordering:?} ordering is not valid"
+            )));
+        }
+    }
+    store_to_slot(code, "x10", dst, stack_slots)
+}
+
+/// Store-release (`stlr`) for release and seq_cst, plain store for relaxed.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_atomic_store(
+    assembler: &mut RasAssembler,
+    ty: &MirType,
+    src: &Operand,
+    addr: &AddressMode,
+    ordering: lamina_mir::MemoryOrdering,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    use lamina_mir::MemoryOrdering::{Relaxed, Release, SeqCst};
+    let size = atomic_size_field(ty)?;
+    match ordering {
+        Relaxed | Release | SeqCst => {}
+        _ => {
+            return Err(RasError::EncodingError(format!(
+                "AArch64 JIT: atomic store with {ordering:?} ordering is not valid"
+            )));
+        }
+    }
+    encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+    materialize_operand(assembler, src, 9, stack_slots, reg_alloc, code, stack_size)?;
+    if ordering == Relaxed {
+        code.extend_from_slice(&encode_str_typed("x9", 16, 0, ty)?);
+    } else {
+        code.extend_from_slice(&word_bytes(0x089F_FC00 | (size << 30) | (16 << 5) | 9));
+    }
+    Ok(())
+}
+
+/// Read-modify-write as an exclusive load and store retry loop. The old value is the result.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_atomic_binary(
+    assembler: &mut RasAssembler,
+    op: lamina_mir::AtomicBinOp,
+    ty: &MirType,
+    dst: &Register,
+    addr: &AddressMode,
+    value: &Operand,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    use lamina_mir::AtomicBinOp;
+    // x9 is the operand, x10 the old value, x11 the new one, x12 the store status.
+    // The loop uses acquire-exclusive and release-exclusive, which is at least as strong
+    // as any requested ordering.
+    let size = atomic_size_field(ty)?;
+    encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+    materialize_operand(
+        assembler,
+        value,
+        9,
+        stack_slots,
+        reg_alloc,
+        code,
+        stack_size,
+    )?;
+
+    let loop_start = code.len();
+    code.extend_from_slice(&word_bytes(0x085F_FC00 | (size << 30) | (16 << 5) | 10));
+    let combine: u32 = match op {
+        AtomicBinOp::Add => 0x8B00_0000,
+        AtomicBinOp::Sub => 0xCB00_0000,
+        AtomicBinOp::And => 0x8A00_0000,
+        AtomicBinOp::Or => 0xAA00_0000,
+        AtomicBinOp::Xor => 0xCA00_0000,
+        AtomicBinOp::Exchange => 0,
+    };
+    if combine == 0 {
+        code.extend_from_slice(&encode_mov_x(11, 9));
+    } else {
+        code.extend_from_slice(&word_bytes(combine | (9 << 16) | (10 << 5) | 11));
+    }
+    code.extend_from_slice(&word_bytes(
+        0x0800_FC00 | (size << 30) | (12 << 16) | (16 << 5) | 11,
+    ));
+    let back = -(((code.len() - loop_start) / 4) as i64);
+    code.extend_from_slice(&word_bytes(
+        0xB500_0000 | ((back as u32 & 0x7_FFFF) << 5) | 12,
+    ));
+
+    sign_extend_narrow_x10(code, ty)?;
+    store_to_slot(code, "x10", dst, stack_slots)
+}
+
+/// Compare-and-exchange as an exclusive retry loop. The old value is the result, and the
+/// exchange happens only when the old value equals `expected` at the width of `ty`.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_atomic_compare_exchange(
+    assembler: &mut RasAssembler,
+    ty: &MirType,
+    dst: &Register,
+    addr: &AddressMode,
+    expected: &Operand,
+    desired: &Operand,
+    success_ordering: lamina_mir::MemoryOrdering,
+    failure_ordering: lamina_mir::MemoryOrdering,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    // x10 old, x12 store status, x14 expected, x15 desired.
+    if let Some(reason) =
+        lamina_mir::MemoryOrdering::cmpxchg_failure_rejection(success_ordering, failure_ordering)
+    {
+        return Err(RasError::EncodingError(format!(
+            "AArch64 JIT: compare-exchange orderings rejected: {reason}"
+        )));
+    }
+    let bits = int_width_bits(ty)?;
+    let size = atomic_size_field(ty)?;
+    encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+    materialize_operand(
+        assembler,
+        expected,
+        14,
+        stack_slots,
+        reg_alloc,
+        code,
+        stack_size,
+    )?;
+    if bits < 64 {
+        // The old value is zero-extended from memory, so the expected value is masked to match.
+        code.extend_from_slice(&encode_ubfm64(14, 14, 0, bits - 1));
+    }
+    materialize_operand(
+        assembler,
+        desired,
+        15,
+        stack_slots,
+        reg_alloc,
+        code,
+        stack_size,
+    )?;
+
+    let loop_start = code.len();
+    code.extend_from_slice(&word_bytes(0x085F_FC00 | (size << 30) | (16 << 5) | 10));
+    // CMP x10, x14
+    code.extend_from_slice(&word_bytes(0xEB00_001F | (14 << 16) | (10 << 5)));
+    // B.NE to the failure path, patched once it is placed.
+    let bne_at = code.len();
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&word_bytes(
+        0x0800_FC00 | (size << 30) | (12 << 16) | (16 << 5) | 15,
+    ));
+    let back = -(((code.len() - loop_start) / 4) as i64);
+    code.extend_from_slice(&word_bytes(
+        0xB500_0000 | ((back as u32 & 0x7_FFFF) << 5) | 12,
+    ));
+    // Stored: skip the failure path.
+    let b_at = code.len();
+    code.extend_from_slice(&[0; 4]);
+    let fail_at = code.len();
+    code.extend_from_slice(&word_bytes(0xD503_305F));
+    let done_at = code.len();
+
+    let bne = 0x5400_0000 | ((((fail_at - bne_at) / 4) as u32 & 0x7_FFFF) << 5) | 0b0001;
+    code[bne_at..bne_at + 4].copy_from_slice(&bne.to_le_bytes());
+    let b = 0x1400_0000 | (((done_at - b_at) / 4) as u32 & 0x03FF_FFFF);
+    code[b_at..b_at + 4].copy_from_slice(&b.to_le_bytes());
+
+    sign_extend_narrow_x10(code, ty)?;
+    store_to_slot(code, "x10", dst, stack_slots)
 }
