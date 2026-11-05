@@ -6,7 +6,7 @@ use lamina_mir::{
     function::{Function, Parameter, Signature},
     instruction::{
         AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp, IntCmpOp,
-        MemoryAttrs, Operand,
+        IntUnOp, MemoryAttrs, Operand,
     },
     module::{Global, Module},
     register::{Register, VirtualReg},
@@ -855,4 +855,162 @@ fn two_functions_with_pointer_call() -> Module {
 #[test]
 fn function_address_and_indirect_call() {
     assert_eq!(run(&two_functions_with_pointer_call(), "main"), 42);
+}
+
+/// Compiles every function in `functions` into one block and returns what each one of the
+/// `names` returns, in order.
+fn run_named(functions: Vec<Function>, names: &[String]) -> Vec<i64> {
+    let module = module_of(functions);
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    let (code, offsets) = assembler
+        .compile_mir_to_binary_function(&module, None)
+        .expect("compile");
+    let mut memory = ExecutableMemory::allocate_writable(code.len()).expect("allocate");
+    memory.write_code(&code).expect("write");
+    memory.make_executable().expect("protect");
+    names
+        .iter()
+        .map(|name| {
+            let start = unsafe { memory.code_start().add(offsets[name.as_str()]) };
+            let function: unsafe extern "C" fn() -> i64 = unsafe { std::mem::transmute(start) };
+            unsafe { function() }
+        })
+        .collect()
+}
+
+/// Stores `value` at `ty`, reads it back, applies `op` and widens the result to i64.
+fn unary_function(name: &str, op: IntUnOp, ty: ScalarType, value: i64) -> Function {
+    let ty = MirType::Scalar(ty);
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::StackAddr {
+        dst: v(1),
+        slot: VirtualReg::gpr(50),
+    });
+    entry.push(Instruction::Store {
+        ty,
+        src: imm(value),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::Load {
+        ty,
+        dst: v(2),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::IntUnary {
+        op,
+        ty,
+        dst: v(3),
+        src: reg(2),
+    });
+    entry.push(Instruction::IntConvert {
+        from: ty,
+        to: I64,
+        signed: true,
+        dst: v(4),
+        src: reg(3),
+    });
+    ret(&mut entry, 4);
+    let mut function = Function::new(Signature::new(name).with_return(I64));
+    function.add_block(entry);
+    function
+}
+
+fn unary_result(op: IntUnOp, ty: ScalarType, value: i64) -> i64 {
+    let name = "unary".to_string();
+    run_named(vec![unary_function(&name, op, ty, value)], &[name])[0]
+}
+
+#[test]
+fn int_unary_matches_mir_evaluation_at_every_width() {
+    const EDGES: [i64; 22] = [
+        0,
+        1,
+        -1,
+        2,
+        3,
+        0x7F,
+        -0x80,
+        0xFF,
+        0x100,
+        0x0102,
+        0x8000,
+        -0x8000,
+        0x7FFF,
+        0x0102_0304,
+        -0x8000_0000,
+        0x7FFF_FFFF,
+        0x8000_0001,
+        0x0123_4567_89AB_CDEF,
+        i64::MIN,
+        i64::MAX,
+        0x40,
+        0xF0F0,
+    ];
+    let widths = [
+        ScalarType::I8,
+        ScalarType::I16,
+        ScalarType::I32,
+        ScalarType::I64,
+    ];
+    let ops = [
+        IntUnOp::Popcount,
+        IntUnOp::Ctlz,
+        IntUnOp::Cttz,
+        IntUnOp::Bswap,
+    ];
+    let mut functions = Vec::new();
+    let mut expected = Vec::new();
+    let mut names = Vec::new();
+    for op in ops {
+        for ty in widths {
+            for value in EDGES {
+                let name = format!("u{}", functions.len());
+                functions.push(unary_function(&name, op, ty, value));
+                expected.push((
+                    op,
+                    ty,
+                    value,
+                    IntUnOp::evaluate(op, MirType::Scalar(ty), value, PointerWidth::Bits64),
+                ));
+                names.push(name);
+            }
+        }
+    }
+    let got = run_named(functions, &names);
+    for (index, (op, ty, value, want)) in expected.iter().enumerate() {
+        assert_eq!(got[index], *want, "{op} {ty:?} of {value:#x}");
+    }
+}
+
+#[test]
+fn int_unary_hand_checked_edges() {
+    assert_eq!(unary_result(IntUnOp::Ctlz, ScalarType::I8, 0), 8);
+    assert_eq!(unary_result(IntUnOp::Ctlz, ScalarType::I8, 1), 7);
+    assert_eq!(unary_result(IntUnOp::Ctlz, ScalarType::I16, 0), 16);
+    assert_eq!(unary_result(IntUnOp::Ctlz, ScalarType::I32, -1), 0);
+    assert_eq!(unary_result(IntUnOp::Ctlz, ScalarType::I64, 0), 64);
+    assert_eq!(unary_result(IntUnOp::Cttz, ScalarType::I8, 0), 8);
+    assert_eq!(unary_result(IntUnOp::Cttz, ScalarType::I16, 0x8000), 15);
+    assert_eq!(unary_result(IntUnOp::Cttz, ScalarType::I64, 0), 64);
+    assert_eq!(unary_result(IntUnOp::Popcount, ScalarType::I8, -1), 8);
+    assert_eq!(unary_result(IntUnOp::Popcount, ScalarType::I64, -1), 64);
+    assert_eq!(
+        unary_result(IntUnOp::Popcount, ScalarType::I64, i64::MIN),
+        1
+    );
+    assert_eq!(
+        unary_result(IntUnOp::Bswap, ScalarType::I16, 0x0102),
+        0x0201
+    );
+    assert_eq!(
+        unary_result(IntUnOp::Bswap, ScalarType::I32, 0x0102_0304),
+        0x0403_0201
+    );
+    assert_eq!(unary_result(IntUnOp::Bswap, ScalarType::I8, -128), -128);
+    assert_eq!(
+        unary_result(IntUnOp::Bswap, ScalarType::I64, 0x0102_0304_0506_0708),
+        0x0807_0605_0403_0201
+    );
 }

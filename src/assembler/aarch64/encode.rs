@@ -3,7 +3,9 @@
 use super::operand::materialize_operand;
 use crate::assembler::core::RasAssembler;
 use crate::encoder::ParsedInstruction;
-use crate::encoder::aarch64::fixed::{enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr};
+use crate::encoder::aarch64::fixed::{
+    enc_ldp_post_64, enc_stp_pre_64, encode_add_rrr, encode_and_rrr,
+};
 use crate::encoder::aarch64::ldst_imm64::{
     AArch64ScalarLdKind, AArch64ScalarStKind, encode_ldr_imm64, encode_ldr_scalar,
     encode_str_imm64, encode_str_scalar,
@@ -988,4 +990,158 @@ pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {
             reg
         ))),
     }
+}
+
+/// Bit width of an integer type the JIT reads in place, refusing anything else.
+#[cfg(feature = "encoder")]
+pub(super) fn int_width_bits(ty: &MirType) -> Result<u8, RasError> {
+    match ty {
+        MirType::Scalar(ScalarType::I8) => Ok(8),
+        MirType::Scalar(ScalarType::I16) => Ok(16),
+        MirType::Scalar(ScalarType::I32) => Ok(32),
+        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(64),
+        _ => Err(RasError::EncodingError(format!(
+            "AArch64 JIT: integer operation on {:?} not supported",
+            ty
+        ))),
+    }
+}
+
+/// Little-endian bytes of one A64 instruction word.
+#[cfg(feature = "encoder")]
+fn word_bytes(word: u32) -> Vec<u8> {
+    word.to_le_bytes().to_vec()
+}
+
+/// Encode `IntUnary`. The operand is read at the width of `ty` (its upper bits are not
+/// trusted), and the result is written back sign-extended, the same way `Load` leaves a
+/// narrow value in its slot.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_int_unary(
+    assembler: &mut RasAssembler,
+    op: lamina_mir::IntUnOp,
+    ty: &MirType,
+    dst: &Register,
+    src: &Operand,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    use lamina_mir::IntUnOp;
+    // x9 holds the value, x10-x12 are temporaries. Nothing here reads the scratch pool.
+    const X: u8 = 9;
+    const T: u8 = 10;
+    const M: u8 = 11;
+    const U: u8 = 12;
+    let bits = int_width_bits(ty)?;
+    let narrow = bits < 64;
+
+    materialize_operand(assembler, src, X, stack_slots, reg_alloc, code, stack_size)?;
+    if narrow {
+        code.extend_from_slice(&encode_ubfm64(X, X, 0, bits - 1));
+    }
+
+    match op {
+        IntUnOp::Popcount => {
+            // SWAR population count over the 64-bit zero-extended value.
+            code.extend_from_slice(&encode_ubfm64(T, X, 1, 63));
+            materialize_operand(
+                assembler,
+                &imm_i64(0x5555_5555_5555_5555),
+                M,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            code.extend_from_slice(&encode_and_rrr(T, T, M));
+            code.extend_from_slice(&word_bytes(
+                0xCB00_0000 | ((T as u32) << 16) | ((X as u32) << 5) | X as u32,
+            ));
+            materialize_operand(
+                assembler,
+                &imm_i64(0x3333_3333_3333_3333),
+                M,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            code.extend_from_slice(&encode_and_rrr(T, X, M));
+            code.extend_from_slice(&encode_ubfm64(U, X, 2, 63));
+            code.extend_from_slice(&encode_and_rrr(U, U, M));
+            code.extend_from_slice(&encode_add_rrr(X, T, U));
+            code.extend_from_slice(&encode_ubfm64(T, X, 4, 63));
+            code.extend_from_slice(&encode_add_rrr(X, X, T));
+            materialize_operand(
+                assembler,
+                &imm_i64(0x0F0F_0F0F_0F0F_0F0F),
+                M,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            code.extend_from_slice(&encode_and_rrr(X, X, M));
+            materialize_operand(
+                assembler,
+                &imm_i64(0x0101_0101_0101_0101),
+                M,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            code.extend_from_slice(&word_bytes(
+                0x9B00_7C00 | ((M as u32) << 16) | ((X as u32) << 5) | X as u32,
+            ));
+            code.extend_from_slice(&encode_ubfm64(X, X, 56, 63));
+        }
+        IntUnOp::Ctlz => {
+            // CLZ of the zero-extended value counts the unused high bits too.
+            code.extend_from_slice(&word_bytes(0xDAC0_1000 | ((X as u32) << 5) | X as u32));
+            if narrow {
+                code.extend_from_slice(&word_bytes(
+                    0xD100_0000 | (u32::from(64 - bits) << 10) | ((X as u32) << 5) | X as u32,
+                ));
+            }
+        }
+        IntUnOp::Cttz => {
+            // A bit just above the width caps the count at the width, and gives it for zero.
+            if narrow {
+                materialize_operand(
+                    assembler,
+                    &imm_i64(1i64 << bits),
+                    T,
+                    stack_slots,
+                    reg_alloc,
+                    code,
+                    stack_size,
+                )?;
+                code.extend_from_slice(&word_bytes(
+                    0xAA00_0000 | ((T as u32) << 16) | ((X as u32) << 5) | X as u32,
+                ));
+            }
+            code.extend_from_slice(&word_bytes(0xDAC0_0000 | ((X as u32) << 5) | X as u32));
+            code.extend_from_slice(&word_bytes(0xDAC0_1000 | ((X as u32) << 5) | X as u32));
+        }
+        IntUnOp::Bswap => match bits {
+            8 => {}
+            16 => code.extend_from_slice(&word_bytes(0x5AC0_0400 | ((X as u32) << 5) | X as u32)),
+            32 => code.extend_from_slice(&word_bytes(0x5AC0_0800 | ((X as u32) << 5) | X as u32)),
+            _ => code.extend_from_slice(&word_bytes(0xDAC0_0C00 | ((X as u32) << 5) | X as u32)),
+        },
+    }
+
+    if narrow {
+        code.extend_from_slice(&encode_sbfm64(X, X, 0, bits - 1));
+    }
+    store_to_slot(code, "x9", dst, stack_slots)
+}
+
+#[cfg(feature = "encoder")]
+fn imm_i64(value: i64) -> Operand {
+    Operand::Immediate(Immediate::I64(value))
 }
