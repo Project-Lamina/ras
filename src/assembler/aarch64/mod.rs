@@ -1145,6 +1145,28 @@ fn encode_mir_instruction_with_context(
         lamina_mir::Instruction::Comment { .. }
         | lamina_mir::Instruction::StackMap { .. }
         | lamina_mir::Instruction::PatchPoint { .. } => {}
+        lamina_mir::Instruction::IntOverflow {
+            op,
+            ty,
+            signed,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            encode_int_overflow(
+                assembler,
+                *op,
+                ty,
+                *signed,
+                dst,
+                lhs,
+                rhs,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
         lamina_mir::Instruction::IntUnary { op, ty, dst, src } => {
             encode_int_unary(
                 assembler,

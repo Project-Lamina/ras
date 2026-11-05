@@ -6,7 +6,7 @@ use lamina_mir::{
     function::{Function, Parameter, Signature},
     instruction::{
         AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp, IntCmpOp,
-        IntUnOp, MemoryAttrs, Operand,
+        IntOverflowOp, IntUnOp, MemoryAttrs, Operand,
     },
     module::{Global, Module},
     register::{Register, VirtualReg},
@@ -1013,4 +1013,216 @@ fn int_unary_hand_checked_edges() {
         unary_result(IntUnOp::Bswap, ScalarType::I64, 0x0102_0304_0506_0708),
         0x0807_0605_0403_0201
     );
+}
+
+fn typed_imm(ty: ScalarType, value: i64) -> Operand {
+    Operand::Immediate(match ty {
+        ScalarType::I8 => Immediate::I8(value as i8),
+        ScalarType::I16 => Immediate::I16(value as i16),
+        ScalarType::I32 => Immediate::I32(value as i32),
+        _ => Immediate::I64(value),
+    })
+}
+
+/// Reads `lhs` and `rhs` at `ty` (from memory, or `rhs` as an immediate) and returns the
+/// IntOverflow flag widened to i64.
+fn overflow_function(
+    name: &str,
+    op: IntOverflowOp,
+    ty: ScalarType,
+    signed: bool,
+    lhs: i64,
+    rhs: i64,
+    rhs_immediate: bool,
+) -> Function {
+    let mir_ty = MirType::Scalar(ty);
+    let slot = VirtualReg::gpr(50);
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::StackAddr { dst: v(1), slot });
+    entry.push(Instruction::Store {
+        ty: mir_ty,
+        src: typed_imm(ty, lhs),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    entry.push(Instruction::Load {
+        ty: mir_ty,
+        dst: v(2),
+        addr: at_v1(0),
+        attrs: MemoryAttrs::default(),
+    });
+    let rhs_operand = if rhs_immediate {
+        typed_imm(ty, rhs)
+    } else {
+        entry.push(Instruction::Store {
+            ty: mir_ty,
+            src: typed_imm(ty, rhs),
+            addr: at_v1(8),
+            attrs: MemoryAttrs::default(),
+        });
+        entry.push(Instruction::Load {
+            ty: mir_ty,
+            dst: v(5),
+            addr: at_v1(8),
+            attrs: MemoryAttrs::default(),
+        });
+        reg(5)
+    };
+    entry.push(Instruction::IntOverflow {
+        op,
+        ty: mir_ty,
+        signed,
+        dst: v(3),
+        lhs: reg(2),
+        rhs: rhs_operand,
+    });
+    entry.push(Instruction::IntConvert {
+        from: MirType::Scalar(ScalarType::I1),
+        to: I64,
+        signed: false,
+        dst: v(4),
+        src: reg(3),
+    });
+    ret(&mut entry, 4);
+    let mut function = Function::new(Signature::new(name).with_return(I64));
+    function.stack_reservations.insert(slot, 2);
+    function.add_block(entry);
+    function
+}
+
+fn overflow_result(op: IntOverflowOp, ty: ScalarType, signed: bool, lhs: i64, rhs: i64) -> i64 {
+    let name = "overflow".to_string();
+    let function = overflow_function(&name, op, ty, signed, lhs, rhs, true);
+    run_named(vec![function], &[name])[0]
+}
+
+#[test]
+fn int_overflow_matches_mir_at_every_width_and_signedness() {
+    let edges: [(ScalarType, [i64; 10]); 4] = [
+        (ScalarType::I8, [-128, -127, -2, -1, 0, 1, 2, 63, 64, 127]),
+        (
+            ScalarType::I16,
+            [
+                i64::from(i16::MIN),
+                -256,
+                -2,
+                -1,
+                0,
+                1,
+                255,
+                256,
+                0x4000,
+                i64::from(i16::MAX),
+            ],
+        ),
+        (
+            ScalarType::I32,
+            [
+                i64::from(i32::MIN),
+                -65536,
+                -2,
+                -1,
+                0,
+                1,
+                65536,
+                0x7FFF,
+                0x4000_0000,
+                i64::from(i32::MAX),
+            ],
+        ),
+        (
+            ScalarType::I64,
+            [
+                i64::MIN,
+                i64::MIN + 1,
+                -2,
+                -1,
+                0,
+                1,
+                2,
+                0x1_0000_0000,
+                0x4000_0000_0000_0000,
+                i64::MAX,
+            ],
+        ),
+    ];
+    let ops = [IntOverflowOp::Add, IntOverflowOp::Sub, IntOverflowOp::Mul];
+    let mut functions = Vec::new();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for (ty, values) in edges {
+        for op in ops {
+            for signed in [true, false] {
+                for (i, &lhs) in values.iter().enumerate() {
+                    for (j, &rhs) in values.iter().enumerate() {
+                        let name = format!("o{}", functions.len());
+                        functions.push(overflow_function(
+                            &name,
+                            op,
+                            ty,
+                            signed,
+                            lhs,
+                            rhs,
+                            (i + j) % 2 == 0,
+                        ));
+                        let want = op.overflows(
+                            MirType::Scalar(ty),
+                            signed,
+                            lhs,
+                            rhs,
+                            PointerWidth::Bits64,
+                        );
+                        expected.push((ty, op, signed, lhs, rhs, i64::from(want)));
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    }
+    let got = run_named(functions, &names);
+    for (index, (ty, op, signed, lhs, rhs, want)) in expected.iter().enumerate() {
+        assert_eq!(got[index], *want, "{op} {ty:?} signed={signed} {lhs} {rhs}");
+    }
+}
+
+#[test]
+fn int_overflow_hand_checked_boundaries() {
+    use IntOverflowOp::{Add, Mul, Sub};
+    use ScalarType::{I8, I16, I32, I64};
+    // (op, width, signed, lhs, rhs, overflows)
+    let cases = [
+        (Add, I8, true, 127, 1, 1),
+        (Add, I8, false, 127, 1, 0),
+        (Add, I8, false, 255, 1, 1),
+        (Add, I8, false, 254, 1, 0),
+        (Sub, I8, true, -128, 1, 1),
+        (Sub, I8, false, 0, 1, 1),
+        (Mul, I8, false, -1, 2, 1),
+        (Mul, I8, true, -128, -1, 1),
+        (Mul, I16, true, -1, i64::from(i16::MIN), 1),
+        (Add, I32, false, 0xFFFF_FFFF, 1, 1),
+        (Mul, I32, true, 65536, 65536, 1),
+        (Mul, I32, false, 65536, 65535, 0),
+        (Sub, I64, true, 0, i64::MIN, 1),
+        (Sub, I64, false, 0, i64::MIN, 1),
+        (Sub, I64, false, 0, -1, 1),
+        (Sub, I64, true, i64::MIN, 0, 0),
+        (Add, I64, true, i64::MAX, 1, 1),
+        (Add, I64, false, -1, 1, 1),
+        (Add, I64, false, 1, 1, 0),
+        (Mul, I64, true, i64::MIN, 1, 0),
+        (Mul, I64, true, -1, i64::MIN, 1),
+        (Mul, I64, true, 0x1_0000_0000, 0x7FFF_FFFF, 0),
+        (Mul, I64, false, i64::MAX, 2, 0),
+        (Mul, I64, false, i64::MAX, 3, 1),
+        (Mul, I64, false, -1, 1, 0),
+        (Mul, I64, false, 0x1_0000_0000, 0x1_0000_0000, 1),
+    ];
+    for (op, ty, signed, lhs, rhs, want) in cases {
+        assert_eq!(
+            overflow_result(op, ty, signed, lhs, rhs),
+            want,
+            "{op} {ty:?} signed={signed} {lhs} {rhs}"
+        );
+    }
 }

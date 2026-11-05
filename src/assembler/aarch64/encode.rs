@@ -1145,3 +1145,117 @@ pub(super) fn encode_int_unary(
 fn imm_i64(value: i64) -> Operand {
     Operand::Immediate(Immediate::I64(value))
 }
+
+/// Encode `IntOverflow`: whether the wrapping operation leaves the range of `ty`, read with
+/// the given signedness, as an i1 that is 0 or 1 in the slot.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_int_overflow(
+    assembler: &mut RasAssembler,
+    op: lamina_mir::IntOverflowOp,
+    ty: &MirType,
+    signed: bool,
+    dst: &Register,
+    lhs: &Operand,
+    rhs: &Operand,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    use lamina_mir::IntOverflowOp;
+    // x9 and x10 hold the operands, x11 the wrapped result, x12 and x14 are temporaries.
+    const L: u8 = 9;
+    const R: u8 = 10;
+    const W: u8 = 11;
+    const U: u8 = 12;
+    const H: u8 = 14;
+    // Condition codes.
+    const NE: u32 = 0b0001;
+    const HS: u32 = 0b0010;
+    const LO: u32 = 0b0011;
+    const VS: u32 = 0b0110;
+
+    if matches!(ty, MirType::Scalar(ScalarType::Ptr)) {
+        return Err(RasError::EncodingError(
+            "AArch64 JIT: IntOverflow on a pointer not supported".into(),
+        ));
+    }
+    let bits = int_width_bits(ty)?;
+
+    materialize_operand(assembler, lhs, L, stack_slots, reg_alloc, code, stack_size)?;
+    materialize_operand(assembler, rhs, R, stack_slots, reg_alloc, code, stack_size)?;
+
+    // Register-form word: `base` with Rm, Rn and Rd filled in.
+    let rrr = |code: &mut Vec<u8>, base: u32, rd: u8, rn: u8, rm: u8| {
+        let word = base | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32;
+        code.extend_from_slice(&word_bytes(word));
+    };
+    // CSET Wd, cond is CSINC with the inverted condition.
+    let cset = |code: &mut Vec<u8>, cond: u32| {
+        code.extend_from_slice(&word_bytes(0x9A9F_07E0 | ((cond ^ 1) << 12) | W as u32));
+    };
+    // CMP Rn, Rm is SUBS with the zero register as the destination.
+    let cmp = |code: &mut Vec<u8>, rn: u8, rm: u8| {
+        rrr(code, 0xEB00_001F, 31, rn, rm);
+    };
+
+    if bits < 64 {
+        // Widened from the type to 64 bits, so the wide result cannot wrap.
+        for reg in [L, R] {
+            if signed {
+                code.extend_from_slice(&encode_sbfm64(reg, reg, 0, bits - 1));
+            } else {
+                code.extend_from_slice(&encode_ubfm64(reg, reg, 0, bits - 1));
+            }
+        }
+        match op {
+            IntOverflowOp::Add => rrr(code, 0x8B00_0000, W, L, R),
+            IntOverflowOp::Sub => rrr(code, 0xCB00_0000, W, L, R),
+            IntOverflowOp::Mul => rrr(code, 0x9B00_7C00, W, L, R),
+        }
+        // In range exactly when the wide result equals its own low-bit extension.
+        if signed {
+            code.extend_from_slice(&encode_sbfm64(U, W, 0, bits - 1));
+        } else {
+            code.extend_from_slice(&encode_ubfm64(U, W, 0, bits - 1));
+        }
+        cmp(code, W, U);
+        cset(code, NE);
+    } else {
+        match (op, signed) {
+            (IntOverflowOp::Add, true) => {
+                rrr(code, 0xAB00_0000, W, L, R);
+                cset(code, VS);
+            }
+            (IntOverflowOp::Add, false) => {
+                rrr(code, 0xAB00_0000, W, L, R);
+                cset(code, HS);
+            }
+            (IntOverflowOp::Sub, true) => {
+                rrr(code, 0xEB00_0000, W, L, R);
+                cset(code, VS);
+            }
+            (IntOverflowOp::Sub, false) => {
+                rrr(code, 0xEB00_0000, W, L, R);
+                cset(code, LO);
+            }
+            (IntOverflowOp::Mul, true) => {
+                rrr(code, 0x9B00_7C00, W, L, R);
+                // SMULH gives the high half, which overflows unless it is the low half's sign.
+                rrr(code, 0x9B40_7C00, U, L, R);
+                code.extend_from_slice(&encode_sbfm64(H, W, 63, 63));
+                cmp(code, U, H);
+                cset(code, NE);
+            }
+            (IntOverflowOp::Mul, false) => {
+                rrr(code, 0x9B00_7C00, W, L, R);
+                // UMULH must be zero for the product to fit.
+                rrr(code, 0x9BC0_7C00, U, L, R);
+                cmp(code, U, 31);
+                cset(code, NE);
+            }
+        }
+    }
+    store_to_slot(code, "x11", dst, stack_slots)
+}
