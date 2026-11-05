@@ -298,6 +298,22 @@ pub(super) fn encode_nop() -> Vec<u8> {
     0xD503_201Fu32.to_le_bytes().to_vec()
 }
 
+/// Encode `Fence` as the DMB the text backend picks for it: nothing for relaxed, DMB ISHLD
+/// for acquire, and DMB ISH for everything else.
+#[cfg(feature = "encoder")]
+pub(super) fn encode_fence(ordering: lamina_mir::MemoryOrdering, code: &mut Vec<u8>) {
+    use lamina_mir::MemoryOrdering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+    // DMB ISHLD orders earlier loads before later loads and stores.
+    const DMB_ISHLD: u32 = 0xD503_39BF;
+    // DMB ISH orders everything within the inner shareable domain.
+    const DMB_ISH: u32 = 0xD503_3BBF;
+    match ordering {
+        Relaxed => {}
+        Acquire => code.extend_from_slice(&word_bytes(DMB_ISHLD)),
+        Release | AcqRel | SeqCst => code.extend_from_slice(&word_bytes(DMB_ISH)),
+    }
+}
+
 #[cfg(feature = "encoder")]
 pub(super) fn apply_i32_offset_to_reg(
     assembler: &mut RasAssembler,

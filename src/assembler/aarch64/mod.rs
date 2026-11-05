@@ -2075,6 +2075,9 @@ fn encode_mir_instruction_with_context(
                 store_to_slot(&mut code, "x0", dst, stack_slots)?;
             }
         }
+        lamina_mir::Instruction::Fence { ordering } => {
+            encode_fence(*ordering, &mut code);
+        }
         lamina_mir::Instruction::Jmp { .. } => {
             return Err(RasError::EncodingError(
                 "Jmp must be handled at block/terminator level (bug: reached instruction encoder)"

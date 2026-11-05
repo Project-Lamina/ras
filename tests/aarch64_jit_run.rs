@@ -1752,3 +1752,60 @@ fn indirect_call_refuses_a_float_before_an_integer() {
             .is_err()
     );
 }
+
+/// DMB ISH and DMB ISHLD, as the words the fence encoder writes.
+const DMB_ISH: u32 = 0xD503_3BBF;
+const DMB_ISHLD: u32 = 0xD503_39BF;
+
+fn count_word(code: &[u8], word: u32) -> usize {
+    code.chunks_exact(4)
+        .filter(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) == word)
+        .count()
+}
+
+#[test]
+fn fence_encodes_the_barrier_each_ordering_needs() {
+    use MemoryOrdering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+    let cases = [
+        (Relaxed, 0, 0),
+        (Acquire, 0, 1),
+        (Release, 1, 0),
+        (AcqRel, 1, 0),
+        (SeqCst, 1, 0),
+    ];
+    for (ordering, ish, ishld) in cases {
+        let name = format!("fence_{ordering:?}");
+        let function = atomic_function(&name, |entry| {
+            entry.push(Instruction::Store {
+                ty: I64,
+                src: imm(42),
+                addr: at_base(1),
+                attrs: MemoryAttrs::default(),
+            });
+            entry.push(Instruction::Fence { ordering });
+            entry.push(Instruction::Load {
+                ty: I64,
+                dst: v(2),
+                addr: at_base(1),
+                attrs: MemoryAttrs::default(),
+            });
+            ret(entry, 2);
+        });
+        let module = module_of(vec![function]);
+        let mut assembler =
+            RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+        let (code, _) = assembler
+            .compile_mir_to_binary_function(&module, None)
+            .expect("compile");
+        assert_eq!(count_word(&code, DMB_ISH), ish, "{ordering:?} DMB ISH");
+        assert_eq!(
+            count_word(&code, DMB_ISHLD),
+            ishld,
+            "{ordering:?} DMB ISHLD"
+        );
+        assert_eq!(
+            run_named(vec![module.functions[&name].clone()], &[name])[0],
+            42
+        );
+    }
+}
