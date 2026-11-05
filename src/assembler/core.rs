@@ -3333,4 +3333,24 @@ mod label_difference_tests {
         let error = assemble_macho(source).expect_err("300 does not fit a byte");
         assert!(error.to_string().contains("does not fit in 1 bytes"));
     }
+
+    #[test]
+    fn loc_rows_beside_debug_sections_are_refused() {
+        let source = "\t.file 1 \"input.c\"\n\
+            \t.section __TEXT,__text,regular,pure_instructions\n\
+            \t.globl _main\n\
+            \t.p2align 2\n\
+            _main:\n\
+            \t.loc 1 1 0\n\
+            \tret\n\
+            \t.section __DWARF,__debug_info,regular,debug\n\
+            \t.long 0\n";
+        let error = assemble_macho(source).expect_err("debug sections beside .loc");
+        assert!(
+            error.to_string().contains(
+                "source defines .debug_* sections; ras cannot add .loc DWARF beside them"
+            ),
+            "{error}"
+        );
+    }
 }
