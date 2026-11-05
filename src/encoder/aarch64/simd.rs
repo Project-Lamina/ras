@@ -218,6 +218,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
             vector_arith("orr", &[p[0].clone(), source.clone(), source])?
         }
         "add" | "sub" | "mul" | "and" | "orr" | "eor" | "fadd" | "fsub" | "fmul" | "fdiv"
+        | "fmla" | "fmls"
             if vector_first =>
         {
             vector_arith(op, p)?
@@ -377,6 +378,8 @@ fn vector_arith(op: &str, p: &[String]) -> Result<u32, RasError> {
         "fsub" => 0x0EA0_D400 | float_size(op, arrangement)?,
         "fmul" => 0x2E20_DC00 | float_size(op, arrangement)?,
         "fdiv" => 0x2E20_FC00 | float_size(op, arrangement)?,
+        "fmla" => 0x0E20_CC00 | float_size(op, arrangement)?,
+        "fmls" => 0x0EA0_CC00 | float_size(op, arrangement)?,
         _ => return Err(error(format!("Unsupported instruction: {op}"))),
     };
     Ok(base | arrangement.q() | (rm << 16) | (rn << 5) | rd)

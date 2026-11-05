@@ -194,7 +194,11 @@ fn neon_float_and_logic_match_clang_bytes() {
         \torr.16b v0, v1, v2\n\
         \torr.8b v3, v4, v5\n\
         \tmov.16b v6, v7\n\
-        \tmov.8b v8, v9\n";
+        \tmov.8b v8, v9\n\
+        \tfmla.4s v0, v1, v2\n\
+        \tfmla.2d v3, v4, v5\n\
+        \tfmls.2s v6, v7, v8\n\
+        \tfmls.2d v9, v10, v11\n";
     assert_matches_clang("ras-neon-float", source);
 }
 

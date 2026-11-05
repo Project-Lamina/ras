@@ -1401,6 +1401,12 @@ mod exclusive_tests {
         assert_eq!(word("fdiv", &["v0.4s", "v1.4s", "v2.4s"]), 0x6E22_FC20);
         assert_eq!(word("fdiv", &["v0.2s", "v1.2s", "v2.2s"]), 0x2E22_FC20);
         assert_eq!(word("fdiv", &["v0.2d", "v1.2d", "v2.2d"]), 0x6E62_FC20);
+        assert_eq!(word("fmla", &["v0.4s", "v1.4s", "v2.4s"]), 0x4E22_CC20);
+        assert_eq!(word("fmla", &["v0.2s", "v1.2s", "v2.2s"]), 0x0E22_CC20);
+        assert_eq!(word("fmla", &["v0.2d", "v1.2d", "v2.2d"]), 0x4E62_CC20);
+        assert_eq!(word("fmls", &["v0.4s", "v1.4s", "v2.4s"]), 0x4EA2_CC20);
+        assert_eq!(word("fmls", &["v0.2s", "v1.2s", "v2.2s"]), 0x0EA2_CC20);
+        assert_eq!(word("fmls", &["v0.2d", "v1.2d", "v2.2d"]), 0x4EE2_CC20);
     }
 
     #[test]
@@ -1468,6 +1474,8 @@ mod exclusive_tests {
             ("orr", &["v0.4s", "v1.4s", "v2.4s"]),
             ("fadd", &["v0.8h", "v1.8h", "v2.8h"]),
             ("fdiv", &["v0.16b", "v1.16b", "v2.16b"]),
+            ("fmla", &["v0.8h", "v1.8h", "v2.8h"]),
+            ("fmls", &["v0.4s", "v1.4s", "v2.2s"]),
             ("mov", &["v0.4s", "v1.2s"]),
             ("mov", &["v0.4s", "v1.4s", "v2.4s"]),
             ("add", &["v0.4s", "v1.4s"]),
