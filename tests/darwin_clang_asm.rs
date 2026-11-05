@@ -348,3 +348,115 @@ fn assignment_names_an_absolute_value() {
         \t.long SIZE\n";
     assert_eq!(exit_code("ras-assignment", source), 42);
 }
+
+/// The data of a Mach-O debug section as `otool -s` prints it, without the addresses.
+fn debug_section_words(object: &std::path::Path, section: &str) -> String {
+    let output = Command::new("otool")
+        .args(["-s", "__DWARF", section])
+        .arg(object)
+        .output()
+        .expect("run otool");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(2)
+        .map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const CLANG_DEBUG_SOURCE: &str = "int add(int a, int b) {\n  return a + b;\n}\n\
+int main(void) {\n  return add(2, 3) - 5;\n}\n";
+
+/// clang's `-S -g` output, optionally without the `.file` and `.loc` lines that name
+/// the line table.
+fn clang_debug_assembly(dir: &std::path::Path, strip_lines: bool) -> std::path::PathBuf {
+    let source = dir.join("input.c");
+    let assembly = dir.join(if strip_lines { "stripped.s" } else { "input.s" });
+    fs::write(&source, CLANG_DEBUG_SOURCE).expect("write C");
+    let emit = Command::new("clang")
+        .args(["-S", "-g", "-arch", "arm64", "-O0"])
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("clang.s"))
+        .output()
+        .expect("run clang");
+    assert!(emit.status.success());
+    let text = fs::read_to_string(dir.join("clang.s")).expect("read assembly");
+    let text: String = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !(strip_lines && (line.starts_with(".loc") || line.starts_with(".file")))
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&assembly, text).expect("write assembly");
+    assembly
+}
+
+#[test]
+fn clang_debug_sections_match_clang_bytes_without_line_table() {
+    let guard = TempDir::new("ras-clang-debug");
+    let dir = guard.path();
+    let input = clang_debug_assembly(dir, true);
+    let ras_object = dir.join("ras.o");
+    let clang_object = dir.join("clang.o");
+    let assemble = Command::new(env!("CARGO_BIN_EXE_ras"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&ras_object)
+        .output()
+        .expect("run ras");
+    assert!(
+        assemble.status.success(),
+        "{}",
+        String::from_utf8_lossy(&assemble.stderr)
+    );
+    let reference = Command::new("clang")
+        .args(["-c", "-x", "assembler"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&clang_object)
+        .output()
+        .expect("run clang");
+    assert!(reference.status.success());
+    for section in [
+        "__debug_abbrev",
+        "__debug_info",
+        "__debug_str",
+        "__debug_str_offs",
+        "__debug_addr",
+        "__debug_names",
+        "__debug_line",
+    ] {
+        assert_eq!(
+            debug_section_words(&ras_object, section),
+            debug_section_words(&clang_object, section),
+            "{section}"
+        );
+    }
+}
+
+#[test]
+fn clang_line_table_is_refused_until_ras_writes_debug_line() {
+    let guard = TempDir::new("ras-clang-line");
+    let dir = guard.path();
+    let input = clang_debug_assembly(dir, false);
+    let assemble = Command::new(env!("CARGO_BIN_EXE_ras"))
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.join("ras.o"))
+        .output()
+        .expect("run ras");
+    assert!(!assemble.status.success());
+    let stderr = String::from_utf8_lossy(&assemble.stderr);
+    assert!(
+        stderr.contains("source defines .debug_* sections; ras cannot add .loc DWARF"),
+        "{stderr}"
+    );
+}
