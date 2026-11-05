@@ -212,7 +212,16 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         // `mov` is the lane alias of INS and UMOV; vector-to-vector moves are not lane moves.
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
         "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
-        "add" | "sub" | "mul" | "and" | "eor" | "fmul" if vector_first => vector_arith(op, p)?,
+        "mov" if vector_first && p.len() == 2 && p[1].starts_with('v') && !p[1].contains('[') => {
+            // A vector copy is ORR with the source in both sources.
+            let source = p.get(1).cloned().unwrap_or_default();
+            vector_arith("orr", &[p[0].clone(), source.clone(), source])?
+        }
+        "add" | "sub" | "mul" | "and" | "orr" | "eor" | "fadd" | "fsub" | "fmul" | "fdiv"
+            if vector_first =>
+        {
+            vector_arith(op, p)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(word))
@@ -326,6 +335,16 @@ fn umov(p: &[String]) -> Result<u32, RasError> {
     Ok(0x0E00_3C00 | q | (lane.imm5(index) << 16) | (rn << 5) | rd)
 }
 
+/// The sz bit (bit 22) of a floating-point vector form: 2s and 4s are single
+/// precision, 2d is double precision, and half precision is not encoded.
+fn float_size(op: &str, arrangement: Arrangement) -> Result<u32, RasError> {
+    match arrangement {
+        Arrangement::S2 | Arrangement::S4 => Ok(0),
+        Arrangement::D2 => Ok(1 << 22),
+        _ => Err(error(format!("{op} takes only 2s, 4s or 2d arrangements"))),
+    }
+}
+
 /// Three-register vector forms over one arrangement.
 fn vector_arith(op: &str, p: &[String]) -> Result<u32, RasError> {
     let p = exact(p, 3)?;
@@ -344,21 +363,20 @@ fn vector_arith(op: &str, p: &[String]) -> Result<u32, RasError> {
             }
             0x0E20_9C00 | arrangement.size()
         }
-        "and" | "eor" => {
+        "and" | "orr" | "eor" => {
             if !matches!(arrangement, Arrangement::B8 | Arrangement::B16) {
                 return Err(error(format!("{op} takes only 8b or 16b arrangements")));
             }
-            if op == "and" {
-                0x0E20_1C00
-            } else {
-                0x2E20_1C00
+            match op {
+                "and" => 0x0E20_1C00,
+                "orr" => 0x0EA0_1C00,
+                _ => 0x2E20_1C00,
             }
         }
-        "fmul" => match arrangement {
-            Arrangement::S2 | Arrangement::S4 => 0x2E20_DC00,
-            Arrangement::D2 => 0x2E20_DC00 | (1 << 22),
-            _ => return Err(error("fmul takes only 2s, 4s or 2d arrangements")),
-        },
+        "fadd" => 0x0E20_D400 | float_size(op, arrangement)?,
+        "fsub" => 0x0EA0_D400 | float_size(op, arrangement)?,
+        "fmul" => 0x2E20_DC00 | float_size(op, arrangement)?,
+        "fdiv" => 0x2E20_FC00 | float_size(op, arrangement)?,
         _ => return Err(error(format!("Unsupported instruction: {op}"))),
     };
     Ok(base | arrangement.q() | (rm << 16) | (rn << 5) | rd)

@@ -181,6 +181,23 @@ fn dotted_neon_spelling_matches_clang_bytes() {
     assert_matches_clang("ras-dotted-neon", source);
 }
 
+#[test]
+fn neon_float_and_logic_match_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tfadd.4s v0, v1, v2\n\
+        \tfadd.2d v3, v4, v5\n\
+        \tfsub.2s v6, v7, v8\n\
+        \tfsub.2d v9, v10, v11\n\
+        \tfdiv.2s v12, v13, v14\n\
+        \tfdiv.4s v15, v16, v17\n\
+        \tfdiv.2d v18, v19, v20\n\
+        \torr.16b v0, v1, v2\n\
+        \torr.8b v3, v4, v5\n\
+        \tmov.16b v6, v7\n\
+        \tmov.8b v8, v9\n";
+    assert_matches_clang("ras-neon-float", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();

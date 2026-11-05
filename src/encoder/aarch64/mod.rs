@@ -1390,6 +1390,17 @@ mod exclusive_tests {
         assert_eq!(word("eor", &["v3.8b", "v4.8b", "v5.8b"]), 0x2E25_1C83);
         assert_eq!(word("fmul", &["v0.4s", "v0.4s", "v1.4s"]), 0x6E21_DC00);
         assert_eq!(word("fmul", &["v2.2d", "v3.2d", "v4.2d"]), 0x6E64_DC62);
+        assert_eq!(word("orr", &["v0.16b", "v1.16b", "v2.16b"]), 0x4EA2_1C20);
+        assert_eq!(word("orr", &["v3.8b", "v4.8b", "v5.8b"]), 0x0EA5_1C83);
+        assert_eq!(word("mov", &["v0.16b", "v1.16b"]), 0x4EA1_1C20);
+        assert_eq!(word("fadd", &["v0.4s", "v1.4s", "v2.4s"]), 0x4E22_D420);
+        assert_eq!(word("fadd", &["v0.2s", "v1.2s", "v2.2s"]), 0x0E22_D420);
+        assert_eq!(word("fadd", &["v0.2d", "v1.2d", "v2.2d"]), 0x4E62_D420);
+        assert_eq!(word("fsub", &["v0.4s", "v1.4s", "v2.4s"]), 0x4EA2_D420);
+        assert_eq!(word("fsub", &["v0.2d", "v1.2d", "v2.2d"]), 0x4EE2_D420);
+        assert_eq!(word("fdiv", &["v0.4s", "v1.4s", "v2.4s"]), 0x6E22_FC20);
+        assert_eq!(word("fdiv", &["v0.2s", "v1.2s", "v2.2s"]), 0x2E22_FC20);
+        assert_eq!(word("fdiv", &["v0.2d", "v1.2d", "v2.2d"]), 0x6E62_FC20);
     }
 
     #[test]
@@ -1454,6 +1465,11 @@ mod exclusive_tests {
             ("mul", &["v0.2d", "v1.2d", "v2.2d"]),
             ("and", &["v0.8h", "v1.8h", "v2.8h"]),
             ("fmul", &["v0.8b", "v1.8b", "v2.8b"]),
+            ("orr", &["v0.4s", "v1.4s", "v2.4s"]),
+            ("fadd", &["v0.8h", "v1.8h", "v2.8h"]),
+            ("fdiv", &["v0.16b", "v1.16b", "v2.16b"]),
+            ("mov", &["v0.4s", "v1.2s"]),
+            ("mov", &["v0.4s", "v1.4s", "v2.4s"]),
             ("add", &["v0.4s", "v1.4s"]),
         ];
         for (op, operands) in refused {
