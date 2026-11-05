@@ -2517,3 +2517,248 @@ fn vector_shapes_the_encoder_does_not_model_are_refused() {
         entry.push(Instruction::Ret { value: None });
     }));
 }
+
+// Float results of indirect calls, from C callees and from JIT callees.
+
+extern "C" fn c_echo_f64(x: f64) -> f64 {
+    x
+}
+
+extern "C" fn c_echo_f32(x: f32) -> f32 {
+    x
+}
+
+extern "C" fn c_scale(a: i64, b: f64) -> f64 {
+    a as f64 + b
+}
+
+extern "C" fn c_nan_payload() -> f64 {
+    f64::from_bits(0x7FF8_0000_0000_1234)
+}
+
+/// Calls the address in its argument with `args`, and returns the result's bits.
+fn float_indirect_caller(arg_types: Vec<MirType>, args: Vec<Operand>, ret_ty: MirType) -> Module {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::CallIndirect {
+        target: reg(0),
+        arg_types,
+        args,
+        variadic_fixed: None,
+        ret: Some(v(1)),
+        ret_ty: Some(ret_ty),
+    });
+    ret(&mut entry, 1);
+    let mut main = Function::new(
+        Signature::new("main")
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    main.add_block(entry);
+    module_of(vec![main])
+}
+
+fn f64_operand(bits: u64) -> Operand {
+    Operand::Immediate(Immediate::F64(f64::from_bits(bits)))
+}
+
+fn f32_operand(bits: u32) -> Operand {
+    Operand::Immediate(Immediate::F32(f32::from_bits(bits)))
+}
+
+const F64_EDGES: [u64; 8] = [
+    0,
+    0x8000_0000_0000_0000,
+    0x3FF8_0000_0000_0000,
+    0x7FF0_0000_0000_0000,
+    0xFFF0_0000_0000_0000,
+    0x0000_0000_0000_0001,
+    0x7FEF_FFFF_FFFF_FFFF,
+    0x7FF8_0000_0000_1234,
+];
+
+const F32_EDGES: [u32; 7] = [
+    0,
+    0x8000_0000,
+    0x3FC0_0000,
+    0x7F80_0000,
+    0x0000_0001,
+    0x7F7F_FFFF,
+    0x7FC0_1234,
+];
+
+#[test]
+fn indirect_call_returns_a_float_from_a_c_function() {
+    for bits in F64_EDGES {
+        let module = float_indirect_caller(vec![F64_TY], vec![f64_operand(bits)], F64_TY);
+        assert_eq!(
+            run_with_address(
+                &module,
+                "main",
+                c_echo_f64 as extern "C" fn(f64) -> f64 as usize as i64
+            ),
+            bits as i64,
+            "f64 {bits:#x}"
+        );
+    }
+    for bits in F32_EDGES {
+        let module = float_indirect_caller(
+            vec![MirType::Scalar(ScalarType::F32)],
+            vec![f32_operand(bits)],
+            MirType::Scalar(ScalarType::F32),
+        );
+        assert_eq!(
+            run_with_address(
+                &module,
+                "main",
+                c_echo_f32 as extern "C" fn(f32) -> f32 as usize as i64
+            ),
+            i64::from(bits),
+            "f32 {bits:#x}"
+        );
+    }
+    let mixed = float_indirect_caller(
+        vec![I64, F64_TY],
+        vec![imm(-3), f64_operand(2.5f64.to_bits())],
+        F64_TY,
+    );
+    assert_eq!(
+        run_with_address(
+            &mixed,
+            "main",
+            c_scale as extern "C" fn(i64, f64) -> f64 as usize as i64
+        ),
+        (-3.0f64 + 2.5).to_bits() as i64
+    );
+    let nan = float_indirect_caller(vec![], vec![], F64_TY);
+    assert_eq!(
+        run_with_address(
+            &nan,
+            "main",
+            c_nan_payload as extern "C" fn() -> f64 as usize as i64
+        ),
+        0x7FF8_0000_0000_1234
+    );
+}
+
+/// `add_half(x) = x + 0.5`, a JIT function that returns a computed float.
+fn add_half_function() -> Function {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::FloatBinary {
+        op: FloatBinOp::FAdd,
+        ty: F64_TY,
+        dst: v(1),
+        lhs: reg(0),
+        rhs: f64_imm(0.5),
+    });
+    ret(&mut entry, 1);
+    let mut function = Function::new(
+        Signature::new("add_half")
+            .with_params(vec![Parameter::new(v(0), F64_TY)])
+            .with_return(F64_TY),
+    );
+    function.add_block(entry);
+    function
+}
+
+#[test]
+fn indirect_call_returns_a_float_from_a_jit_function() {
+    let inputs = [2.25f64, -7.5, 1.0e300, -0.0];
+    for input in inputs {
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::SymbolAddress {
+            dst: v(0),
+            symbol: "add_half".to_string(),
+        });
+        entry.push(Instruction::CallIndirect {
+            target: reg(0),
+            arg_types: vec![F64_TY],
+            args: vec![f64_operand(input.to_bits())],
+            variadic_fixed: None,
+            ret: Some(v(1)),
+            ret_ty: Some(F64_TY),
+        });
+        entry.push(Instruction::Bitcast {
+            from: F64_TY,
+            to: I64,
+            dst: v(2),
+            src: reg(1),
+        });
+        ret(&mut entry, 2);
+        let mut main = Function::new(Signature::new("main").with_return(I64));
+        main.add_block(entry);
+        let module = module_of(vec![add_half_function(), main]);
+        assert_eq!(
+            run(&module, "main"),
+            (input + 0.5).to_bits() as i64,
+            "add_half({input})"
+        );
+    }
+}
+
+#[test]
+fn jit_float_return_is_still_read_from_x0_by_a_direct_call() {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::Call {
+        name: "add_half".to_string(),
+        args: vec![f64_operand(2.25f64.to_bits())],
+        ret: Some(v(1)),
+    });
+    entry.push(Instruction::Bitcast {
+        from: F64_TY,
+        to: I64,
+        dst: v(2),
+        src: reg(1),
+    });
+    ret(&mut entry, 2);
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.add_block(entry);
+    let module = module_of(vec![add_half_function(), main]);
+    assert_eq!(run(&module, "main"), 2.75f64.to_bits() as i64);
+}
+
+#[test]
+fn indirect_call_returns_a_float_immediate_from_a_jit_function() {
+    let mut f64_callee = Block::new("entry");
+    f64_callee.push(Instruction::Ret {
+        value: Some(f64_operand(2.5f64.to_bits())),
+    });
+    let mut f64_fn = Function::new(Signature::new("constant64").with_return(F64_TY));
+    f64_fn.add_block(f64_callee);
+
+    let mut f32_callee = Block::new("entry");
+    f32_callee.push(Instruction::Ret {
+        value: Some(f32_operand(1.25f32.to_bits())),
+    });
+    let mut f32_fn =
+        Function::new(Signature::new("constant32").with_return(MirType::Scalar(ScalarType::F32)));
+    f32_fn.add_block(f32_callee);
+
+    for (name, ty, expected) in [
+        ("constant64", F64_TY, 2.5f64.to_bits()),
+        (
+            "constant32",
+            MirType::Scalar(ScalarType::F32),
+            u64::from(1.25f32.to_bits()),
+        ),
+    ] {
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::SymbolAddress {
+            dst: v(0),
+            symbol: name.to_string(),
+        });
+        entry.push(Instruction::CallIndirect {
+            target: reg(0),
+            arg_types: vec![],
+            args: vec![],
+            variadic_fixed: None,
+            ret: Some(v(1)),
+            ret_ty: Some(ty),
+        });
+        ret(&mut entry, 1);
+        let mut main = Function::new(Signature::new("main").with_return(I64));
+        main.add_block(entry);
+        let module = module_of(vec![f64_fn.clone(), f32_fn.clone(), main]);
+        // An f32 result is its 32 bits, zero-extended, as the move from s0 leaves it.
+        assert_eq!(run(&module, "main") as u64, expected, "{name}");
+    }
+}

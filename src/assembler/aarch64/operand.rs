@@ -1,6 +1,8 @@
 //! Materialising MIR operands into AArch64 registers.
 
-use super::encode::{encode_ldr, encode_ldr_typed, encode_sbfm64};
+use super::encode::{
+    encode_float_in, encode_ldr, encode_ldr_typed, encode_sbfm64, float_register_prefix,
+};
 use crate::assembler::core::RasAssembler;
 use crate::error::RasError;
 use lamina_mir::{Immediate, MirType, Operand, Register, ScalarType};
@@ -144,12 +146,27 @@ pub(super) fn materialize_return_value(
                     )));
                 }
             }
-            Ok(())
+            mirror_float_return(assembler, ret_ty, code)
         }
         Operand::Immediate(_) | Operand::Register(Register::Physical(_)) => {
-            materialize_operand(assembler, op, 0, stack_slots, reg_alloc, code, stack_size)
+            materialize_operand(assembler, op, 0, stack_slots, reg_alloc, code, stack_size)?;
+            mirror_float_return(assembler, ret_ty, code)
         }
     }
+}
+
+/// A float result is also left in d0 or s0, where the AAPCS64 puts it. That lets a call
+/// through a pointer read the result the same way whether the callee is C or JIT code.
+#[cfg(feature = "encoder")]
+fn mirror_float_return(
+    assembler: &mut RasAssembler,
+    ret_ty: &MirType,
+    code: &mut Vec<u8>,
+) -> Result<(), RasError> {
+    if matches!(ret_ty, MirType::Scalar(ScalarType::F32 | ScalarType::F64)) {
+        encode_float_in(assembler, code, float_register_prefix(ret_ty)?, 0, 0)?;
+    }
+    Ok(())
 }
 
 /// Loads from stack slot if operand is a virtual register, or moves immediate

@@ -2062,7 +2062,7 @@ fn encode_mir_instruction_with_context(
                 || arg_types.len() != args.len()
                 || int_after_float
                 || arg_types.iter().any(|ty| ty.is_vector())
-                || ret_ty.is_some_and(|ty| ty.is_float() || ty.is_vector())
+                || ret_ty.is_some_and(|ty| ty.is_vector())
             {
                 return Err(RasError::EncodingError(
                     "AArch64 JIT: indirect call with a float before an integer, vector, variadic or stack arguments not supported"
@@ -2104,15 +2104,21 @@ fn encode_mir_instruction_with_context(
             code.extend_from_slice(&encode_blr(16)?);
             if let Some(dst) = ret {
                 if let Some(ty) = ret_ty {
-                    let bytes = ty.size_bytes(lamina_platform::PointerWidth::Bits64);
-                    if bytes > 8 {
-                        return Err(RasError::EncodingError(format!(
-                            "AArch64 JIT: indirect call returning {:?} not supported",
-                            ty
-                        )));
-                    }
-                    if bytes < 8 {
-                        code.extend_from_slice(&encode_sbfm64(0, 0, 0, (bytes * 8 - 1) as u8));
+                    if ty.is_float() {
+                        // A float comes back in d0 or s0 from C and from JIT code alike. The
+                        // move zero-extends it into x0, the same as an extern call does.
+                        encode_float_out(assembler, &mut code, float_register_prefix(ty)?, 0)?;
+                    } else {
+                        let bytes = ty.size_bytes(lamina_platform::PointerWidth::Bits64);
+                        if bytes > 8 {
+                            return Err(RasError::EncodingError(format!(
+                                "AArch64 JIT: indirect call returning {:?} not supported",
+                                ty
+                            )));
+                        }
+                        if bytes < 8 {
+                            code.extend_from_slice(&encode_sbfm64(0, 0, 0, (bytes * 8 - 1) as u8));
+                        }
                     }
                 }
                 store_to_slot(&mut code, "x0", dst, stack_slots)?;
