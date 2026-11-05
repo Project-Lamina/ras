@@ -87,6 +87,9 @@ pub fn compile_mir_aarch64_function(
             RasError::EncodingError(format!("Function '{}' not found in module", func_name))
         })?;
         reject_unmodelled_abi(func)?;
+        // A vector register gets a 16-byte slot, so the frame is laid out from a copy that says so.
+        let vector_sized = vector_frame(func)?;
+        let func = vector_sized.as_ref().unwrap_or(func);
 
         function_offsets.insert(func_name.clone(), code.len());
         let mut reg_alloc = A64RegAlloc::new();
@@ -891,6 +894,46 @@ fn encode_mir_instruction_with_context(
             reg_alloc.free_scratch(lhs_reg_str);
             reg_alloc.free_scratch(rhs_reg_str);
             reg_alloc.free_scratch(dst_reg_str);
+        }
+        lamina_mir::Instruction::Load { ty, dst, addr, .. } if ty.is_vector() => {
+            encode_vector_load(
+                assembler,
+                dst,
+                addr,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
+        lamina_mir::Instruction::Store { ty, src, addr, .. } if ty.is_vector() => {
+            encode_vector_store(
+                assembler,
+                src,
+                addr,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
+        }
+        lamina_mir::Instruction::VectorOp {
+            op,
+            ty,
+            dst,
+            operands,
+        } => {
+            encode_vector_op(
+                assembler,
+                *op,
+                ty,
+                dst,
+                operands,
+                stack_slots,
+                reg_alloc,
+                &mut code,
+                stack_size,
+            )?;
         }
         lamina_mir::Instruction::Load { dst, addr, ty, .. } => {
             let tmp_reg_str = reg_alloc.alloc_scratch().unwrap_or("x10");

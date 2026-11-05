@@ -11,7 +11,10 @@ use crate::encoder::aarch64::ldst_imm64::{
     encode_str_imm64, encode_str_scalar,
 };
 use crate::error::RasError;
-use lamina_mir::{AddressMode, Immediate, MirType, Operand, Register, ScalarType};
+use lamina_mir::{
+    AddressMode, Immediate, MirType, Operand, Register, ScalarType, VectorLane, VectorOp,
+    VectorType,
+};
 
 /// `SUB`/`ADD` sp in up to two immediates: the low 12 bits and the next 12 shifted.
 fn adjust_sp(code: &mut Vec<u8>, size: usize, low: u32, high: u32) -> Result<(), RasError> {
@@ -1577,4 +1580,464 @@ pub(super) fn encode_atomic_compare_exchange(
 
     sign_extend_narrow_x10(code, ty)?;
     store_to_slot(code, "x10", dst, stack_slots)
+}
+
+/// The lane type of a 128-bit vector. 256-bit vectors are not encoded.
+#[cfg(feature = "encoder")]
+fn vector_lane(ty: &MirType) -> Result<VectorLane, RasError> {
+    match ty {
+        MirType::Vector(VectorType::V128(lane)) => Ok(*lane),
+        MirType::Vector(VectorType::V256(_)) => Err(RasError::EncodingError(
+            "AArch64 JIT: 256-bit vectors not supported".into(),
+        )),
+        _ => Err(RasError::EncodingError(format!(
+            "AArch64 JIT: {ty:?} is not a vector"
+        ))),
+    }
+}
+
+/// Arrangement, element letter, general register prefix and lane width of a lane type.
+#[cfg(feature = "encoder")]
+fn lane_shape(lane: VectorLane) -> (&'static str, &'static str, &'static str, u32) {
+    match lane {
+        VectorLane::I8 => ("16b", "b", "w", 8),
+        VectorLane::I16 => ("8h", "h", "w", 16),
+        VectorLane::I32 | VectorLane::F32 => ("4s", "s", "w", 32),
+        VectorLane::I64 | VectorLane::F64 => ("2d", "d", "x", 64),
+    }
+}
+
+/// The lane index of an extract or insert, which must be an integer immediate in range.
+#[cfg(feature = "encoder")]
+fn lane_index(lane: VectorLane, operand: &Operand) -> Result<u32, RasError> {
+    let value = match operand {
+        Operand::Immediate(Immediate::I8(v)) => i64::from(*v),
+        Operand::Immediate(Immediate::I16(v)) => i64::from(*v),
+        Operand::Immediate(Immediate::I32(v)) => i64::from(*v),
+        Operand::Immediate(Immediate::I64(v)) => *v,
+        _ => {
+            return Err(RasError::EncodingError(
+                "AArch64 JIT: vector lane index must be an integer immediate".into(),
+            ));
+        }
+    };
+    let lanes = 128 / i64::from(lane_shape(lane).3);
+    if !(0..lanes).contains(&value) {
+        return Err(RasError::EncodingError(format!(
+            "AArch64 JIT: lane index {value} out of range for {lane:?}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+/// The vector register an operand names. Anything else is not a vector value.
+#[cfg(feature = "encoder")]
+fn vector_operand(operand: &Operand) -> Result<&Register, RasError> {
+    match operand {
+        Operand::Register(reg) => Ok(reg),
+        Operand::Immediate(_) => Err(RasError::EncodingError(
+            "AArch64 JIT: vector operand must be a register".into(),
+        )),
+    }
+}
+
+/// Where each instruction keeps 128-bit vectors: the registers that hold one there. Any
+/// other instruction holds none, so a vector in it is refused by `vector_frame`.
+#[cfg(feature = "encoder")]
+fn vector_positions(inst: &lamina_mir::Instruction) -> Result<Vec<&Register>, RasError> {
+    use lamina_mir::Instruction;
+    match inst {
+        Instruction::Load { ty, dst, .. } if ty.is_vector() => {
+            vector_lane(ty)?;
+            Ok(vec![dst])
+        }
+        Instruction::Store { ty, src, .. } if ty.is_vector() => {
+            vector_lane(ty)?;
+            Ok(vec![vector_operand(src)?])
+        }
+        Instruction::VectorOp {
+            op,
+            ty,
+            dst,
+            operands,
+        } => {
+            vector_lane(ty)?;
+            let all: &[Operand] = operands;
+            // Operands past the ones a form reads are left for the encoder to refuse.
+            let (inputs, has_result): (&[Operand], bool) = match op {
+                VectorOp::VAdd
+                | VectorOp::VSub
+                | VectorOp::VMul
+                | VectorOp::VAnd
+                | VectorOp::VOr
+                | VectorOp::VXor => (all.get(..2).unwrap_or(all), true),
+                VectorOp::VInsertLane => (all.get(..1).unwrap_or(all), true),
+                VectorOp::VExtractLane => (all.get(..1).unwrap_or(all), false),
+                VectorOp::VSplat => (&[], true),
+                other => {
+                    return Err(RasError::EncodingError(format!(
+                        "AArch64 JIT: vector {other} not supported"
+                    )));
+                }
+            };
+            let mut positions = Vec::with_capacity(inputs.len() + 1);
+            if has_result {
+                positions.push(dst);
+            }
+            for input in inputs {
+                positions.push(vector_operand(input)?);
+            }
+            Ok(positions)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[cfg(feature = "encoder")]
+fn unsupported_vector(name: &str, what: &str) -> RasError {
+    RasError::EncodingError(format!("AArch64 JIT: @{name} has {what}, not supported"))
+}
+
+/// Check how a function uses 128-bit vectors and give every vector register a 16-byte slot
+/// aligned to 16 bytes. Returns the function the frame is laid out from, or None when the
+/// function has no vectors. Refuses any use this encoder does not model.
+#[cfg(feature = "encoder")]
+pub(super) fn vector_frame(
+    func: &lamina_mir::Function,
+) -> Result<Option<lamina_mir::Function>, RasError> {
+    use lamina_mir::Instruction;
+    let name = func.sig.name.as_str();
+    let mut vectors = std::collections::HashSet::new();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        match &inst.instr {
+            Instruction::Select { ty, .. } if ty.is_vector() => {
+                return Err(unsupported_vector(name, "a vector select"));
+            }
+            Instruction::Copy { ty, .. } if ty.is_vector() => {
+                return Err(unsupported_vector(name, "a vector copy"));
+            }
+            Instruction::Bitcast { from, .. } if from.is_vector() => {
+                return Err(unsupported_vector(name, "a bitcast from a vector"));
+            }
+            _ => {}
+        }
+        for reg in vector_positions(&inst.instr)? {
+            match reg {
+                Register::Virtual(vreg) => {
+                    vectors.insert(*vreg);
+                }
+                Register::Physical(_) => {
+                    return Err(unsupported_vector(name, "a physical vector register"));
+                }
+            }
+        }
+    }
+    // A vector parameter or return is refused even when the body never touches a vector.
+    if func.sig.params.iter().any(|p| p.ty.is_vector()) {
+        return Err(unsupported_vector(name, "a vector parameter"));
+    }
+    if func.sig.ret_ty.is_some_and(|ty| ty.is_vector()) {
+        return Err(unsupported_vector(name, "a vector return"));
+    }
+    if vectors.is_empty() {
+        return Ok(None);
+    }
+    if func
+        .sig
+        .params
+        .iter()
+        .any(|p| matches!(&p.reg, Register::Virtual(v) if vectors.contains(v)))
+    {
+        return Err(unsupported_vector(name, "a vector parameter"));
+    }
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::StackAddr { slot, .. } = &inst.instr
+            && vectors.contains(slot)
+        {
+            return Err(unsupported_vector(name, "a vector whose address is taken"));
+        }
+        // A vector register may only appear where a vector operand is expected, the same
+        // number of times it appears in the instruction.
+        let positions = vector_positions(&inst.instr)?;
+        let mut mentions: Vec<&Register> = inst.instr.use_regs();
+        mentions.extend(inst.instr.def_reg());
+        for reg in &mentions {
+            let Register::Virtual(vreg) = reg else {
+                continue;
+            };
+            if !vectors.contains(vreg) {
+                continue;
+            }
+            let mentioned = mentions.iter().filter(|other| ***other == **reg).count();
+            let in_position = positions.iter().filter(|other| ***other == **reg).count();
+            if mentioned != in_position {
+                return Err(unsupported_vector(
+                    name,
+                    "a vector used where no vector operand is encoded",
+                ));
+            }
+        }
+    }
+
+    let mut reserved = func.clone();
+    for vreg in vectors {
+        // A V128 takes two 8-byte slots, and the frame puts it on a 16-byte boundary.
+        let reservation = reserved.stack_reservations.entry(vreg).or_insert(0);
+        *reservation = (*reservation).max(1);
+        let alignment = reserved.stack_alignments.entry(vreg).or_insert(0);
+        *alignment = (*alignment).max(16);
+    }
+    Ok(Some(reserved))
+}
+
+/// Put the address of the frame slot of vector register `reg` into `dst`.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+fn vector_slot_address(
+    assembler: &mut RasAssembler,
+    reg: &Register,
+    dst: u8,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    let Register::Virtual(vreg) = reg else {
+        return Err(RasError::EncodingError(
+            "AArch64 JIT: vector register must be virtual".into(),
+        ));
+    };
+    let offset = *stack_slots.get(vreg).ok_or_else(|| {
+        RasError::EncodingError(format!("No stack slot for virtual register: {:?}", vreg))
+    })?;
+    if offset >= REGISTER_HOME {
+        return Err(RasError::EncodingError(
+            "AArch64 JIT: vector register has a register home".into(),
+        ));
+    }
+    code.extend_from_slice(&encode_mov_x(dst, 29));
+    match offset {
+        0 => {}
+        1..=4095 => {
+            let add = 0x9100_0000 | ((offset as u32) << 10) | ((dst as u32) << 5) | dst as u32;
+            code.extend_from_slice(&word_bytes(add));
+        }
+        -4095..=-1 => {
+            let sub = 0xD100_0000 | (((-offset) as u32) << 10) | ((dst as u32) << 5) | dst as u32;
+            code.extend_from_slice(&word_bytes(sub));
+        }
+        _ => {
+            materialize_operand(
+                assembler,
+                &imm_i64(i64::from(offset)),
+                14,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            code.extend_from_slice(&encode_add_rrr(dst, dst, 14));
+        }
+    }
+    Ok(())
+}
+
+/// Load the vector in `operand` into `v<n>`. Uses x17 for the slot address.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+fn load_vector(
+    assembler: &mut RasAssembler,
+    operand: &Operand,
+    n: u8,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    let reg = vector_operand(operand)?;
+    vector_slot_address(assembler, reg, 17, stack_slots, reg_alloc, code, stack_size)?;
+    encode_text(assembler, code, &format!("ldr q{n}, [x17]"))
+}
+
+/// Store `v<n>` into the slot of the vector `dst`. Uses x17 for the slot address.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+fn store_vector(
+    assembler: &mut RasAssembler,
+    dst: &Register,
+    n: u8,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    vector_slot_address(assembler, dst, 17, stack_slots, reg_alloc, code, stack_size)?;
+    encode_text(assembler, code, &format!("str q{n}, [x17]"))
+}
+
+/// Encode a vector `Load`: the 16 bytes at the address go to the vector's slot.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_vector_load(
+    assembler: &mut RasAssembler,
+    dst: &Register,
+    addr: &AddressMode,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+    encode_text(assembler, code, "ldr q0, [x16]")?;
+    store_vector(assembler, dst, 0, stack_slots, reg_alloc, code, stack_size)
+}
+
+/// Encode a vector `Store`: the 16 bytes of the vector's slot go to the address.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_vector_store(
+    assembler: &mut RasAssembler,
+    src: &Operand,
+    addr: &AddressMode,
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    encode_atomic_address(assembler, addr, stack_slots, reg_alloc, code, stack_size)?;
+    load_vector(assembler, src, 0, stack_slots, reg_alloc, code, stack_size)?;
+    encode_text(assembler, code, "str q0, [x16]")
+}
+
+/// Encode a vector operation. Operands are loaded into v0 and v1, the operation runs in v0,
+/// and v0 goes to the destination's slot. Element values are bits in general registers.
+#[cfg(feature = "encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_vector_op(
+    assembler: &mut RasAssembler,
+    op: VectorOp,
+    ty: &MirType,
+    dst: &Register,
+    operands: &[Operand],
+    stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+    reg_alloc: &mut lamina_codegen::aarch64::A64RegAlloc,
+    code: &mut Vec<u8>,
+    stack_size: usize,
+) -> Result<(), RasError> {
+    let lane = vector_lane(ty)?;
+    let (arrangement, element, gpr, bits) = lane_shape(lane);
+    let float = matches!(lane, VectorLane::F32 | VectorLane::F64);
+    let arity_error = || {
+        RasError::EncodingError(format!(
+            "AArch64 JIT: {op} takes a different number of operands"
+        ))
+    };
+    match op {
+        VectorOp::VSplat => {
+            let [scalar] = operands else {
+                return Err(arity_error());
+            };
+            materialize_operand(
+                assembler,
+                scalar,
+                9,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            encode_text(assembler, code, &format!("dup v0.{arrangement}, {gpr}9"))?;
+            store_vector(assembler, dst, 0, stack_slots, reg_alloc, code, stack_size)
+        }
+        VectorOp::VExtractLane => {
+            let [vector, index] = operands else {
+                return Err(arity_error());
+            };
+            let index = lane_index(lane, index)?;
+            load_vector(
+                assembler,
+                vector,
+                0,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            encode_text(
+                assembler,
+                code,
+                &format!("umov {gpr}9, v0.{element}[{index}]"),
+            )?;
+            // Sign-extended, the way a narrow value sits in its slot everywhere else.
+            if bits < 64 {
+                code.extend_from_slice(&encode_sbfm64(9, 9, 0, (bits - 1) as u8));
+            }
+            store_to_slot(code, "x9", dst, stack_slots)
+        }
+        VectorOp::VInsertLane => {
+            let [vector, scalar, index] = operands else {
+                return Err(arity_error());
+            };
+            let index = lane_index(lane, index)?;
+            load_vector(
+                assembler,
+                vector,
+                0,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            materialize_operand(
+                assembler,
+                scalar,
+                9,
+                stack_slots,
+                reg_alloc,
+                code,
+                stack_size,
+            )?;
+            encode_text(
+                assembler,
+                code,
+                &format!("ins v0.{element}[{index}], {gpr}9"),
+            )?;
+            store_vector(assembler, dst, 0, stack_slots, reg_alloc, code, stack_size)
+        }
+        VectorOp::VAdd
+        | VectorOp::VSub
+        | VectorOp::VMul
+        | VectorOp::VAnd
+        | VectorOp::VOr
+        | VectorOp::VXor => {
+            let [lhs, rhs] = operands else {
+                return Err(arity_error());
+            };
+            if op == VectorOp::VMul && lane == VectorLane::I64 {
+                // NEON has no 64-bit lane multiply.
+                return Err(RasError::EncodingError(
+                    "AArch64 JIT: vmul on 64-bit lanes not supported".into(),
+                ));
+            }
+            let (mnemonic, arrangement) = match op {
+                VectorOp::VAdd => (if float { "fadd" } else { "add" }, arrangement),
+                VectorOp::VSub => (if float { "fsub" } else { "sub" }, arrangement),
+                VectorOp::VMul => (if float { "fmul" } else { "mul" }, arrangement),
+                VectorOp::VAnd => ("and", "16b"),
+                VectorOp::VOr => ("orr", "16b"),
+                _ => ("eor", "16b"),
+            };
+            load_vector(assembler, lhs, 0, stack_slots, reg_alloc, code, stack_size)?;
+            load_vector(assembler, rhs, 1, stack_slots, reg_alloc, code, stack_size)?;
+            encode_text(
+                assembler,
+                code,
+                &format!("{mnemonic} v0.{arrangement}, v0.{arrangement}, v1.{arrangement}"),
+            )?;
+            store_vector(assembler, dst, 0, stack_slots, reg_alloc, code, stack_size)
+        }
+        other => Err(RasError::EncodingError(format!(
+            "AArch64 JIT: vector {other} not supported"
+        ))),
+    }
 }

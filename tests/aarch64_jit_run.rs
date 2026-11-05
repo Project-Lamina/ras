@@ -6,11 +6,11 @@ use lamina_mir::{
     function::{Function, Parameter, Signature},
     instruction::{
         AddressMode, AtomicBinOp, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction,
-        IntBinOp, IntCmpOp, IntOverflowOp, IntUnOp, MemoryAttrs, MemoryOrdering, Operand,
+        IntBinOp, IntCmpOp, IntOverflowOp, IntUnOp, MemoryAttrs, MemoryOrdering, Operand, VectorOp,
     },
     module::{Global, Module},
     register::{Register, VirtualReg},
-    types::{MirType, ScalarType},
+    types::{MirType, ScalarType, VectorLane, VectorType},
 };
 use lamina_platform::{PointerWidth, TargetArchitecture, TargetOperatingSystem};
 use ras::{ExecutableMemory, RasAssembler};
@@ -1808,4 +1808,712 @@ fn fence_encodes_the_barrier_each_ordering_needs() {
             42
         );
     }
+}
+
+// Vectors: 128-bit values in 16-byte frame slots.
+
+const LANES: [VectorLane; 6] = [
+    VectorLane::I8,
+    VectorLane::I16,
+    VectorLane::I32,
+    VectorLane::I64,
+    VectorLane::F32,
+    VectorLane::F64,
+];
+const PTR: MirType = MirType::Scalar(ScalarType::Ptr);
+
+fn vec_ty(lane: VectorLane) -> MirType {
+    MirType::Vector(VectorType::V128(lane))
+}
+
+fn lane_bits(lane: VectorLane) -> u32 {
+    match lane {
+        VectorLane::I8 => 8,
+        VectorLane::I16 => 16,
+        VectorLane::I32 | VectorLane::F32 => 32,
+        VectorLane::I64 | VectorLane::F64 => 64,
+    }
+}
+
+fn lane_count(lane: VectorLane) -> usize {
+    128 / lane_bits(lane) as usize
+}
+
+fn lane_mask(lane: VectorLane) -> u64 {
+    match lane_bits(lane) {
+        64 => u64::MAX,
+        bits => (1u64 << bits) - 1,
+    }
+}
+
+/// An immediate of the lane's type holding the raw bits `bits`.
+fn lane_imm(lane: VectorLane, bits: u64) -> Operand {
+    Operand::Immediate(match lane {
+        VectorLane::I8 => Immediate::I8(bits as u8 as i8),
+        VectorLane::I16 => Immediate::I16(bits as u16 as i16),
+        VectorLane::I32 => Immediate::I32(bits as u32 as i32),
+        VectorLane::I64 => Immediate::I64(bits as i64),
+        VectorLane::F32 => Immediate::F32(f32::from_bits(bits as u32)),
+        VectorLane::F64 => Immediate::F64(f64::from_bits(bits)),
+    })
+}
+
+/// Bit patterns that matter for a lane: zero, all ones, the sign boundary, alternating bits
+/// and, for floats, signed zeros, infinities, a denormal, the largest finite value and NaNs
+/// with payloads.
+fn edge_bits(lane: VectorLane) -> Vec<u64> {
+    match lane {
+        VectorLane::F32 => vec![
+            0.0f32.to_bits() as u64,
+            (-0.0f32).to_bits() as u64,
+            1.5f32.to_bits() as u64,
+            (-2.25f32).to_bits() as u64,
+            f32::MAX.to_bits() as u64,
+            f32::MIN_POSITIVE.to_bits() as u64,
+            1,
+            f32::INFINITY.to_bits() as u64,
+            f32::NEG_INFINITY.to_bits() as u64,
+            0x7FC0_1234,
+            0xFFA0_0000,
+            3.0e38f32.to_bits() as u64,
+        ],
+        VectorLane::F64 => vec![
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            1.5f64.to_bits(),
+            (-2.25f64).to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+            1,
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7FF8_0000_0000_1234,
+            0xFFF4_0000_0000_0000,
+            3.0e300f64.to_bits(),
+        ],
+        _ => {
+            let mask = lane_mask(lane);
+            let sign = 1u64 << (lane_bits(lane) - 1);
+            [
+                0,
+                1,
+                mask,
+                mask - 1,
+                sign,
+                sign - 1,
+                0x5555_5555_5555_5555 & mask,
+                0xAAAA_AAAA_AAAA_AAAA & mask,
+                0x7F & mask,
+                2,
+                0x0102_0304_0506_0708 & mask,
+            ]
+            .to_vec()
+        }
+    }
+}
+
+/// What one lane holds after `op`, computed the way the lane's type would.
+fn reference_lane(op: VectorOp, lane: VectorLane, a: u64, b: u64) -> u64 {
+    let mask = lane_mask(lane);
+    match (op, lane) {
+        (VectorOp::VAnd, _) => a & b,
+        (VectorOp::VOr, _) => a | b,
+        (VectorOp::VXor, _) => a ^ b,
+        (_, VectorLane::F32) => {
+            let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+            match op {
+                VectorOp::VAdd => x + y,
+                VectorOp::VSub => x - y,
+                _ => x * y,
+            }
+            .to_bits() as u64
+        }
+        (_, VectorLane::F64) => {
+            let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+            match op {
+                VectorOp::VAdd => x + y,
+                VectorOp::VSub => x - y,
+                _ => x * y,
+            }
+            .to_bits()
+        }
+        (VectorOp::VAdd, _) => a.wrapping_add(b) & mask,
+        (VectorOp::VSub, _) => a.wrapping_sub(b) & mask,
+        _ => a.wrapping_mul(b) & mask,
+    }
+}
+
+fn is_nan_bits(lane: VectorLane, bits: u64) -> bool {
+    match lane {
+        VectorLane::F32 => f32::from_bits(bits as u32).is_nan(),
+        VectorLane::F64 => f64::from_bits(bits).is_nan(),
+        _ => false,
+    }
+}
+
+/// Float lanes match when both are NaN, since the payload of a NaN result is not part of
+/// the arithmetic. Everything else must match bit for bit.
+fn same_lane(lane: VectorLane, got: u64, want: u64) -> bool {
+    if is_nan_bits(lane, got) && is_nan_bits(lane, want) {
+        return true;
+    }
+    got == want
+}
+
+fn lanes_of(lane: VectorLane, bytes: &[u8]) -> Vec<u64> {
+    let width = lane_bits(lane) as usize / 8;
+    bytes
+        .chunks_exact(width)
+        .map(|chunk| {
+            let mut word = [0u8; 8];
+            word[..width].copy_from_slice(chunk);
+            u64::from_le_bytes(word)
+        })
+        .collect()
+}
+
+fn assert_lanes(lane: VectorLane, got: &[u8], want: &[u64], context: &str) {
+    let got = lanes_of(lane, got);
+    assert_eq!(got.len(), want.len(), "{context}: lane count");
+    for (index, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            same_lane(lane, g, w),
+            "{context}: lane {index} is {g:#x}, want {w:#x}"
+        );
+    }
+}
+
+/// Builds the vector in `v<id>` from one value per lane, a splat then an insert per lane.
+fn build_vector(entry: &mut Block, lane: VectorLane, id: u32, values: &[u64]) {
+    entry.push(Instruction::VectorOp {
+        op: VectorOp::VSplat,
+        ty: vec_ty(lane),
+        dst: v(id),
+        operands: vec![lane_imm(lane, values[0])],
+    });
+    for (index, value) in values.iter().enumerate() {
+        entry.push(Instruction::VectorOp {
+            op: VectorOp::VInsertLane,
+            ty: vec_ty(lane),
+            dst: v(id),
+            operands: vec![reg(id), lane_imm(lane, *value), imm(index as i64)],
+        });
+    }
+}
+
+fn store_vector(entry: &mut Block, lane: VectorLane, src: u32, base: u32, offset: i16) {
+    entry.push(Instruction::Store {
+        ty: vec_ty(lane),
+        src: reg(src),
+        addr: AddressMode::BaseOffset {
+            address_space: Default::default(),
+            base: v(base),
+            offset,
+        },
+        attrs: MemoryAttrs::default(),
+    });
+}
+
+/// Compiles `module` and returns the memory holding it with the offset of each function.
+fn jit(module: &Module) -> (ExecutableMemory, std::collections::HashMap<String, usize>) {
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    let (code, offsets) = assembler
+        .compile_mir_to_binary_function(module, None)
+        .expect("compile");
+    let mut memory = ExecutableMemory::allocate_writable(code.len()).expect("allocate");
+    memory.write_code(&code).expect("write");
+    memory.make_executable().expect("protect");
+    (memory, offsets)
+}
+
+/// Runs `entry`, which takes a destination pointer, and returns the bytes it wrote there.
+fn run_into(module: &Module, entry: &str, len: usize) -> Vec<u8> {
+    let (memory, offsets) = jit(module);
+    let start = unsafe { memory.code_start().add(offsets[entry]) };
+    let function: unsafe extern "C" fn(*mut u8) = unsafe { std::mem::transmute(start) };
+    let mut out = vec![0u8; len];
+    unsafe { function(out.as_mut_ptr()) };
+    out
+}
+
+/// Runs `entry`, which takes a source and a destination pointer.
+fn run_copy(module: &Module, entry: &str, src: &[u8], len: usize) -> Vec<u8> {
+    let (memory, offsets) = jit(module);
+    let start = unsafe { memory.code_start().add(offsets[entry]) };
+    let function: unsafe extern "C" fn(*const u8, *mut u8) = unsafe { std::mem::transmute(start) };
+    let mut out = vec![0u8; len];
+    unsafe { function(src.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+
+/// `a op b` on two vectors built lane by lane, stored at the destination pointer.
+fn vector_op_function(
+    name: &str,
+    lane: VectorLane,
+    op: VectorOp,
+    a: &[u64],
+    b: &[u64],
+) -> Function {
+    let mut entry = Block::new("entry");
+    build_vector(&mut entry, lane, 1, a);
+    build_vector(&mut entry, lane, 2, b);
+    entry.push(Instruction::VectorOp {
+        op,
+        ty: vec_ty(lane),
+        dst: v(3),
+        operands: vec![reg(1), reg(2)],
+    });
+    store_vector(&mut entry, lane, 3, 0, 0);
+    entry.push(Instruction::Ret { value: None });
+    let mut function =
+        Function::new(Signature::new(name).with_params(vec![Parameter::new(v(0), PTR)]));
+    function.add_block(entry);
+    function
+}
+
+#[test]
+fn vector_arithmetic_matches_scalar_lanes_at_every_width() {
+    let ops = [
+        VectorOp::VAdd,
+        VectorOp::VSub,
+        VectorOp::VMul,
+        VectorOp::VAnd,
+        VectorOp::VOr,
+        VectorOp::VXor,
+    ];
+    for lane in LANES {
+        let edges = edge_bits(lane);
+        let lanes = lane_count(lane);
+        for op in ops {
+            if op == VectorOp::VMul && lane == VectorLane::I64 {
+                continue;
+            }
+            for shift in 0..edges.len() {
+                let a: Vec<u64> = (0..lanes)
+                    .map(|i| edges[(i + shift) % edges.len()])
+                    .collect();
+                let b: Vec<u64> = (0..lanes)
+                    .map(|i| edges[(i * 5 + shift + 3) % edges.len()])
+                    .collect();
+                let module = module_of(vec![vector_op_function("vop", lane, op, &a, &b)]);
+                let got = run_into(&module, "vop", 16);
+                let want: Vec<u64> = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(&x, &y)| reference_lane(op, lane, x, y))
+                    .collect();
+                assert_lanes(lane, &got, &want, &format!("{op} {lane:?} shift {shift}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_load_and_store_copy_bytes_at_an_offset() {
+    let patterns: Vec<Vec<u8>> = vec![
+        (0..48u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(0x80))
+            .collect(),
+        vec![0xFF; 48],
+        (0..48u8)
+            .map(|i| if i % 4 == 3 { 0x7F } else { 0xC0 })
+            .collect(),
+    ];
+    for lane in LANES {
+        for pattern in &patterns {
+            // Load 16 bytes at offset 16 of the source, store them at offset 0 of the destination.
+            let mut entry = Block::new("entry");
+            entry.push(Instruction::Load {
+                ty: vec_ty(lane),
+                dst: v(1),
+                addr: AddressMode::BaseOffset {
+                    address_space: Default::default(),
+                    base: v(0),
+                    offset: 16,
+                },
+                attrs: MemoryAttrs::default(),
+            });
+            store_vector(&mut entry, lane, 1, 10, 0);
+            entry.push(Instruction::Ret { value: None });
+            let mut function = Function::new(
+                Signature::new("copy")
+                    .with_params(vec![Parameter::new(v(0), PTR), Parameter::new(v(10), PTR)]),
+            );
+            function.add_block(entry);
+            let module = module_of(vec![function]);
+            let out = run_copy(&module, "copy", pattern, 48);
+            assert_eq!(&out[..16], &pattern[16..32], "{lane:?} copy");
+            assert!(
+                out[16..].iter().all(|&byte| byte == 0),
+                "{lane:?} wrote past 16 bytes"
+            );
+        }
+    }
+}
+
+/// The value of a lane read as a narrow integer, sign-extended to 64 bits. Float lanes
+/// use the same rule as the scalar floats in their slots.
+fn sign_extended(lane: VectorLane, bits: u64) -> i64 {
+    match lane_bits(lane) {
+        64 => bits as i64,
+        width => ((bits << (64 - width)) as i64) >> (64 - width),
+    }
+}
+
+#[test]
+fn vector_splat_and_lane_insert_match_every_width() {
+    for lane in LANES {
+        let edges = edge_bits(lane);
+        let lanes = lane_count(lane);
+        let mask = lane_mask(lane);
+        for &bits in &edges {
+            // An immediate splat, and a splat from a register whose upper bits are junk: a
+            // narrow lane must take only its own bits from the scalar.
+            let junk = bits | !mask;
+            let mut from_imm = Block::new("entry");
+            from_imm.push(Instruction::VectorOp {
+                op: VectorOp::VSplat,
+                ty: vec_ty(lane),
+                dst: v(1),
+                operands: vec![lane_imm(lane, bits)],
+            });
+            store_vector(&mut from_imm, lane, 1, 0, 0);
+            from_imm.push(Instruction::Ret { value: None });
+            let mut from_reg = Block::new("entry");
+            from_reg.push(Instruction::Copy {
+                ty: MirType::Scalar(ScalarType::I64),
+                dst: v(5),
+                src: imm(junk as i64),
+            });
+            from_reg.push(Instruction::VectorOp {
+                op: VectorOp::VSplat,
+                ty: vec_ty(lane),
+                dst: v(1),
+                operands: vec![reg(5)],
+            });
+            store_vector(&mut from_reg, lane, 1, 0, 0);
+            from_reg.push(Instruction::Ret { value: None });
+            for block in [from_imm, from_reg] {
+                let mut function = Function::new(
+                    Signature::new("splat").with_params(vec![Parameter::new(v(0), PTR)]),
+                );
+                function.add_block(block);
+                let got = run_into(&module_of(vec![function]), "splat", 16);
+                assert_lanes(
+                    lane,
+                    &got,
+                    &vec![bits & mask; lanes],
+                    &format!("splat {lane:?} {bits:#x}"),
+                );
+            }
+
+            // Insert the scalar into every lane of a vector built from other values.
+            let base: Vec<u64> = (0..lanes).map(|i| edges[(i + 1) % edges.len()]).collect();
+            for index in 0..lanes {
+                let mut entry = Block::new("entry");
+                build_vector(&mut entry, lane, 1, &base);
+                entry.push(Instruction::VectorOp {
+                    op: VectorOp::VInsertLane,
+                    ty: vec_ty(lane),
+                    dst: v(2),
+                    operands: vec![reg(1), lane_imm(lane, bits), imm(index as i64)],
+                });
+                store_vector(&mut entry, lane, 2, 0, 0);
+                entry.push(Instruction::Ret { value: None });
+                let mut function = Function::new(
+                    Signature::new("insert").with_params(vec![Parameter::new(v(0), PTR)]),
+                );
+                function.add_block(entry);
+                let got = run_into(&module_of(vec![function]), "insert", 16);
+                let mut want = base.clone();
+                want[index] = bits & mask;
+                assert_lanes(
+                    lane,
+                    &got,
+                    &want,
+                    &format!("insert {lane:?} {bits:#x} at {index}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_extract_lane_sign_extends_every_lane() {
+    let mut functions = Vec::new();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for lane in LANES {
+        let edges = edge_bits(lane);
+        let lanes = lane_count(lane);
+        for shift in 0..3 {
+            let values: Vec<u64> = (0..lanes)
+                .map(|i| edges[(i + shift) % edges.len()])
+                .collect();
+            for index in 0..lanes {
+                let name = format!("x{}", functions.len());
+                let mut entry = Block::new("entry");
+                build_vector(&mut entry, lane, 1, &values);
+                entry.push(Instruction::VectorOp {
+                    op: VectorOp::VExtractLane,
+                    ty: vec_ty(lane),
+                    dst: v(2),
+                    operands: vec![reg(1), imm(index as i64)],
+                });
+                ret(&mut entry, 2);
+                let mut function = Function::new(Signature::new(&name).with_return(I64));
+                function.add_block(entry);
+                functions.push(function);
+                names.push(name);
+                expected.push(sign_extended(lane, values[index]));
+            }
+        }
+    }
+    let got = run_named(functions, &names);
+    for (index, (got, want)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(got, want, "extract case {index}");
+    }
+}
+
+#[test]
+fn vector_slots_past_the_immediate_range_keep_their_values() {
+    // 300 vectors take 4800 bytes of frame, so the later ones sit past the 12-bit offsets.
+    let mut entry = Block::new("entry");
+    for k in 0..300u32 {
+        entry.push(Instruction::VectorOp {
+            op: VectorOp::VSplat,
+            ty: vec_ty(VectorLane::I32),
+            dst: v(100 + k),
+            operands: vec![lane_imm(VectorLane::I32, u64::from(k))],
+        });
+    }
+    entry.push(Instruction::VectorOp {
+        op: VectorOp::VAdd,
+        ty: vec_ty(VectorLane::I32),
+        dst: v(1000),
+        operands: vec![reg(100), reg(399)],
+    });
+    entry.push(Instruction::VectorOp {
+        op: VectorOp::VAdd,
+        ty: vec_ty(VectorLane::I32),
+        dst: v(1001),
+        operands: vec![reg(150), reg(250)],
+    });
+    store_vector(&mut entry, VectorLane::I32, 1000, 0, 0);
+    store_vector(&mut entry, VectorLane::I32, 1001, 0, 16);
+    entry.push(Instruction::Ret { value: None });
+    let mut function =
+        Function::new(Signature::new("deep").with_params(vec![Parameter::new(v(0), PTR)]));
+    function.add_block(entry);
+    let got = run_into(&module_of(vec![function]), "deep", 32);
+    let want: Vec<u64> = vec![299; 4];
+    assert_lanes(VectorLane::I32, &got[..16], &want, "first sum");
+    // v(150) holds 50 and v(250) holds 150.
+    let want: Vec<u64> = vec![200; 4];
+    assert_lanes(VectorLane::I32, &got[16..], &want, "second sum");
+}
+
+/// Compiles `module` and returns the refusal, which must be one of this encoder's.
+#[track_caller]
+fn refusal(module: &Module) -> String {
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    match assembler.compile_mir_to_binary_function(module, None) {
+        Ok(_) => panic!("compiled a vector shape that must be refused"),
+        Err(error) => {
+            let text = format!("{error:?}");
+            assert!(
+                text.contains("AArch64 JIT"),
+                "not an encoder refusal: {text}"
+            );
+            text
+        }
+    }
+}
+
+/// A module of one function `main` with `signature` and the body `build` makes.
+fn refused_main(signature: Signature, build: impl FnOnce(&mut Block)) -> Module {
+    let mut entry = Block::new("entry");
+    build(&mut entry);
+    let mut function = Function::new(signature);
+    function.add_block(entry);
+    module_of(vec![function])
+}
+
+fn splat_i32(entry: &mut Block, dst: u32, value: u64) {
+    entry.push(Instruction::VectorOp {
+        op: VectorOp::VSplat,
+        ty: vec_ty(VectorLane::I32),
+        dst: v(dst),
+        operands: vec![lane_imm(VectorLane::I32, value)],
+    });
+}
+
+#[test]
+fn vector_shapes_the_encoder_does_not_model_are_refused() {
+    let no_params = || Signature::new("main");
+
+    let refused = refusal(&refused_main(no_params(), |entry| {
+        for (dst, value) in [(2, 1), (3, 2)] {
+            entry.push(Instruction::VectorOp {
+                op: VectorOp::VSplat,
+                ty: vec_ty(VectorLane::I64),
+                dst: v(dst),
+                operands: vec![lane_imm(VectorLane::I64, value)],
+            });
+        }
+        entry.push(Instruction::VectorOp {
+            op: VectorOp::VMul,
+            ty: vec_ty(VectorLane::I64),
+            dst: v(1),
+            operands: vec![reg(2), reg(3)],
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
+    assert!(refused.contains("vmul on 64-bit lanes"), "{refused}");
+
+    refusal(&refused_main(no_params(), |entry| {
+        entry.push(Instruction::Load {
+            ty: MirType::Vector(VectorType::V256(VectorLane::I32)),
+            dst: v(1),
+            addr: at_base(0),
+            attrs: MemoryAttrs::default(),
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
+
+    refusal(&refused_main(no_params(), |entry| {
+        splat_i32(entry, 1, 1);
+        entry.push(Instruction::VectorOp {
+            op: VectorOp::VShl,
+            ty: vec_ty(VectorLane::I32),
+            dst: v(2),
+            operands: vec![reg(1), imm(3)],
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
+
+    let takes = {
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::Ret { value: None });
+        let mut function =
+            Function::new(Signature::new("takes").with_params(vec![Parameter::new(v(0), I64)]));
+        function.add_block(entry);
+        function
+    };
+    let mut main_entry = Block::new("entry");
+    splat_i32(&mut main_entry, 1, 1);
+    main_entry.push(Instruction::Call {
+        name: "takes".to_string(),
+        args: vec![reg(1)],
+        ret: None,
+    });
+    main_entry.push(Instruction::Ret { value: None });
+    let mut main = Function::new(Signature::new("main"));
+    main.add_block(main_entry);
+    refusal(&module_of(vec![takes, main]));
+
+    refusal(&refused_main(
+        Signature::new("main").with_return(vec_ty(VectorLane::I32)),
+        |entry| {
+            splat_i32(entry, 1, 1);
+            entry.push(Instruction::Ret {
+                value: Some(reg(1)),
+            });
+        },
+    ));
+
+    refusal(&refused_main(
+        Signature::new("main").with_params(vec![Parameter::new(v(1), vec_ty(VectorLane::I32))]),
+        |entry| entry.push(Instruction::Ret { value: None }),
+    ));
+
+    refusal(&refused_main(
+        Signature::new("main").with_return(I64),
+        |entry| {
+            splat_i32(entry, 1, 1);
+            entry.push(Instruction::IntBinary {
+                op: IntBinOp::Add,
+                ty: I64,
+                dst: v(2),
+                lhs: reg(1),
+                rhs: imm(0),
+            });
+            ret(entry, 2);
+        },
+    ));
+
+    let refused = refusal(&refused_main(
+        Signature::new("main").with_return(I64),
+        |entry| {
+            splat_i32(entry, 1, 1);
+            entry.push(Instruction::VectorOp {
+                op: VectorOp::VExtractLane,
+                ty: vec_ty(VectorLane::I32),
+                dst: v(2),
+                operands: vec![reg(1), imm(4)],
+            });
+            ret(entry, 2);
+        },
+    ));
+    assert!(refused.contains("out of range"), "{refused}");
+
+    refusal(&refused_main(
+        Signature::new("main").with_return(I64),
+        |entry| {
+            entry.push(Instruction::Copy {
+                ty: MirType::Scalar(ScalarType::I64),
+                dst: v(3),
+                src: imm(1),
+            });
+            splat_i32(entry, 1, 1);
+            entry.push(Instruction::Select {
+                ty: vec_ty(VectorLane::I32),
+                dst: v(2),
+                cond: v(3),
+                true_val: reg(1),
+                false_val: reg(1),
+            });
+            ret(entry, 2);
+        },
+    ));
+
+    refusal(&refused_main(no_params(), |entry| {
+        splat_i32(entry, 1, 1);
+        entry.push(Instruction::StackAddr {
+            dst: v(2),
+            slot: VirtualReg::gpr(1),
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
+
+    refusal(&refused_main(no_params(), |entry| {
+        entry.push(Instruction::VectorOp {
+            op: VectorOp::VAdd,
+            ty: vec_ty(VectorLane::I32),
+            dst: v(1),
+            operands: vec![imm(1), imm(2)],
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
+
+    refusal(&refused_main(no_params(), |entry| {
+        splat_i32(entry, 1, 1);
+        entry.push(Instruction::VectorOp {
+            op: VectorOp::VInsertLane,
+            ty: vec_ty(VectorLane::I32),
+            dst: v(2),
+            operands: vec![reg(1), lane_imm(VectorLane::I32, 2), reg(3)],
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
+
+    refusal(&refused_main(no_params(), |entry| {
+        splat_i32(entry, 1, 1);
+        entry.push(Instruction::Copy {
+            ty: vec_ty(VectorLane::I32),
+            dst: v(2),
+            src: reg(1),
+        });
+        entry.push(Instruction::Ret { value: None });
+    }));
 }
