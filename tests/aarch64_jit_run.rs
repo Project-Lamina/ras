@@ -1623,3 +1623,132 @@ fn atomic_orderings_the_mir_rejects_are_refused() {
         ordering: MemoryOrdering::SeqCst,
     }));
 }
+
+/// Runs `entry`, which takes one i64 argument, and returns its result.
+fn run_with_address(module: &Module, entry: &str, argument: i64) -> i64 {
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    let (code, offsets) = assembler
+        .compile_mir_to_binary_function(module, None)
+        .expect("compile");
+    let mut memory = ExecutableMemory::allocate_writable(code.len()).expect("allocate");
+    memory.write_code(&code).expect("write");
+    memory.make_executable().expect("protect");
+    let start = unsafe { memory.code_start().add(offsets[entry]) };
+    let function: unsafe extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(start) };
+    unsafe { function(argument) }
+}
+
+/// Calls the address in its argument through `args` and `arg_types`, returning the i64 result.
+fn indirect_caller(arg_types: Vec<MirType>, args: Vec<Operand>) -> Module {
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::CallIndirect {
+        target: reg(0),
+        arg_types,
+        args,
+        variadic_fixed: None,
+        ret: Some(v(1)),
+        ret_ty: Some(I64),
+    });
+    ret(&mut entry, 1);
+    let mut main = Function::new(
+        Signature::new("main")
+            .with_params(vec![Parameter::new(v(0), I64)])
+            .with_return(I64),
+    );
+    main.add_block(entry);
+    module_of(vec![main])
+}
+
+extern "C" fn c_mixed(a: i64, c: i64, b: f64) -> i64 {
+    a * 100 + c * 10 + (b * 10.0) as i64
+}
+
+extern "C" fn c_float_pair(x: f32, y: f64) -> i64 {
+    (x * 2.0) as i64 * 1000 + y as i64
+}
+
+#[test]
+fn indirect_call_passes_floats_to_a_c_function() {
+    let mixed = indirect_caller(vec![I64, I64, F64_TY], vec![imm(7), imm(5), f64_imm(2.5)]);
+    assert_eq!(
+        run_with_address(
+            &mixed,
+            "main",
+            c_mixed as extern "C" fn(i64, i64, f64) -> i64 as usize as i64
+        ),
+        775
+    );
+    let pair = indirect_caller(
+        vec![MirType::Scalar(ScalarType::F32), F64_TY],
+        vec![Operand::Immediate(Immediate::F32(1.5)), f64_imm(7.0)],
+    );
+    assert_eq!(
+        run_with_address(
+            &pair,
+            "main",
+            c_float_pair as extern "C" fn(f32, f64) -> i64 as usize as i64
+        ),
+        3007
+    );
+}
+
+#[test]
+fn indirect_call_passes_floats_to_a_jit_function() {
+    let mut callee_entry = Block::new("entry");
+    callee_entry.push(Instruction::Bitcast {
+        from: F64_TY,
+        to: I64,
+        dst: v(2),
+        src: reg(1),
+    });
+    callee_entry.push(Instruction::IntBinary {
+        op: IntBinOp::Add,
+        ty: I64,
+        dst: v(3),
+        lhs: reg(0),
+        rhs: reg(2),
+    });
+    ret(&mut callee_entry, 3);
+    let mut callee = Function::new(
+        Signature::new("takes_float")
+            .with_params(vec![
+                Parameter::new(v(0), I64),
+                Parameter::new(v(1), F64_TY),
+            ])
+            .with_return(I64),
+    );
+    callee.add_block(callee_entry);
+
+    let mut entry = Block::new("entry");
+    entry.push(Instruction::SymbolAddress {
+        dst: v(0),
+        symbol: "takes_float".to_string(),
+    });
+    entry.push(Instruction::CallIndirect {
+        target: reg(0),
+        arg_types: vec![I64, F64_TY],
+        args: vec![imm(40), f64_imm(2.5)],
+        variadic_fixed: None,
+        ret: Some(v(1)),
+        ret_ty: Some(I64),
+    });
+    ret(&mut entry, 1);
+    let mut main = Function::new(Signature::new("main").with_return(I64));
+    main.add_block(entry);
+    let module = module_of(vec![callee, main]);
+    assert_eq!(
+        run(&module, "main"),
+        40i64.wrapping_add(2.5f64.to_bits() as i64)
+    );
+}
+
+#[test]
+fn indirect_call_refuses_a_float_before_an_integer() {
+    let module = indirect_caller(vec![F64_TY, I64], vec![f64_imm(1.0), imm(2)]);
+    let mut assembler = RasAssembler::new(TargetArchitecture::Aarch64, HOST_OS).expect("assembler");
+    assert!(
+        assembler
+            .compile_mir_to_binary_function(&module, None)
+            .is_err()
+    );
+}

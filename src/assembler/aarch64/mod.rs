@@ -2008,14 +2008,21 @@ fn encode_mir_instruction_with_context(
             ret,
             ret_ty,
         } => {
-            // The target may be C, whose floats and variadics travel differently from here.
+            // The callee may be a JIT function, which takes every argument by position in a
+            // general register, or C, which takes floats in the float registers. Both agree
+            // only when the integers come before the floats, so each float is passed in both.
+            let first_float = arg_types.iter().position(|ty| ty.is_float());
+            let int_after_float =
+                first_float.is_some_and(|first| arg_types[first..].iter().any(|ty| !ty.is_float()));
             if variadic_fixed.is_some()
                 || args.len() > 8
-                || arg_types.iter().any(|ty| ty.is_float() || ty.is_vector())
+                || arg_types.len() != args.len()
+                || int_after_float
+                || arg_types.iter().any(|ty| ty.is_vector())
                 || ret_ty.is_some_and(|ty| ty.is_float() || ty.is_vector())
             {
                 return Err(RasError::EncodingError(
-                    "AArch64 JIT: indirect call with float, vector, variadic or stack arguments not supported"
+                    "AArch64 JIT: indirect call with a float before an integer, vector, variadic or stack arguments not supported"
                         .to_string(),
                 ));
             }
@@ -2029,6 +2036,18 @@ fn encode_mir_instruction_with_context(
                     &mut code,
                     stack_size,
                 )?;
+                if let Some(first) = first_float
+                    && index >= first
+                {
+                    let prefix = float_register_prefix(&arg_types[index])?;
+                    encode_float_in(
+                        assembler,
+                        &mut code,
+                        prefix,
+                        (index - first) as u8,
+                        index as u8,
+                    )?;
+                }
             }
             materialize_operand(
                 assembler,
