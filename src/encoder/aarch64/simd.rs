@@ -211,6 +211,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         "umov" => umov(p)?,
         // `mov` is the lane alias of INS and UMOV; vector-to-vector moves are not lane moves.
         "addv" => addv(p)?,
+        "ext" if vector_first => ext_vector(p)?,
         "faddp" if !vector_first => faddp_scalar(p)?,
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
         "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
@@ -336,6 +337,28 @@ fn umov(p: &[String]) -> Result<u32, RasError> {
     let rd = lane_gpr(&p[0], lane)?;
     let q = if lane == Lane::D { 0x4000_0000 } else { 0 };
     Ok(0x0E00_3C00 | q | (lane.imm5(index) << 16) | (rn << 5) | rd)
+}
+
+/// EXT, 0 Q 10 1110 00 0 Rm 0 imm4 0 Rn Rd: bytes taken from the pair
+/// Vn:Vm starting at byte `imm4`. Only 8b and 16b are encoded.
+fn ext_vector(p: &[String]) -> Result<u32, RasError> {
+    let p = exact(p, 4)?;
+    let (rd, arrangement) = vector_register(&p[0])?;
+    let (rn, rn_arrangement) = vector_register(&p[1])?;
+    let (rm, rm_arrangement) = vector_register(&p[2])?;
+    if rn_arrangement != arrangement || rm_arrangement != arrangement {
+        return Err(error("Mismatched vector arrangements for ext"));
+    }
+    let limit = match arrangement {
+        Arrangement::B8 => 8,
+        Arrangement::B16 => 16,
+        _ => return Err(error("ext takes only 8b or 16b arrangements")),
+    };
+    let index = super::immediate(&p[3])?;
+    if !(0..limit).contains(&index) {
+        return Err(error(format!("ext index must be in 0..{limit}: {}", p[3])));
+    }
+    Ok(0x2E00_0000 | arrangement.q() | (rm << 16) | ((index as u32) << 11) | (rn << 5) | rd)
 }
 
 /// ADDV, 0 Q 0 01110 size 11000 11011 10 Rn Rd: the sum of the lanes of an

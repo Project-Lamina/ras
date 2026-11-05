@@ -219,6 +219,17 @@ fn neon_reductions_match_clang_bytes() {
     assert_matches_clang("ras-neon-reduce", source);
 }
 
+#[test]
+fn neon_ext_matches_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \text.16b v0, v1, v2, #8\n\
+        \text.8b v3, v4, v5, #3\n\
+        \text.16b v6, v7, v8, #0\n\
+        \text.16b v9, v10, v11, #15\n\
+        \text.8b v12, v13, v14, #7\n";
+    assert_matches_clang("ras-neon-ext", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();

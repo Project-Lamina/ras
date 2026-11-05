@@ -1401,6 +1401,15 @@ mod exclusive_tests {
         assert_eq!(word("faddp", &["s0", "v1.2s"]), 0x7E30_D820);
         assert_eq!(word("faddp", &["d0", "v1.2d"]), 0x7E70_D820);
         assert_eq!(
+            word("ext", &["v0.16b", "v1.16b", "v2.16b", "#8"]),
+            0x6E02_4020
+        );
+        assert_eq!(word("ext", &["v0.8b", "v1.8b", "v2.8b", "#3"]), 0x2E02_1820);
+        assert_eq!(
+            word("ext", &["v0.16b", "v1.16b", "v2.16b", "#0"]),
+            0x6E02_0020
+        );
+        assert_eq!(
             word("faddp.2s", &["s0", "v1"]),
             word("faddp", &["s0", "v1.2s"])
         );
@@ -1485,6 +1494,11 @@ mod exclusive_tests {
             ("faddp", &["d0", "v1.2s"]),
             ("faddp", &["s0", "v1.2d"]),
             ("faddp", &["v0.8h", "v1.8h", "v2.8h"]),
+            ("ext", &["v0.8b", "v1.8b", "v2.8b", "#8"]),
+            ("ext", &["v0.16b", "v1.16b", "v2.16b", "#16"]),
+            ("ext", &["v0.4s", "v1.4s", "v2.4s", "#1"]),
+            ("ext", &["v0.8b", "v1.16b", "v2.8b", "#1"]),
+            ("ext", &["v0.8b", "v1.8b", "#1"]),
         ];
         for (op, operands) in refused {
             let inst = ParsedInstruction {
