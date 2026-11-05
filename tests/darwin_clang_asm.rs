@@ -230,6 +230,16 @@ fn neon_ext_matches_clang_bytes() {
     assert_matches_clang("ras-neon-ext", source);
 }
 
+#[test]
+fn neon_fmov_high_doubleword_matches_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tfmov.d x0, v1[1]\n\
+        \tfmov.d v2[1], x3\n\
+        \tfmov x4, v5.d[1]\n\
+        \tfmov v6.d[1], x7\n";
+    assert_matches_clang("ras-neon-fmov", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();

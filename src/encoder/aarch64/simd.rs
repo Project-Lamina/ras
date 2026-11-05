@@ -211,6 +211,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         "umov" => umov(p)?,
         // `mov` is the lane alias of INS and UMOV; vector-to-vector moves are not lane moves.
         "addv" => addv(p)?,
+        "fmov" if p.iter().any(|s| s.starts_with('v')) => fmov_lane(p)?,
         "ext" if vector_first => ext_vector(p)?,
         "faddp" if !vector_first => faddp_scalar(p)?,
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
@@ -337,6 +338,28 @@ fn umov(p: &[String]) -> Result<u32, RasError> {
     let rd = lane_gpr(&p[0], lane)?;
     let q = if lane == Lane::D { 0x4000_0000 } else { 0 };
     Ok(0x0E00_3C00 | q | (lane.imm5(index) << 16) | (rn << 5) | rd)
+}
+
+/// FMOV between the high doubleword of a vector and an X register:
+/// 1001 1110 1010 111 1 (to vector) or 1010 111 0 (from vector), Rn Rd.
+/// Only `v<n>.d[1]` is encoded; the other lanes have no FMOV form.
+fn fmov_lane(p: &[String]) -> Result<u32, RasError> {
+    let p = exact(p, 2)?;
+    let (vector, gpr) = if p[0].starts_with('v') {
+        (&p[0], &p[1])
+    } else {
+        (&p[1], &p[0])
+    };
+    let (number, lane, index) = element(vector)?;
+    if lane != Lane::D || index != 1 {
+        return Err(error(format!("fmov takes only v<n>.d[1]: {vector}")));
+    }
+    let gpr = lane_gpr(gpr, Lane::D)?;
+    Ok(if p[0].starts_with('v') {
+        0x9EAF_0000 | (gpr << 5) | number
+    } else {
+        0x9EAE_0000 | (number << 5) | gpr
+    })
 }
 
 /// EXT, 0 Q 10 1110 00 0 Rm 0 imm4 0 Rn Rd: bytes taken from the pair

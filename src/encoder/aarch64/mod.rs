@@ -1409,6 +1409,12 @@ mod exclusive_tests {
             word("ext", &["v0.16b", "v1.16b", "v2.16b", "#0"]),
             0x6E02_0020
         );
+        assert_eq!(word("fmov", &["x0", "v1.d[1]"]), 0x9EAE_0020);
+        assert_eq!(word("fmov", &["v1.d[1]", "x0"]), 0x9EAF_0001);
+        assert_eq!(
+            word("fmov.d", &["x0", "v1[1]"]),
+            word("fmov", &["x0", "v1.d[1]"])
+        );
         assert_eq!(
             word("faddp.2s", &["s0", "v1"]),
             word("faddp", &["s0", "v1.2s"])
@@ -1499,6 +1505,11 @@ mod exclusive_tests {
             ("ext", &["v0.4s", "v1.4s", "v2.4s", "#1"]),
             ("ext", &["v0.8b", "v1.16b", "v2.8b", "#1"]),
             ("ext", &["v0.8b", "v1.8b", "#1"]),
+            ("fmov", &["x0", "v1.d[0]"]),
+            ("fmov", &["w0", "v1.d[1]"]),
+            ("fmov", &["x0", "v1.s[1]"]),
+            ("fmov", &["v1.d[1]", "w0"]),
+            ("fmov", &["d0", "v1.d[1]"]),
         ];
         for (op, operands) in refused {
             let inst = ParsedInstruction {
