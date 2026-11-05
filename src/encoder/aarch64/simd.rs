@@ -210,6 +210,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         "ins" => ins_general(p)?,
         "umov" => umov(p)?,
         // `mov` is the lane alias of INS and UMOV; vector-to-vector moves are not lane moves.
+        "addv" => addv(p)?,
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
         "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
         "mov" if vector_first && p.len() == 2 && p[1].starts_with('v') && !p[1].contains('[') => {
@@ -334,6 +335,29 @@ fn umov(p: &[String]) -> Result<u32, RasError> {
     let rd = lane_gpr(&p[0], lane)?;
     let q = if lane == Lane::D { 0x4000_0000 } else { 0 };
     Ok(0x0E00_3C00 | q | (lane.imm5(index) << 16) | (rn << 5) | rd)
+}
+
+/// ADDV, 0 Q 0 01110 size 11000 11011 10 Rn Rd: the sum of the lanes of an
+/// integer vector into a b, h or s scalar register.
+fn addv(p: &[String]) -> Result<u32, RasError> {
+    let p = exact(p, 2)?;
+    let (rn, arrangement) = vector_register(&p[1])?;
+    let kind = match arrangement {
+        Arrangement::B8 | Arrangement::B16 => 'b',
+        Arrangement::H4 | Arrangement::H8 => 'h',
+        Arrangement::S4 => 's',
+        _ => return Err(error("addv takes only 8b, 16b, 4h, 8h or 4s arrangements")),
+    };
+    let rd = scalar_register(&p[0], kind)?;
+    Ok(0x0E31_B800 | arrangement.q() | arrangement.size() | (rn << 5) | rd)
+}
+
+/// A scalar SIMD register of the named width, such as `s0`.
+fn scalar_register(text: &str, kind: char) -> Result<u32, RasError> {
+    text.strip_prefix(kind)
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| *n < 32)
+        .ok_or_else(|| error(format!("Expected a {kind}<n> register: {text}")))
 }
 
 /// The sz bit (bit 22) of a floating-point vector form: 2s and 4s are single

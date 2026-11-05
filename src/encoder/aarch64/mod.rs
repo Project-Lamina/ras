@@ -135,13 +135,6 @@ fn vector_8b(reg: &str) -> Result<u32, RasError> {
     Ok(number)
 }
 
-fn scalar_b(reg: &str) -> Result<u32, RasError> {
-    reg.strip_prefix('b')
-        .and_then(|n| n.parse::<u32>().ok())
-        .filter(|n| *n < 32)
-        .ok_or_else(|| error(format!("Expected a b<n> register: {reg}")))
-}
-
 /// Register numbers of the first `N` operands, all general purpose registers of one width.
 fn gpr_regs<const N: usize>(p: &[String]) -> Result<([u32; N], bool), RasError> {
     let mut regs = [0; N];
@@ -1278,11 +1271,6 @@ impl AArch64Encoder {
                 let (rd, rn) = (vector_8b(arg(0)?)?, vector_8b(arg(1)?)?);
                 0x0e20_5800 | (rn << 5) | rd
             }
-            "addv" => {
-                let rd = scalar_b(arg(0)?)?;
-                let rn = vector_8b(arg(1)?)?;
-                0x0e31_b800 | (rn << 5) | rd
-            }
             _ => return Err(error(format!("Unsupported instruction: {op}"))),
         };
         Ok(word.to_le_bytes().to_vec())
@@ -1479,6 +1467,11 @@ mod exclusive_tests {
             ("mov", &["v0.4s", "v1.2s"]),
             ("mov", &["v0.4s", "v1.4s", "v2.4s"]),
             ("add", &["v0.4s", "v1.4s"]),
+            ("addv", &["b0", "v1.2s"]),
+            ("addv", &["d0", "v1.2d"]),
+            ("addv", &["h0", "v1.8b"]),
+            ("addv", &["s0", "v1.8h"]),
+            ("addv", &["b0", "v1.8b", "v2.8b"]),
         ];
         for (op, operands) in refused {
             let inst = ParsedInstruction {
@@ -1500,6 +1493,14 @@ mod exclusive_tests {
         assert_eq!(word("neg", &["x0", "x1"]), 0xCB01_03E0);
         assert_eq!(word("cnt", &["v0.8b", "v1.8b"]), 0x0E20_5820);
         assert_eq!(word("addv", &["b0", "v1.8b"]), 0x0E31_B820);
+        assert_eq!(word("addv", &["b0", "v1.16b"]), 0x4E31_B820);
+        assert_eq!(word("addv", &["h0", "v1.4h"]), 0x0E71_B820);
+        assert_eq!(word("addv", &["h0", "v1.8h"]), 0x4E71_B820);
+        assert_eq!(word("addv", &["s0", "v1.4s"]), 0x4EB1_B820);
+        assert_eq!(
+            word("addv.4s", &["s0", "v1"]),
+            word("addv", &["s0", "v1.4s"])
+        );
     }
 
     /// The sysreg fields come from the ARM ARM (DDI 0487) system register table; the

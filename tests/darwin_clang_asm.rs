@@ -202,6 +202,18 @@ fn neon_float_and_logic_match_clang_bytes() {
     assert_matches_clang("ras-neon-float", source);
 }
 
+#[test]
+fn neon_addv_matches_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \taddv.8b b0, v1\n\
+        \taddv.16b b2, v3\n\
+        \taddv.4h h4, v5\n\
+        \taddv.8h h6, v7\n\
+        \taddv.4s s8, v9\n\
+        \taddv s10, v11.4s\n";
+    assert_matches_clang("ras-neon-addv", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();
