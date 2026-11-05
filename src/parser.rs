@@ -1345,14 +1345,16 @@ fn coff_section_flags(name: &str, flags: &str) -> SectionFlags {
     }
 }
 
+/// Splits operands at commas outside parentheses and braces, so that a NEON
+/// register list such as `{ v0.4s, v1.4s }` stays one operand.
 fn split_operands(text: &str) -> Vec<String> {
     let mut operands = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
     for (index, ch) in text.char_indices() {
         match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
+            '(' | '{' => depth += 1,
+            ')' | '}' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
                 operands.push(text[start..index].trim().to_string());
                 start = index + 1;
@@ -1530,6 +1532,13 @@ mod tests {
     fn instruction_with_three_operands() {
         let asm = parse("add x0, x1, x2");
         assert_eq!(asm.instructions[0].operands, &["x0", "x1", "x2"]);
+    }
+
+    #[test]
+    fn braced_register_lists_stay_one_operand() {
+        let asm = parse("ld1.4s { v0.4s, v1.4s }, [x0]");
+        assert_eq!(asm.instructions[0].opcode, "ld1.4s");
+        assert_eq!(asm.instructions[0].operands, &["{ v0.4s, v1.4s }", "[x0]"]);
     }
 
     #[test]

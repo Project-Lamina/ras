@@ -1185,6 +1185,12 @@ impl RasAssembler {
                     current_offset += width;
                 }
                 Line::Instruction(inst) => {
+                    let standard = if self.target_arch == TargetArchitecture::Aarch64 {
+                        crate::encoder::aarch64::normalize_dotted(inst)?
+                    } else {
+                        None
+                    };
+                    let inst = standard.as_ref().unwrap_or(inst);
                     let opcode = inst.opcode.to_lowercase();
                     let is_jmp_call = opcode == "jmp" || opcode == "jmpq" || opcode == "call";
 

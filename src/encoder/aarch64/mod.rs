@@ -1,6 +1,8 @@
 pub mod fixed;
 pub mod ldst_imm64;
 mod simd;
+
+pub(crate) use simd::normalize_dotted;
 mod sysreg;
 
 use crate::{
@@ -490,6 +492,9 @@ impl AArch64Encoder {
     }
 
     fn encode(&self, inst: &ParsedInstruction) -> Result<Vec<u8>, RasError> {
+        if let Some(standard) = simd::normalize_dotted(inst)? {
+            return self.encode(&standard);
+        }
         let op = inst.opcode.as_str();
         let p = &inst.operands;
         if max_operands(op).is_some_and(|max| p.len() > max) {
@@ -1385,6 +1390,53 @@ mod exclusive_tests {
         assert_eq!(word("eor", &["v3.8b", "v4.8b", "v5.8b"]), 0x2E25_1C83);
         assert_eq!(word("fmul", &["v0.4s", "v0.4s", "v1.4s"]), 0x6E21_DC00);
         assert_eq!(word("fmul", &["v2.2d", "v3.2d", "v4.2d"]), 0x6E64_DC62);
+    }
+
+    #[test]
+    fn dotted_neon_spelling_encodes_like_the_standard_form() {
+        assert_eq!(word("add.4s", &["v0", "v1", "v2"]), 0x4EA2_8420);
+        assert_eq!(
+            word("add.4s", &["v0", "v1", "v2"]),
+            word("add", &["v0.4s", "v1.4s", "v2.4s"])
+        );
+        assert_eq!(
+            word("mul.8h", &["v0", "v1", "v2"]),
+            word("mul", &["v0.8h", "v1.8h", "v2.8h"])
+        );
+        assert_eq!(word("eor.8b", &["v3", "v4", "v5"]), 0x2E25_1C83);
+        assert_eq!(word("fmul.2d", &["v2", "v3", "v4"]), 0x6E64_DC62);
+        assert_eq!(word("dup.4s", &["v0", "w12"]), 0x4E04_0D80);
+        assert_eq!(word("dup.2d", &["v2", "x3"]), 0x4E08_0C62);
+        assert_eq!(word("mov.s", &["w12", "v0[3]"]), 0x0E1C_3C0C);
+        assert_eq!(word("mov.s", &["v0[1]", "w10"]), 0x4E0C_1D40);
+        assert_eq!(word("mov", &["w11", "v0.s[0]"]), 0x0E04_3C0B);
+    }
+
+    #[test]
+    fn dotted_spelling_is_refused_when_it_is_not_a_vector_form() {
+        let refused = [
+            ("add.4s", &["v0.4s", "v1", "v2"][..]),
+            ("add.4s", &["x0", "x1", "x2"]),
+            ("ld1.4s", &["{ v0 }", "[x0]"]),
+            ("ins.s", &["x0", "w1"]),
+            ("fmul.2s", &["s0", "s1", "s2"]),
+            ("add.3s", &["v0", "v1", "v2"]),
+        ];
+        for (op, operands) in refused {
+            let inst = ParsedInstruction {
+                opcode: op.to_string(),
+                operands: operands.iter().map(|s| s.to_string()).collect(),
+            };
+            assert!(
+                AArch64Encoder::new().encode_instruction(&inst).is_err(),
+                "{op} {operands:?}"
+            );
+        }
+        let condition = ParsedInstruction {
+            opcode: "b.eq".into(),
+            operands: vec!["8".into()],
+        };
+        assert!(normalize_dotted(&condition).unwrap().is_none());
     }
 
     #[test]

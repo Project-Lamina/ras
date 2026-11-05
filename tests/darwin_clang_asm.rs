@@ -161,6 +161,26 @@ fn fmov_constants_match_clang_bytes() {
     assert_matches_clang("ras-fmov-constant", source);
 }
 
+#[test]
+fn dotted_neon_spelling_matches_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tadd.4s v0, v1, v2\n\
+        \tadd.16b v3, v4, v5\n\
+        \tsub.2d v0, v1, v2\n\
+        \tmul.8h v0, v1, v2\n\
+        \tand.16b v0, v1, v2\n\
+        \teor.8b v3, v4, v5\n\
+        \tfmul.2s v0, v1, v2\n\
+        \tfmul.2d v2, v3, v4\n\
+        \tdup.4s v0, w12\n\
+        \tdup.2d v2, x3\n\
+        \tdup.16b v1, w0\n\
+        \tmov.s v0[1], w10\n\
+        \tmov.d v2[1], x3\n\
+        \tmov.s w12, v0[3]\n";
+    assert_matches_clang("ras-dotted-neon", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();

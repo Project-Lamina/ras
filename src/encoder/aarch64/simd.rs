@@ -1,4 +1,5 @@
 use super::{gpr, is_stack_pointer};
+use crate::encoder::traits::ParsedInstruction;
 use crate::error::RasError;
 
 fn error(message: impl Into<String>) -> RasError {
@@ -88,12 +89,129 @@ impl Arrangement {
     }
 }
 
+/// Rewrites Apple's dotted NEON spelling to the standard one, so both encode the same.
+///
+/// clang on Darwin puts the layout on the mnemonic: `fmla.4s v0, v1, v2` and
+/// `ld1.4s { v0 }, [x0]`. Every plain vector register then takes the layout
+/// (`v0.4s`), and an element `v1[2]` takes its lane letter (`v1.s[2]`). The
+/// result is `None` for mnemonics without a layout suffix, so conditions such as
+/// `b.eq` pass through unchanged.
+pub(crate) fn normalize_dotted(
+    inst: &ParsedInstruction,
+) -> Result<Option<ParsedInstruction>, RasError> {
+    let Some((opcode, suffix)) = inst.opcode.split_once('.') else {
+        return Ok(None);
+    };
+    let (lane, arrangement) = match suffix {
+        "8b" | "16b" => ("b", Some(suffix)),
+        "4h" | "8h" => ("h", Some(suffix)),
+        "2s" | "4s" => ("s", Some(suffix)),
+        "2d" => ("d", Some(suffix)),
+        "b" | "h" | "s" | "d" => (suffix, None),
+        _ => return Ok(None),
+    };
+    if opcode.is_empty() || opcode.contains('.') {
+        return Ok(None);
+    }
+    let mut tagged = false;
+    let mut operands = Vec::with_capacity(inst.operands.len());
+    for operand in &inst.operands {
+        if let Some(inner) = operand.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            let Some(arrangement) = arrangement else {
+                return Err(error(format!(
+                    "{opcode}.{suffix} takes a lane list without a layout"
+                )));
+            };
+            let mut items = Vec::new();
+            for item in inner.split(',') {
+                let (text, done) = tag_vector(item.trim(), arrangement, lane)?;
+                if !done {
+                    return Err(error(format!("Expected a vector register in list: {item}")));
+                }
+                items.push(text);
+            }
+            tagged = true;
+            operands.push(format!("{{ {} }}", items.join(", ")));
+        } else {
+            let (text, done) = match arrangement {
+                Some(arrangement) => tag_vector(operand, arrangement, lane)?,
+                None => tag_element(operand, lane)?,
+            };
+            tagged |= done;
+            operands.push(text);
+        }
+    }
+    if !tagged {
+        return Err(error(format!(
+            "{opcode}.{suffix} needs a vector register operand"
+        )));
+    }
+    Ok(Some(ParsedInstruction {
+        opcode: opcode.to_string(),
+        operands,
+    }))
+}
+
+/// Adds the layout to a plain `v<n>` operand, or the lane letter to `v<n>[i]`.
+/// Returns the operand and whether it named a vector register.
+fn tag_vector(text: &str, arrangement: &str, lane: &str) -> Result<(String, bool), RasError> {
+    let Some((number, rest)) = split_vector(text) else {
+        return Ok((text.to_string(), false));
+    };
+    if rest.starts_with('.') {
+        return Err(error(format!(
+            "{text} already names its layout, which the dotted form forbids"
+        )));
+    }
+    Ok(if rest.is_empty() {
+        (format!("v{number}.{arrangement}"), true)
+    } else if rest.starts_with('[') {
+        (format!("v{number}.{lane}{rest}"), true)
+    } else {
+        (text.to_string(), false)
+    })
+}
+
+/// Adds the lane letter to an element operand `v<n>[i]` when the mnemonic has
+/// only a lane suffix, as in `mov.s v0[1], w1`.
+fn tag_element(text: &str, lane: &str) -> Result<(String, bool), RasError> {
+    match split_vector(text) {
+        Some((number, rest)) if rest.starts_with('[') => {
+            Ok((format!("v{number}.{lane}{rest}"), true))
+        }
+        Some((_, rest)) if rest.starts_with('.') => Err(error(format!(
+            "{text} already names its layout, which the dotted form forbids"
+        ))),
+        _ => Ok((text.to_string(), false)),
+    }
+}
+
+/// Splits `v<n>` followed by an optional `.layout` or `[index]` tail.
+fn split_vector(text: &str) -> Option<(&str, &str)> {
+    let body = text.strip_prefix('v')?;
+    let digits = body
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(body.len());
+    if digits == 0 {
+        return None;
+    }
+    let (number, rest) = body.split_at(digits);
+    if rest.is_empty() || rest.starts_with(['.', '[']) {
+        Some((number, rest))
+    } else {
+        None
+    }
+}
+
 pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
     let vector_first = p.first().is_some_and(|s| s.starts_with('v'));
     let word = match op {
         "dup" if vector_first => dup_general(p)?,
         "ins" => ins_general(p)?,
         "umov" => umov(p)?,
+        // `mov` is the lane alias of INS and UMOV; vector-to-vector moves are not lane moves.
+        "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
+        "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
         "add" | "sub" | "mul" | "and" | "eor" | "fmul" if vector_first => vector_arith(op, p)?,
         _ => return Ok(None),
     };
