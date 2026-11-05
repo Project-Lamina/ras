@@ -341,12 +341,39 @@ impl RasAssembler {
             .parse(&asm_text)
             .map_err(|e| RasError::ParseError(e.to_string()))?;
         let constants = absolute_aliases(&parsed.aliases)?;
+        let differences = difference_aliases(&parsed.aliases)?;
         for line in &mut parsed.lines {
-            if let Line::DataExpression { expression, .. } = line
-                && let DataExpression::Symbol(name, addend) = parse_data_expression(expression)?
-                && let Some(value) = constants.get(&name)
-            {
-                *expression = (value + addend).to_string();
+            let expression = match line {
+                Line::DataExpression { expression, .. } | Line::Leb128 { expression, .. } => {
+                    expression
+                }
+                _ => continue,
+            };
+            if let DataExpression::Symbol(name, addend) = parse_data_expression(expression)? {
+                if let Some(value) = constants.get(&name) {
+                    *expression = (value + addend).to_string();
+                } else if let Some(difference) = differences.get(&name) {
+                    if addend != 0 {
+                        return Err(RasError::EncodingError(format!(
+                            "Offset on a label difference is not supported: {expression}"
+                        )));
+                    }
+                    *expression = difference.clone();
+                }
+            }
+        }
+        for name in differences.keys() {
+            let referenced = parsed.lines.iter().any(|line| match line {
+                Line::Instruction(inst) => inst
+                    .operands
+                    .iter()
+                    .any(|op| op.split(|c: char| !is_symbol_char(c)).any(|t| t == name)),
+                _ => false,
+            });
+            if referenced {
+                return Err(RasError::EncodingError(format!(
+                    "Label difference {name} can only be used in data directives"
+                )));
             }
         }
 
@@ -529,7 +556,13 @@ impl RasAssembler {
             symbols.append(&mut syms);
             relocs.append(&mut relocations);
         }
-        let mut aliases = parsed.aliases.clone();
+        // Label differences were substituted into their data directives above.
+        let mut aliases: Vec<(String, String)> = parsed
+            .aliases
+            .iter()
+            .filter(|(name, _)| !differences.contains_key(name))
+            .cloned()
+            .collect();
         while !aliases.is_empty() {
             let count = aliases.len();
             let mut pending = Vec::new();
@@ -1780,8 +1813,18 @@ impl RasAssembler {
                 arch,
             } = patch
             {
+                let checked = |value: i128| {
+                    if fits_data_width(value, *width) {
+                        Ok(value)
+                    } else {
+                        Err(RasError::EncodingError(format!(
+                            "Value {value} does not fit in {width} bytes: {expression}"
+                        )))
+                    }
+                };
                 match parse_data_expression(expression)? {
                     DataExpression::Constant(value) => {
+                        let value = checked(value)?;
                         code[*offset..*offset + width]
                             .copy_from_slice(&value.to_le_bytes()[..*width]);
                     }
@@ -1798,7 +1841,7 @@ impl RasAssembler {
                         if let (Some((ls, left)), Some((rs, right))) = (&left_value, &right_value)
                             && ls == rs
                         {
-                            let value = *left as i128 - *right as i128;
+                            let value = checked(*left as i128 - *right as i128)?;
                             code[*offset..*offset + width]
                                 .copy_from_slice(&value.to_le_bytes()[..*width]);
                         } else if let Some((rs, right)) =
@@ -3013,6 +3056,38 @@ fn absolute_aliases(aliases: &[(String, String)]) -> Result<HashMap<String, i128
     Ok(values)
 }
 
+/// Darwin assignments of the form `X = A-B`, keyed by `X` and holding the text `A-B`.
+/// An assignment of such a name to another name is followed to the same text.
+fn difference_aliases(aliases: &[(String, String)]) -> Result<HashMap<String, String>, RasError> {
+    let mut differences: HashMap<String, String> = HashMap::new();
+    for _ in 0..aliases.len() {
+        for (name, expression) in aliases {
+            match parse_data_expression(expression)? {
+                DataExpression::Difference(..) => {
+                    differences.insert(name.clone(), expression.clone());
+                }
+                DataExpression::Symbol(target, 0) => {
+                    if let Some(text) = differences.get(&target).cloned() {
+                        differences.insert(name.clone(), text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(differences)
+}
+
+fn is_symbol_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '$')
+}
+
+/// Whether `value` can be stored in a data field of `width` bytes, signed or unsigned.
+fn fits_data_width(value: i128, width: usize) -> bool {
+    let bits = 8 * width as u32;
+    value >= -(1i128 << (bits - 1)) && value < (1i128 << bits)
+}
+
 fn absolute_expression(
     expression: &str,
     positions: &HashMap<String, (String, usize)>,
@@ -3110,5 +3185,152 @@ mod layout_cache_tests {
         assert_eq!(cached.symbol_offsets, full.symbol_offsets);
         assert_eq!(rip_patches(&cached), rip_patches(&full));
         assert!(!rip_patches(&full).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod label_difference_tests {
+    use super::*;
+
+    fn assemble_macho(source: &str) -> Result<Vec<u8>, RasError> {
+        RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::MacOS)?
+            .assemble_text_to_object_bytes(source)
+    }
+
+    /// The contents of one section in a 64-bit Mach-O object.
+    fn macho_section(object: &[u8], segment: &str, section: &str) -> Vec<u8> {
+        let word = |at: usize| u32::from_le_bytes(object[at..at + 4].try_into().unwrap());
+        let quad = |at: usize| u64::from_le_bytes(object[at..at + 8].try_into().unwrap());
+        let name = |at: usize| {
+            let raw = &object[at..at + 16];
+            String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(16)])
+                .into_owned()
+        };
+        let mut at = 32;
+        for _ in 0..word(16) {
+            let size = word(at + 4) as usize;
+            if word(at) == 0x19 {
+                for index in 0..word(at + 64) as usize {
+                    let header = at + 72 + index * 80;
+                    if name(header) == section && name(header + 16) == segment {
+                        let start = word(header + 48) as usize;
+                        return object[start..start + quad(header + 40) as usize].to_vec();
+                    }
+                }
+            }
+            at += size;
+        }
+        panic!("no {segment},{section} section");
+    }
+
+    const TEXT: &str = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \t.globl _main\n\
+        \t.p2align 2\n\
+        _main:\n\
+        \tmov w0, #1\n\
+        Lstart:\n\
+        \tret\n\
+        Lend:\n";
+
+    fn debug_info(body: &str) -> String {
+        format!("{TEXT}\t.section __DWARF,__debug_info,regular,debug\n{body}")
+    }
+
+    #[test]
+    fn assignments_of_label_differences_fill_data_and_leb128() {
+        let object = assemble_macho(&debug_info(
+            "Lset0 = Lend-Lstart\n\
+            \t.long Lset0\n\
+            \t.quad Lset0\n\
+            \t.byte 0\n\
+            Lset1 = Lend-Lstart\n\
+            \t.uleb128 Lset1\n\
+            \t.sleb128 Lset1\n",
+        ))
+        .expect("assemble");
+        assert_eq!(
+            macho_section(&object, "__DWARF", "__debug_info"),
+            [
+                0x04, 0, 0, 0, // .long
+                0x04, 0, 0, 0, 0, 0, 0, 0,    // .quad
+                0x00, // .byte
+                0x04, // .uleb128
+                0x04, // .sleb128
+            ]
+        );
+    }
+
+    #[test]
+    fn negative_label_difference_fills_two_complement_field() {
+        let object = assemble_macho(&debug_info(
+            "Lback = Lstart-Lend\n\
+            \t.long Lback\n\
+            \t.sleb128 Lback\n",
+        ))
+        .expect("assemble");
+        assert_eq!(
+            macho_section(&object, "__DWARF", "__debug_info"),
+            [0xfc, 0xff, 0xff, 0xff, 0x7c]
+        );
+    }
+
+    #[test]
+    fn label_difference_refusals_are_explicit() {
+        let cases = [
+            (
+                // `Lelsewhere` is in another section than the `.long`.
+                debug_info("Lx = Lend-Lelsewhere\n\t.long Lx\n")
+                    + "\t.section __DWARF,__debug_str,regular,debug\nLelsewhere:\n",
+                "cross-section label in difference",
+            ),
+            (
+                debug_info("Lx = Lundef-Lstart\n\t.long Lx\n"),
+                "cross-section label in difference",
+            ),
+            (
+                debug_info("Lx = Lend-Lstart\n\t.byte Lx+1\n"),
+                "Offset on a label difference is not supported",
+            ),
+            (
+                debug_info("Lx = Lend-Lstart\nLy = Lx\n\t.long Ly+4\n"),
+                "Offset on a label difference is not supported",
+            ),
+            (
+                debug_info("Lx = Lstart-Lend\n\t.uleb128 Lx\n"),
+                "Negative unsigned LEB128",
+            ),
+            (
+                debug_info("Lx = Lend-Lstart\nLy = Lx\n\tadr x0, Ly\n"),
+                "can only be used in data directives",
+            ),
+            (debug_info("Lx = Lend-Lstart\n\t.byte Lx\n"), ""),
+        ];
+        for (source, expected) in cases {
+            if expected.is_empty() {
+                assert!(assemble_macho(&source).is_ok(), "{source}");
+                continue;
+            }
+            let error = assemble_macho(&source).expect_err(&source).to_string();
+            assert!(
+                error.contains(expected),
+                "{error} does not contain {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_wider_than_its_directive_is_refused() {
+        let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+            \t.globl _main\n\
+            \t.p2align 2\n\
+            _main:\n\
+            Lstart:\n\
+            \t.space 300\n\
+            Lend:\n\
+            \t.section __DWARF,__debug_info,regular,debug\n\
+            Lx = Lend-Lstart\n\
+            \t.byte Lx\n";
+        let error = assemble_macho(source).expect_err("300 does not fit a byte");
+        assert!(error.to_string().contains("does not fit in 1 bytes"));
     }
 }
