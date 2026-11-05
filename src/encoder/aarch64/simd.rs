@@ -211,6 +211,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         "umov" => umov(p)?,
         // `mov` is the lane alias of INS and UMOV; vector-to-vector moves are not lane moves.
         "addv" => addv(p)?,
+        "faddp" if !vector_first => faddp_scalar(p)?,
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
         "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
         "mov" if vector_first && p.len() == 2 && p[1].starts_with('v') && !p[1].contains('[') => {
@@ -219,7 +220,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
             vector_arith("orr", &[p[0].clone(), source.clone(), source])?
         }
         "add" | "sub" | "mul" | "and" | "orr" | "eor" | "fadd" | "fsub" | "fmul" | "fdiv"
-        | "fmla" | "fmls"
+        | "fmla" | "fmls" | "faddp"
             if vector_first =>
         {
             vector_arith(op, p)?
@@ -360,6 +361,20 @@ fn scalar_register(text: &str, kind: char) -> Result<u32, RasError> {
         .ok_or_else(|| error(format!("Expected a {kind}<n> register: {text}")))
 }
 
+/// FADDP (scalar), 0 1 1 11110 0 sz 11000 01101 10 Rn Rd: the sum of the two
+/// lanes of a 2s or 2d vector into an s or d register.
+fn faddp_scalar(p: &[String]) -> Result<u32, RasError> {
+    let p = exact(p, 2)?;
+    let (rn, arrangement) = vector_register(&p[1])?;
+    let (kind, base) = match arrangement {
+        Arrangement::S2 => ('s', 0x7E30_D800),
+        Arrangement::D2 => ('d', 0x7E70_D800),
+        _ => return Err(error("faddp scalar takes a 2s or 2d source")),
+    };
+    let rd = scalar_register(&p[0], kind)?;
+    Ok(base | (rn << 5) | rd)
+}
+
 /// The sz bit (bit 22) of a floating-point vector form: 2s and 4s are single
 /// precision, 2d is double precision, and half precision is not encoded.
 fn float_size(op: &str, arrangement: Arrangement) -> Result<u32, RasError> {
@@ -404,6 +419,7 @@ fn vector_arith(op: &str, p: &[String]) -> Result<u32, RasError> {
         "fdiv" => 0x2E20_FC00 | float_size(op, arrangement)?,
         "fmla" => 0x0E20_CC00 | float_size(op, arrangement)?,
         "fmls" => 0x0EA0_CC00 | float_size(op, arrangement)?,
+        "faddp" => 0x2E20_D400 | float_size(op, arrangement)?,
         _ => return Err(error(format!("Unsupported instruction: {op}"))),
     };
     Ok(base | arrangement.q() | (rm << 16) | (rn << 5) | rd)

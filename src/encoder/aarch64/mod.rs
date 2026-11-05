@@ -1395,6 +1395,15 @@ mod exclusive_tests {
         assert_eq!(word("fmls", &["v0.4s", "v1.4s", "v2.4s"]), 0x4EA2_CC20);
         assert_eq!(word("fmls", &["v0.2s", "v1.2s", "v2.2s"]), 0x0EA2_CC20);
         assert_eq!(word("fmls", &["v0.2d", "v1.2d", "v2.2d"]), 0x4EE2_CC20);
+        assert_eq!(word("faddp", &["v0.4s", "v1.4s", "v2.4s"]), 0x6E22_D420);
+        assert_eq!(word("faddp", &["v0.2s", "v1.2s", "v2.2s"]), 0x2E22_D420);
+        assert_eq!(word("faddp", &["v0.2d", "v1.2d", "v2.2d"]), 0x6E62_D420);
+        assert_eq!(word("faddp", &["s0", "v1.2s"]), 0x7E30_D820);
+        assert_eq!(word("faddp", &["d0", "v1.2d"]), 0x7E70_D820);
+        assert_eq!(
+            word("faddp.2s", &["s0", "v1"]),
+            word("faddp", &["s0", "v1.2s"])
+        );
     }
 
     #[test]
@@ -1472,6 +1481,10 @@ mod exclusive_tests {
             ("addv", &["h0", "v1.8b"]),
             ("addv", &["s0", "v1.8h"]),
             ("addv", &["b0", "v1.8b", "v2.8b"]),
+            ("faddp", &["s0", "v1.4s"]),
+            ("faddp", &["d0", "v1.2s"]),
+            ("faddp", &["s0", "v1.2d"]),
+            ("faddp", &["v0.8h", "v1.8h", "v2.8h"]),
         ];
         for (op, operands) in refused {
             let inst = ParsedInstruction {
