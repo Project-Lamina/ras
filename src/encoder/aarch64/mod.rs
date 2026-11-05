@@ -1426,6 +1426,25 @@ mod exclusive_tests {
             word("movi.4s", &["v1", "#1"]),
             word("movi", &["v1.4s", "#1"])
         );
+        assert_eq!(word("ld1", &["{ v0.4s }", "[x0]"]), 0x4C40_7800);
+        assert_eq!(word("ld1", &["{ v0.4s, v1.4s }", "[x0]"]), 0x4C40_A800);
+        assert_eq!(
+            word("ld1", &["{ v0.4s, v1.4s, v2.4s }", "[x0]"]),
+            0x4C40_6800
+        );
+        assert_eq!(
+            word("ld1", &["{ v0.4s, v1.4s, v2.4s, v3.4s }", "[x0]"]),
+            0x4C40_2800
+        );
+        assert_eq!(word("ld1", &["{ v0.2d }", "[x0]"]), 0x4C40_7C00);
+        assert_eq!(word("ld1", &["{ v0.8b }", "[x0]"]), 0x0C40_7000);
+        assert_eq!(word("st1", &["{ v0.2s }", "[x0]"]), 0x0C00_7800);
+        assert_eq!(word("st1", &["{ v31.4h }", "[sp]"]), 0x0C00_77FF);
+        assert_eq!(word("st1", &["{ v0.2d, v1.2d }", "[x0]"]), 0x4C00_AC00);
+        assert_eq!(
+            word("ld1.4s", &["{ v0 }", "[x0]"]),
+            word("ld1", &["{ v0.4s }", "[x0]"])
+        );
         assert_eq!(
             word("fmov.d", &["x0", "v1[1]"]),
             word("fmov", &["x0", "v1.d[1]"])
@@ -1461,7 +1480,7 @@ mod exclusive_tests {
         let refused = [
             ("add.4s", &["v0.4s", "v1", "v2"][..]),
             ("add.4s", &["x0", "x1", "x2"]),
-            ("ld1.4s", &["{ v0 }", "[x0]"]),
+            ("ld1.s", &["{ v0 }", "[x0]"]),
             ("ins.s", &["x0", "w1"]),
             ("fmul.2s", &["s0", "s1", "s2"]),
             ("add.3s", &["v0", "v1", "v2"]),
@@ -1536,6 +1555,18 @@ mod exclusive_tests {
             ("movi", &["v0.4s", "#0x100"]),
             ("movi", &["v0.4s", "1"]),
             ("movi", &["v0.4s"]),
+            ("ld1", &["{ v0.4s, v2.4s }", "[x0]"]),
+            ("ld1", &["{ v0.4s, v1.8h }", "[x0]"]),
+            ("ld1", &["{ v0.4s }", "[x0], #16"]),
+            ("ld1", &["{ v0.4s }", "[x31]"]),
+            ("ld1", &["{ v0.4s }", "[w0]"]),
+            ("ld1", &["{ v0.4s }", "[x0, #16]"]),
+            ("ld1", &["{ v0.4s }", "x0"]),
+            ("ld1", &["{ v0.4s }"]),
+            ("ld1", &["{ v0.4s, v1.4s, v2.4s, v3.4s, v4.4s }", "[x0]"]),
+            ("ld1", &["{ v0.1d }", "[x0]"]),
+            ("ld1", &["{ v0 }", "[x0]"]),
+            ("st1", &["{ v0.4s }", "[x0], #16"]),
         ];
         for (op, operands) in refused {
             let inst = ParsedInstruction {

@@ -260,6 +260,23 @@ fn neon_movi_matches_clang_bytes() {
     assert_matches_clang("ras-neon-movi", source);
 }
 
+#[test]
+fn neon_structure_loads_and_stores_match_clang_bytes() {
+    let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+        \tld1.4s { v0 }, [x0]\n\
+        \tld1.4s { v1, v2 }, [x2]\n\
+        \tld1.16b { v3, v4, v5 }, [x1]\n\
+        \tld1.8h { v6, v7, v8, v9 }, [x3]\n\
+        \tld1.2d { v10 }, [sp]\n\
+        \tld1.8b { v11 }, [x12]\n\
+        \tst1.2s { v13 }, [x4]\n\
+        \tst1.4h { v31 }, [sp]\n\
+        \tst1.2d { v14, v15 }, [x5]\n\
+        \tst1.16b { v16, v17, v18, v19 }, [x6]\n\
+        \tld1.4s { v31, v0 }, [x7]\n";
+    assert_matches_clang("ras-neon-ld1", source);
+}
+
 fn assert_matches_clang(tag: &str, source: &str) {
     let guard = TempDir::new(tag);
     let dir = guard.path();

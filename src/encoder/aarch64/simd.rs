@@ -214,6 +214,7 @@ pub(super) fn encode(op: &str, p: &[String]) -> Result<Option<u32>, RasError> {
         "fmov" if p.iter().any(|s| s.starts_with('v')) => fmov_lane(p)?,
         "ext" if vector_first => ext_vector(p)?,
         "movi" if vector_first => movi_vector(p)?,
+        "ld1" | "st1" if p.first().is_some_and(|s| s.starts_with('{')) => ld_st_multiple(op, p)?,
         "faddp" if !vector_first => faddp_scalar(p)?,
         "mov" if vector_first && p.get(1).is_some_and(|s| !s.starts_with('v')) => ins_general(p)?,
         "mov" if !vector_first && p.get(1).is_some_and(|s| s.starts_with('v')) => umov(p)?,
@@ -361,6 +362,62 @@ fn fmov_lane(p: &[String]) -> Result<u32, RasError> {
     } else {
         0x9EAE_0000 | (number << 5) | gpr
     })
+}
+
+/// LD1/ST1 (multiple structures, no offset): 0 Q 0011000 L 000000 opcode size
+/// Rn Rt, with L set for loads and the opcode naming one to four registers.
+/// Post-indexed forms are not encoded.
+fn ld_st_multiple(op: &str, p: &[String]) -> Result<u32, RasError> {
+    let p = exact(p, 2)?;
+    let inner = p[0]
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| error(format!("Expected a register list in braces: {}", p[0])))?;
+    let mut first = None;
+    let mut arrangement = None;
+    let mut count = 0;
+    for item in inner.split(',') {
+        let (number, layout) = vector_register(item.trim())?;
+        if arrangement.is_some_and(|a| a != layout) {
+            return Err(error(format!("{op} list mixes layouts: {}", p[0])));
+        }
+        arrangement = Some(layout);
+        let expected = first.map_or(number, |f: u32| (f + count) % 32);
+        if number != expected {
+            return Err(error(format!(
+                "{op} list must name consecutive registers: {}",
+                p[0]
+            )));
+        }
+        first.get_or_insert(number);
+        count += 1;
+    }
+    let (rt, arrangement) = match (first, arrangement) {
+        (Some(rt), Some(arrangement)) => (rt, arrangement),
+        _ => return Err(error(format!("Empty register list for {op}"))),
+    };
+    let opcode = match count {
+        1 => 0x7000,
+        2 => 0xA000,
+        3 => 0x6000,
+        4 => 0x2000,
+        _ => return Err(error(format!("{op} takes one to four registers"))),
+    };
+    let base = p[1]
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| error(format!("Expected a [<base>] address: {}", p[1])))?;
+    let rn = if base == "sp" {
+        31
+    } else {
+        let (number, wide) = gpr(base)?;
+        if !wide {
+            return Err(error(format!("Expected an x base register: {base}")));
+        }
+        number
+    };
+    let load = if op == "ld1" { 0x0040_0000 } else { 0 };
+    Ok(0x0C00_0000 | load | arrangement.q() | (arrangement.size() >> 12) | opcode | (rn << 5) | rt)
 }
 
 /// MOVI (vector immediate), 0 Q op 0111100000 abc cmode 01 defgh Rd. The
