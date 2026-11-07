@@ -663,6 +663,17 @@ impl AssemblyParser {
                     }
                 }
             }
+            // COFF's image-relative address, as `.long symbol@IMGREL` spells it.
+            ".rva" => {
+                for item in line[parts[0].len()..].split(',') {
+                    let expression = format!("{}@IMGREL", item.trim());
+                    parse_data_expression(&expression)?;
+                    self.lines.push(Line::DataExpression {
+                        width: 4,
+                        expression,
+                    });
+                }
+            }
             ".zero" | ".space" | ".skip" => {
                 let items: Vec<_> = line[parts[0].len()..].split(',').map(str::trim).collect();
                 let count = usize::try_from(parse_integer(items[0])?)
@@ -1096,7 +1107,9 @@ pub(crate) fn parse_data_expression(text: &str) -> Result<DataExpression, RasErr
                 && s.as_bytes()[0].is_ascii_digit()
                 && matches!(s.as_bytes()[1], b'f' | b'b'))
     };
-    if let Some(name) = text.strip_suffix("@tpoff")
+    if let Some(name) = text
+        .strip_suffix("@tpoff")
+        .or_else(|| text.strip_suffix("@IMGREL"))
         && symbol(name)
     {
         return Ok(DataExpression::Symbol(text.into(), 0));
