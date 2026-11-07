@@ -666,3 +666,372 @@ fn push_sleb(buf: &mut Vec<u8>, mut value: i64) {
         buf.push(byte | 0x80);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Function symbols and `.debug_info` subprograms, read back with readelf.
+    ///
+    /// The assertions are questions a debugger asks: which functions exist, where each
+    /// one starts and ends, what it returns and what its parameters are called. None of
+    /// them compares bytes with another toolchain's output.
+    #[cfg(target_os = "linux")]
+    mod info {
+        use crate::test_support::TempDir;
+        use crate::{
+            BaseType, DebugInfoRequest, DebugType, DeclSite, FormalParameter, ObjectWriteOptions,
+            Ras, Subprogram,
+        };
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+        use std::path::Path;
+        use std::process::Command;
+
+        /// `twice` is followed by `.p2align 4`, so the padding between it and `half` belongs
+        /// to neither function and must not land in either one's size.
+        const SOURCE: &str = ".file 1 \"shapes.lamina\"\n\
+        .text\n\
+        .globl twice\n\
+        twice:\n\
+        .loc 1 1 1\n\
+        addl %edi, %edi\n\
+        movl %edi, %eax\n\
+        ret\n\
+        .p2align 4\n\
+        half:\n\
+        .loc 1 6 1\n\
+        movl %edi, %eax\n\
+        ret\n";
+
+        fn request() -> DebugInfoRequest {
+            DebugInfoRequest {
+                producer: Some("ras test".into()),
+                subprograms: vec![
+                    Subprogram {
+                        name: "twice".into(),
+                        symbol: None,
+                        external: true,
+                        decl: Some(DeclSite { file: 1, line: 1 }),
+                        ret: Some(DebugType::Base(BaseType::I32)),
+                        params: vec![FormalParameter {
+                            name: Some("n".into()),
+                            ty: Some(DebugType::Base(BaseType::I32)),
+                        }],
+                        variadic: false,
+                    },
+                    Subprogram {
+                        name: "half".into(),
+                        symbol: None,
+                        external: false,
+                        decl: Some(DeclSite { file: 1, line: 6 }),
+                        ret: Some(DebugType::Base(BaseType::I32)),
+                        params: vec![FormalParameter {
+                            name: Some("n".into()),
+                            ty: Some(DebugType::Base(BaseType::I32)),
+                        }],
+                        variadic: false,
+                    },
+                    // Nothing in the source defines this, so it must be left undescribed
+                    // rather than described without an address.
+                    Subprogram {
+                        name: "absent".into(),
+                        symbol: None,
+                        external: true,
+                        decl: None,
+                        ret: None,
+                        params: Vec::new(),
+                        variadic: false,
+                    },
+                ],
+            }
+        }
+
+        fn assemble(path: &Path, options: ObjectWriteOptions) {
+            Ras::with_object_write_options(
+                TargetArchitecture::X86_64,
+                TargetOperatingSystem::Linux,
+                options,
+            )
+            .expect("assembler")
+            .assemble(SOURCE, path)
+            .expect("assemble");
+        }
+
+        fn readelf(path: &Path, switch: &str) -> String {
+            let output = Command::new("readelf")
+                .arg(switch)
+                .arg(path)
+                .output()
+                .expect("readelf");
+            String::from_utf8(output.stdout).expect("readelf output is utf-8")
+        }
+
+        /// `(type, size)` of a symbol in the symbol table.
+        fn symbol(dump: &str, name: &str) -> Option<(String, u64)> {
+            dump.lines().find_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 8 || fields.last() != Some(&name) {
+                    return None;
+                }
+                Some((fields[3].to_string(), fields[2].parse().ok()?))
+            })
+        }
+
+        #[test]
+        fn named_functions_are_sized_without_the_padding_that_follows_them() {
+            let dir = TempDir::new("debug_info_symbols");
+            let path = dir.path().join("out.o");
+            assemble(
+                &path,
+                ObjectWriteOptions {
+                    function_symbols: vec!["twice".into(), "half".into()],
+                    ..ObjectWriteOptions::default()
+                },
+            );
+            let dump = readelf(&path, "-sW");
+
+            // addl + movl + ret, and none of the alignment padding after them.
+            assert_eq!(symbol(&dump, "twice"), Some(("FUNC".into(), 5)));
+            assert_eq!(symbol(&dump, "half"), Some(("FUNC".into(), 3)));
+        }
+
+        #[test]
+        fn a_symbol_not_named_as_a_function_keeps_its_type() {
+            let dir = TempDir::new("debug_info_untyped");
+            let path = dir.path().join("out.o");
+            assemble(&path, ObjectWriteOptions::default());
+            let dump = readelf(&path, "-sW");
+
+            assert_eq!(symbol(&dump, "twice"), Some(("NOTYPE".into(), 0)));
+        }
+
+        #[test]
+        fn subprograms_carry_their_range_declaration_and_parameters() {
+            let dir = TempDir::new("debug_info_dies");
+            let path = dir.path().join("out.o");
+            assemble(
+                &path,
+                ObjectWriteOptions {
+                    function_symbols: vec!["twice".into(), "half".into()],
+                    debug_info: Some(request()),
+                    ..ObjectWriteOptions::default()
+                },
+            );
+            let dump = readelf(&path, "--debug-dump=info");
+
+            assert_eq!(dump.matches("DW_TAG_subprogram").count(), 2, "{dump}");
+            assert!(!dump.contains("absent"), "{dump}");
+            assert_eq!(dump.matches("DW_TAG_base_type").count(), 1, "{dump}");
+            assert_eq!(dump.matches("DW_TAG_formal_parameter").count(), 2, "{dump}");
+
+            // The externally visible one says so; the other must not.
+            assert_eq!(dump.matches("DW_AT_external").count(), 1, "{dump}");
+
+            for (name, line, length) in [("twice", "1", "0x5"), ("half", "6", "0x3")] {
+                let die = dump
+                    .split("DW_TAG_subprogram")
+                    .find(|part| part.contains(&format!("DW_AT_name        : {name}")))
+                    .unwrap_or_else(|| panic!("no subprogram for {name} in {dump}"));
+                assert!(
+                    die.contains(&format!("DW_AT_decl_line   : {line}")),
+                    "{die}"
+                );
+                assert!(
+                    die.contains(&format!("DW_AT_high_pc     : {length}")),
+                    "{die}"
+                );
+                assert!(die.contains("DW_OP_call_frame_cfa"), "{die}");
+                assert!(die.contains("DW_AT_name        : n"), "{die}");
+            }
+        }
+
+        /// A parameter whose location the caller could not supply must carry no location at
+        /// all. A debugger reads the absence as "optimized out"; a guess would make it print
+        /// a wrong value instead.
+        #[test]
+        fn a_parameter_without_a_known_location_is_given_none() {
+            let dir = TempDir::new("debug_info_no_location");
+            let path = dir.path().join("out.o");
+            assemble(
+                &path,
+                ObjectWriteOptions {
+                    function_symbols: vec!["twice".into(), "half".into()],
+                    debug_info: Some(request()),
+                    ..ObjectWriteOptions::default()
+                },
+            );
+            let dump = readelf(&path, "--debug-dump=info");
+
+            assert!(!dump.contains("DW_AT_location"), "{dump}");
+        }
+
+        #[test]
+        fn the_tree_passes_the_dwarf_verifier() {
+            let Ok(verifier) = which_dwarfdump() else {
+                return;
+            };
+            let dir = TempDir::new("debug_info_verify");
+            let path = dir.path().join("out.o");
+            assemble(
+                &path,
+                ObjectWriteOptions {
+                    function_symbols: vec!["twice".into(), "half".into()],
+                    debug_info: Some(request()),
+                    ..ObjectWriteOptions::default()
+                },
+            );
+            let output = Command::new(verifier)
+                .arg("--verify")
+                .arg(&path)
+                .output()
+                .expect("llvm-dwarfdump");
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{text}");
+            assert!(text.contains("No errors."), "{text}");
+        }
+
+        fn which_dwarfdump() -> Result<String, ()> {
+            for name in ["llvm-dwarfdump", "llvm-dwarfdump-18", "llvm-dwarfdump-19"] {
+                let found = Command::new(name)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success());
+                if found {
+                    return Ok(name.to_string());
+                }
+            }
+            Err(())
+        }
+    }
+
+    /// A `.loc` row must follow its instruction when branch relaxation moves code.
+    /// The expected rows were checked against GNU as.
+    #[cfg(target_os = "linux")]
+    mod line {
+        use crate::Ras;
+        use crate::test_support::TempDir;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+        use std::process::Command;
+
+        fn source() -> String {
+            let mut text = String::from(
+                ".file 1 \"relax.c\"\n.text\n.globl relaxed\nrelaxed:\n.loc 1 2 0\nxorl %eax, %eax\n.loc 1 3 0\njne .Lfar\n.loc 1 4 0\nmovl $1, %eax\n",
+            );
+            for _ in 0..40 {
+                text.push_str("addl $1000, %eax\n");
+            }
+            text.push_str(".loc 1 5 0\nmovl $5, %ecx\n.Lfar:\n.loc 1 6 2\nmovl $7, %edx\n.p2align 4\n.loc 1 7 0\njmp .Lend\n");
+            for _ in 0..30 {
+                text.push_str("addl $2000, %ebx\n");
+            }
+            text.push_str(".Lend:\n.loc 1 9 0 is_stmt 0\naddl %edx, %eax\n.loc 1 10 0\nret\n");
+            text
+        }
+
+        fn rows(object: &std::path::Path) -> Option<Vec<(u32, u64, bool)>> {
+            let output = Command::new("readelf")
+                .arg("--debug-dump=decodedline")
+                .arg(object)
+                .output()
+                .ok()?;
+            let text = String::from_utf8(output.stdout).ok()?;
+            let mut rows = Vec::new();
+            for line in text.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 3 || !fields[0].starts_with("relax") {
+                    continue;
+                }
+                let (Ok(number), Some(address)) = (
+                    fields[1].parse::<u32>(),
+                    fields[2].strip_prefix("0x").map_or_else(
+                        || fields[2].parse::<u64>().ok(),
+                        |hex| u64::from_str_radix(hex, 16).ok(),
+                    ),
+                ) else {
+                    continue;
+                };
+                rows.push((number, address, fields.get(3) == Some(&"x")));
+            }
+            Some(rows)
+        }
+
+        #[test]
+        fn loc_rows_follow_relaxed_branches() {
+            let dir = TempDir::new("debug_line");
+            let path = dir.path().join("out.o");
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(&source(), &path)
+                .unwrap();
+            let Some(rows) = rows(&path) else {
+                return;
+            };
+            assert_eq!(
+                rows,
+                [
+                    (2, 0x0, true),
+                    (3, 0x2, true),
+                    (4, 0x8, true),
+                    (5, 0xd5, true),
+                    (6, 0xda, true),
+                    (7, 0xe0, true),
+                    (9, 0x199, false),
+                    (10, 0x19b, false),
+                ]
+            );
+        }
+
+        fn dwarfdump(object: &std::path::Path) -> Option<String> {
+            for tool in ["llvm-dwarfdump-18", "llvm-dwarfdump"] {
+                if let Ok(output) = Command::new(tool).arg("--debug-line").arg(object).output()
+                    && output.status.success()
+                {
+                    return String::from_utf8(output.stdout).ok();
+                }
+            }
+            None
+        }
+
+        #[test]
+        fn loc_flags_reach_the_line_program() {
+            let dir = TempDir::new("debug_line_flags");
+            let path = dir.path().join("flags.o");
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(
+                    ".file 1 \"flags.c\"\n.text\n.globl f\nf:\n.loc 1 1 0 prologue_end\nnop\n.loc 1 2 0 basic_block discriminator 3\nnop\n.loc 1 3 0 epilogue_begin isa 1\nret\n",
+                    &path,
+                )
+                .unwrap();
+            let Some(text) = dwarfdump(&path) else {
+                return;
+            };
+            let rows: Vec<Vec<String>> = text
+                .lines()
+                .filter(|line| line.starts_with("0x"))
+                .map(|line| {
+                    line.split_whitespace()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(rows.len(), 4, "{text}");
+            let flags = |row: &Vec<String>| row[7..].join(" ");
+            let isa = |row: &Vec<String>| row[4].clone();
+            let discriminator = |row: &Vec<String>| row[5].clone();
+            assert_eq!(flags(&rows[0]), "is_stmt prologue_end");
+            assert_eq!(flags(&rows[1]), "is_stmt basic_block");
+            assert_eq!(flags(&rows[2]), "is_stmt epilogue_begin");
+            assert_eq!(
+                [
+                    discriminator(&rows[0]),
+                    discriminator(&rows[1]),
+                    discriminator(&rows[2])
+                ],
+                ["0", "3", "0"]
+            );
+            assert_eq!(
+                [isa(&rows[0]), isa(&rows[1]), isa(&rows[2])],
+                ["0", "0", "1"]
+            );
+        }
+    }
+}

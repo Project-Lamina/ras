@@ -35,3 +35,22 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+/// The `ras` executable beside this test binary. `cargo test` builds it as part of the
+/// bin target; `cargo test --lib` does not, so say which command is missing rather than
+/// failing later on an absent program.
+#[allow(dead_code)]
+pub(crate) fn ras_binary() -> PathBuf {
+    let mut path = std::env::current_exe().expect("test binary path");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let ras = path.join("ras");
+    assert!(
+        ras.is_file(),
+        "{} is not built: run `cargo build --bin ras`",
+        ras.display()
+    );
+    ras
+}

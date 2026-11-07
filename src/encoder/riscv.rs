@@ -1342,4 +1342,468 @@ mod tests {
         assert_eq!(word("amoadd.d.aqrl", &["a0", "a2", "(a1)"]), 0x06C5_B52F);
         assert_eq!(word("sc.w.rl", &["a3", "a4", "(a5)"]), 0x1AE7_A6AF);
     }
+
+    /// These compare ras against GNU binutils and clang on ELF objects, so they
+    /// only run where both the reference assembler and the format are available.
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "encoder")]
+    mod oracle {
+        use crate::Ras;
+        use crate::test_support::TempDir;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+        use std::process::Command;
+
+        fn text(bytes: &[u8]) -> &[u8] {
+            let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+            let headers = u64_at(40);
+            let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+            let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+            let names = &bytes[u64_at(headers + strings * 64 + 24)..];
+            for i in 1..count {
+                let h = headers + i * 64;
+                let name = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+                if names[name..].starts_with(b".text\0") {
+                    return &bytes[u64_at(h + 24)..u64_at(h + 24) + u64_at(h + 32)];
+                }
+            }
+            panic!("Missing .text")
+        }
+
+        /// Run the RV64I subset that `li` expands into and report `a0`.
+        fn evaluate(text: &[u8]) -> i64 {
+            let mut regs = [0i64; 32];
+            for word in text.as_chunks::<4>().0.iter() {
+                let word = u32::from_le_bytes(*word);
+                let rd = ((word >> 7) & 31) as usize;
+                let rs1 = regs[((word >> 15) & 31) as usize];
+                let shamt = (word >> 20) & 63;
+                let imm = i64::from((word as i32) >> 20);
+                let value = match (word & 0x7f, (word >> 12) & 7) {
+                    (0x37, _) => i64::from((word & 0xffff_f000) as i32),
+                    (0x13, 0) => rs1.wrapping_add(imm),
+                    (0x13, 1) => ((rs1 as u64) << shamt) as i64,
+                    (0x13, 5) => ((rs1 as u64) >> shamt) as i64,
+                    (0x13, 6) => rs1 | imm,
+                    (0x1b, 0) => i64::from(rs1.wrapping_add(imm) as i32),
+                    (0x33, 0) => rs1.wrapping_add(regs[((word >> 20) & 31) as usize]),
+                    _ => panic!("Unexpected instruction in li expansion: {word:#010x}"),
+                };
+                if rd != 0 {
+                    regs[rd] = value;
+                }
+            }
+            regs[10]
+        }
+
+        #[test]
+        fn li_materializes_every_boundary_immediate() {
+            let cases: &[(&str, i64)] = &[
+                ("0", 0),
+                ("1", 1),
+                ("-1", -1),
+                ("2047", 2047),
+                ("2048", 2048),
+                ("-2048", -2048),
+                ("-2049", -2049),
+                ("4095", 4095),
+                ("4096", 4096),
+                ("-4096", -4096),
+                ("0x7ff", 0x7ff),
+                ("0x800", 0x800),
+                ("0xfff", 0xfff),
+                ("0x1000", 0x1000),
+                ("0x1800", 0x1800),
+                ("0x7fffffff", 0x7fff_ffff),
+                ("-0x80000000", -0x8000_0000),
+                ("0x80000000", 0x8000_0000),
+                ("0xffffffff", 0xffff_ffff),
+                ("0x100000000", 0x1_0000_0000),
+                ("0x123456789abcdef0", 0x1234_5678_9abc_def0),
+                ("-9223372036854775808", i64::MIN),
+                ("9223372036854775807", i64::MAX),
+            ];
+            for (literal, expected) in cases {
+                let object = assemble_riscv("li_boundary", &format!(".text\nli a0, {literal}\n"));
+                assert_eq!(evaluate(text(&object)), *expected, "li a0, {literal}");
+            }
+        }
+
+        /// (offset, relocation type, symbol name) for every RELA entry in an object file.
+        fn relocations(bytes: &[u8]) -> Vec<(u64, u32, String)> {
+            let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let shoff = u64_at(40) as usize;
+            let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+            let section = |i: usize| shoff + i * 64;
+            let mut out = Vec::new();
+            for i in 0..count {
+                let header = section(i);
+                if u32_at(header + 4) != 4 {
+                    continue;
+                }
+                let symtab = section(u32_at(header + 40) as usize);
+                let symbols = u64_at(symtab + 24) as usize;
+                let strings = u64_at(section(u32_at(symtab + 40) as usize) + 24) as usize;
+                let entries = u64_at(header + 24) as usize;
+                for entry in (entries..entries + u64_at(header + 32) as usize).step_by(24) {
+                    let info = u64_at(entry + 8);
+                    let name_at = strings + u32_at(symbols + (info >> 32) as usize * 24) as usize;
+                    let name_len = bytes[name_at..].iter().position(|&b| b == 0).unwrap();
+                    let name =
+                        String::from_utf8_lossy(&bytes[name_at..name_at + name_len]).into_owned();
+                    out.push((u64_at(entry), info as u32, name));
+                }
+            }
+            out
+        }
+
+        fn assemble_riscv(name: &str, asm: &str) -> Vec<u8> {
+            let tmp = TempDir::new(&format!("riscv_{name}"));
+            let dir = tmp.path();
+            let output = dir.join("ras.o");
+            Ras::new(TargetArchitecture::Riscv64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(asm, &output)
+                .unwrap();
+            std::fs::read(&output).unwrap()
+        }
+
+        fn clang_riscv(name: &str, asm: &str, extra: &[&str]) -> Vec<u8> {
+            let tmp = TempDir::new(&format!("riscv_{name}"));
+            let dir = tmp.path();
+            let source = dir.join("input.s");
+            let reference = dir.join("reference.o");
+            std::fs::write(&source, asm).unwrap();
+            let result = Command::new("clang")
+                .args(["--target=riscv64-linux-gnu", "-march=rv64g", "-c"])
+                .args(extra)
+                .arg(&source)
+                .arg("-o")
+                .arg(&reference)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            std::fs::read(&reference).unwrap()
+        }
+
+        /// R_RISCV_RELAX hints only matter to linker relaxation, which ras does not emit.
+        fn without_relax(relocs: Vec<(u64, u32, String)>) -> Vec<(u64, u32, String)> {
+            relocs
+                .into_iter()
+                .filter(|(_, kind, _)| *kind != 51)
+                .collect()
+        }
+
+        #[test]
+        fn call_and_tail_to_external_symbols_match_clang_with_call_plt() {
+            let asm = ".text\n.globl _start\n_start:\n  call foo\n  tail foo\n";
+            let reference = clang_riscv("call_oracle", asm, &[]);
+            let ras = assemble_riscv("call_ras", asm);
+            assert_eq!(text(&ras), text(&reference));
+            assert_eq!(
+                without_relax(relocations(&ras)),
+                without_relax(relocations(&reference))
+            );
+        }
+
+        #[test]
+        fn la_to_external_symbol_matches_clang_non_pic_pcrel_pair() {
+            let asm = ".text\n.globl _start\n_start:\n  la a0, foo\n";
+            let reference = clang_riscv("la_oracle", asm, &["-fno-pic"]);
+            let ras = assemble_riscv("la_ras", asm);
+            assert_eq!(text(&ras), text(&reference));
+            let kinds = |bytes: &[u8]| {
+                without_relax(relocations(bytes))
+                    .into_iter()
+                    .map(|(offset, kind, _)| (offset, kind))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(kinds(&ras), kinds(&reference));
+        }
+
+        #[test]
+        fn local_call_tail_and_la_land_on_their_label_across_the_twelve_bit_boundary() {
+            let pc_relative = |pc: i64, auipc: u32, second: u32| {
+                let hi = (auipc & !0xFFF) as i32 as i64;
+                let lo = (second as i32 >> 20) as i64;
+                pc + hi + lo
+            };
+            for skip in [0usize, 2044, 2046, 2047, 2048, 2049, 4094, 4096] {
+                let asm = format!(
+                    ".text\n.globl _start\n_start:\n  call local\n  tail local\n  la a0, local\n  .skip {skip}\nlocal:\n  ret\n"
+                );
+                let bytes = assemble_riscv("local_pairs", &asm);
+                let code = text(&bytes);
+                let word = |at: usize| u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                let target = 24 + skip as i64;
+                for pc in [0i64, 8, 16] {
+                    let at = pc as usize;
+                    assert_eq!(
+                        pc_relative(pc, word(at), word(at + 4)),
+                        target,
+                        "skip {skip} pair at {pc}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// RISC-V label branches.
+    #[cfg(feature = "encoder")]
+    mod labels {
+        use crate::Ras;
+        use crate::test_support::TempDir;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        fn section(bytes: &[u8], wanted: &str) -> Vec<u8> {
+            let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+            let headers = u64_at(40);
+            let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+            let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+            let names = &bytes[u64_at(headers + strings * 64 + 24)..];
+            let wanted = format!("{wanted}\0");
+            for i in 1..count {
+                let h = headers + i * 64;
+                let name = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+                if names[name..].starts_with(wanted.as_bytes()) {
+                    return bytes[u64_at(h + 24)..u64_at(h + 24) + u64_at(h + 32)].to_vec();
+                }
+            }
+            panic!("Missing {wanted}")
+        }
+
+        fn section32(bytes: &[u8], wanted: &str) -> Vec<u8> {
+            let u32_at =
+                |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let headers = u32_at(32);
+            let count = u16::from_le_bytes(bytes[48..50].try_into().unwrap()) as usize;
+            let strings = u16::from_le_bytes(bytes[50..52].try_into().unwrap()) as usize;
+            let names = &bytes[u32_at(headers + strings * 40 + 16)..];
+            let wanted = format!("{wanted}\0");
+            for i in 1..count {
+                let h = headers + i * 40;
+                let name = u32_at(h);
+                if names[name..].starts_with(wanted.as_bytes()) {
+                    return bytes[u32_at(h + 16)..u32_at(h + 16) + u32_at(h + 20)].to_vec();
+                }
+            }
+            panic!("Missing {wanted}")
+        }
+
+        fn entsize32(bytes: &[u8], wanted: &str) -> u32 {
+            let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let headers = u32_at(32) as usize;
+            let count = u16::from_le_bytes(bytes[48..50].try_into().unwrap()) as usize;
+            let strings = u16::from_le_bytes(bytes[50..52].try_into().unwrap()) as usize;
+            let names = &bytes[u32_at(headers + strings * 40 + 16) as usize..];
+            let wanted = format!("{wanted}\0");
+            for i in 1..count {
+                let h = headers + i * 40;
+                if names[u32_at(h) as usize..].starts_with(wanted.as_bytes()) {
+                    return u32_at(h + 36);
+                }
+            }
+            panic!("Missing {wanted}")
+        }
+
+        fn assemble(name: &str, source: &str) -> Result<Vec<u8>, crate::error::RasError> {
+            let tmp = TempDir::new("riscv_labels");
+            let dir = tmp.path();
+            let output = dir.join(format!("{name}.o"));
+            Ras::new(TargetArchitecture::Riscv64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(source, &output)?;
+            Ok(std::fs::read(&output).unwrap())
+        }
+
+        fn words(text: &[u8]) -> Vec<u32> {
+            text.chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+
+        #[test]
+        fn backward_and_forward_labels_resolve_to_clang_encodings() {
+            let source = "\
+        .text
+        f:
+          addi a0, zero, 1
+        loop:
+          addi a0, a0, -1
+          bne a0, zero, loop
+          beq a0, zero, done
+          jal zero, f
+          bgt a1, a2, loop
+        done:
+          ret
+        ";
+            let object = assemble("resolved", source).unwrap();
+            assert_eq!(
+                words(&section(&object, ".text")),
+                [
+                    0x0010_0513,
+                    0xfff5_0513,
+                    0xfe05_1ee3,
+                    0x0005_0663,
+                    0xff1f_f06f,
+                    0xfeb6_48e3,
+                    0x0000_8067,
+                ]
+            );
+        }
+
+        #[test]
+        fn branch_offsets_reach_exactly_four_kib() {
+            let reach = |skip: usize| {
+                format!(".text\nstart:\n  beq a0, a1, end\n  .skip {skip}\nend:\n  ret\n")
+            };
+            assert!(assemble("branch_limit", &reach(4090)).is_ok());
+            let err = assemble("branch_past", &reach(4092)).unwrap_err();
+            assert!(
+                err.to_string().contains("RISC-V branch out of range"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn jump_offsets_reach_exactly_one_mib() {
+            let reach =
+                |skip: usize| format!(".text\nstart:\n  j end\n  .skip {skip}\nend:\n  ret\n");
+            assert!(assemble("jump_limit", &reach(1_048_570)).is_ok());
+            let err = assemble("jump_past", &reach(1_048_572)).unwrap_err();
+            assert!(
+                err.to_string().contains("RISC-V jump out of range"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn global_and_undefined_jump_targets_stay_relocations() {
+            let source = ".text\n.globl f\nf:\n  j f\n  jal ra, external\n";
+            let object = assemble("relocated", source).unwrap();
+            assert_eq!(
+                words(&section(&object, ".text")),
+                [0x0000_006f, 0x0000_00ef]
+            );
+        }
+
+        #[test]
+        fn align_counts_powers_of_two_and_pads_text_with_nops() {
+            let object = assemble("align", ".text\n  addi a0, a0, 1\n  .align 4\n  ret\n").unwrap();
+            assert_eq!(
+                words(&section(&object, ".text")),
+                [
+                    0x0015_0513,
+                    0x0000_0013,
+                    0x0000_0013,
+                    0x0000_0013,
+                    0x0000_8067
+                ]
+            );
+        }
+
+        #[test]
+        fn riscv32_object_output_is_elf32() {
+            let tmp = TempDir::new("riscv32");
+            let output = tmp.path().join("riscv32.o");
+            Ras::new(TargetArchitecture::Riscv32, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(
+                    ".text\n.globl f\nf:\n  addi a0, a0, 1\n  call h\n  ret\n",
+                    &output,
+                )
+                .expect("assemble");
+            let object = std::fs::read(&output).expect("read");
+            assert_eq!(&object[0..4], b"\x7fELF");
+            assert_eq!(object[4], 1, "ELFCLASS32");
+            assert_eq!(
+                u16::from_le_bytes([object[18], object[19]]),
+                243,
+                "EM_RISCV"
+            );
+            assert_eq!(u16::from_le_bytes([object[40], object[41]]), 52, "e_ehsize");
+            assert_eq!(
+                u16::from_le_bytes([object[46], object[47]]),
+                40,
+                "e_shentsize"
+            );
+            assert_eq!(
+                section32(&object, ".text"),
+                [
+                    0x13, 0x05, 0x15, 0x00, 0x97, 0x00, 0x00, 0x00, 0xe7, 0x80, 0x00, 0x00, 0x67,
+                    0x80, 0x00, 0x00,
+                ]
+            );
+            let relocations = section32(&object, ".rela.text");
+            assert_eq!(relocations.len(), 12, "one Elf32_Rela");
+            assert_eq!(entsize32(&object, ".rela.text"), 12, "sh_entsize");
+            assert_eq!(entsize32(&object, ".symtab"), 16, "sh_entsize");
+            assert_eq!(
+                u32::from_le_bytes([
+                    relocations[0],
+                    relocations[1],
+                    relocations[2],
+                    relocations[3]
+                ]),
+                4,
+                "r_offset"
+            );
+            let info = u32::from_le_bytes([
+                relocations[4],
+                relocations[5],
+                relocations[6],
+                relocations[7],
+            ]);
+            assert_eq!(info & 0xff, 19, "R_RISCV_CALL_PLT");
+            let symbol = info >> 8;
+            assert_ne!(symbol, 0, "symbol index");
+            let symbols = section32(&object, ".symtab");
+            assert_eq!(symbols.len() % 16, 0, "Elf32_Sym entries");
+            let strings = section32(&object, ".strtab");
+            let entry = &symbols[symbol as usize * 16..][..16];
+            let name = u32::from_le_bytes(entry[0..4].try_into().unwrap()) as usize;
+            let end = strings[name..].iter().position(|b| *b == 0).unwrap() + name;
+            assert_eq!(&strings[name..end], b"h");
+            assert_eq!(entry[12], 1 << 4, "STB_GLOBAL, STT_NOTYPE");
+            assert_eq!(
+                u16::from_le_bytes([entry[14], entry[15]]),
+                0,
+                "undefined section"
+            );
+            let f = (1..symbols.len() / 16)
+                .find(|i| {
+                    let at = u32::from_le_bytes(symbols[i * 16..i * 16 + 4].try_into().unwrap())
+                        as usize;
+                    strings[at..].starts_with(b"f\0")
+                })
+                .expect("f");
+            assert_eq!(
+                u16::from_le_bytes([symbols[f * 16 + 14], symbols[f * 16 + 15]]),
+                1,
+                "f lives in .text"
+            );
+        }
+
+        #[test]
+        fn gas_data_directives_encode_like_clang() {
+            let object = assemble(
+                "data",
+                ".data\n.word 1, -1\n.half 0x1234\n.dword 0x0102030405060708\n.2byte 7\n.4byte 9\n.8byte 10\n.float 1.5\n.double -2.25\n.single 0.5\n",
+            )
+            .unwrap();
+            assert_eq!(
+                section(&object, ".data"),
+                [
+                    0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x34, 0x12, 0x08, 0x07, 0x06,
+                    0x05, 0x04, 0x03, 0x02, 0x01, 0x07, 0x00, 0x09, 0x00, 0x00, 0x00, 0x0a, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x3f, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x02, 0xc0, 0x00, 0x00, 0x00, 0x3f,
+                ]
+            );
+        }
+    }
 }

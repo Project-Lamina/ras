@@ -3882,4 +3882,1021 @@ mod tests {
         assert_eq!(relocs[0].2, 0, "not pc-relative");
         assert_eq!(relocs[0].5, X86_64_RELOC_UNSIGNED);
     }
+
+    /// These compare ras against GNU binutils and clang on ELF objects, so they
+    /// only run where both the reference assembler and the format are available.
+    #[cfg(target_os = "linux")]
+    mod elf_sections {
+        use crate::Ras;
+        use crate::test_support::TempDir;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        }
+
+        #[test]
+        fn sections_keep_contents_symbols_and_relocations() {
+            let tmp = TempDir::new("sections");
+            let path = tmp.path().join("sections.o");
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(
+                    ".section .rodata\n.globl message\nmessage: .asciz \"hi\"\n.data\nvalue: .ascii \"ab\"\n.text\n.globl entry\nentry: leaq message(%rip), %rax\nret\n.section .rodata\n.ascii \"!\"\n",
+                    &path,
+                )
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+            let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+            let headers = u64_at(&bytes, 40) as usize;
+            let string_header = headers + strings * 64;
+            let names = &bytes[u64_at(&bytes, string_header + 24) as usize..];
+            let section = |name: &str| {
+                (1..count)
+                    .find_map(|i| {
+                        let h = headers + i * 64;
+                        let n = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+                        (names[n..].split(|b| *b == 0).next().unwrap() == name.as_bytes())
+                            .then_some((i, h))
+                    })
+                    .unwrap()
+            };
+            let contents = |h: usize| {
+                let start = u64_at(&bytes, h + 24) as usize;
+                &bytes[start..start + u64_at(&bytes, h + 32) as usize]
+            };
+            let (rodata_index, rodata) = section(".rodata");
+            assert_eq!(u64_at(&bytes, rodata + 8), 2);
+            assert_eq!(contents(rodata), b"hi\0!");
+            assert_eq!(contents(section(".data").1), b"ab");
+            assert_eq!(
+                contents(section(".text").1),
+                &[0x48, 0x8d, 5, 0, 0, 0, 0, 0xc3]
+            );
+            let symbols = contents(section(".symtab").1);
+            assert!(symbols.as_chunks::<24>().0.iter().any(|s| {
+                u16::from_le_bytes(s[6..8].try_into().unwrap()) as usize == rodata_index
+                    && s[4] >> 4 == 1
+                    && u64_at(s, 8) == 0
+            }));
+            let reloc = contents(section(".rela.text").1);
+            assert_eq!(u64_at(reloc, 0), 3);
+            assert_eq!(u64_at(reloc, 8) as u32, 2);
+            assert_eq!(u64_at(reloc, 16) as i64, -4);
+        }
+
+        #[test]
+        fn numeric_data_alignment_and_bss_match_gas() {
+            let tmp = TempDir::new("data_sections");
+            let dir = tmp.path();
+            let source = dir.join("input.s");
+            let reference = dir.join("reference.o");
+            let output = dir.join("ras.o");
+            let asm = ".data\n.byte 1, 255\n.short 0x1234\n.balign 8\n.quad 0x1122334455667788\n.long -1\n.space 3, 42\n.bss\n.balign 16\n.zero 32\n.section .rodata\n.ascii \"a\"\n.p2align 3\n.asciz \"b\"\n";
+            std::fs::write(&source, asm).unwrap();
+            let result = std::process::Command::new("as")
+                .arg("--64")
+                .arg(&source)
+                .arg("-o")
+                .arg(&reference)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(asm, &output)
+                .unwrap();
+            let inspect = |path: &std::path::Path| {
+                let bytes = std::fs::read(path).unwrap();
+                let headers = u64_at(&bytes, 40) as usize;
+                let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+                let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+                let names = &bytes[u64_at(&bytes, headers + strings * 64 + 24) as usize..];
+                let mut sections = std::collections::BTreeMap::new();
+                for i in 1..count {
+                    let h = headers + i * 64;
+                    let name = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+                    let name = names[name..].split(|b| *b == 0).next().unwrap();
+                    if ![b".data".as_slice(), b".rodata", b".bss"].contains(&name) {
+                        continue;
+                    }
+                    let kind = u32::from_le_bytes(bytes[h + 4..h + 8].try_into().unwrap());
+                    let offset = u64_at(&bytes, h + 24) as usize;
+                    let size = u64_at(&bytes, h + 32) as usize;
+                    let contents = if kind == 8 {
+                        vec![0; size]
+                    } else {
+                        bytes[offset..offset + size].to_vec()
+                    };
+                    sections.insert(
+                        name.to_vec(),
+                        (
+                            kind,
+                            u64_at(&bytes, h + 8),
+                            u64_at(&bytes, h + 48),
+                            contents,
+                        ),
+                    );
+                }
+                sections
+            };
+            assert_eq!(inspect(&output), inspect(&reference));
+        }
+
+        #[test]
+        fn numeric_labels_and_deferred_data_match_gas() {
+            let tmp = TempDir::new("label_expressions");
+            let dir = tmp.path();
+            let source = dir.join("input.s");
+            let reference = dir.join("gas.o");
+            let output = dir.join("ras.o");
+            let asm = ".text\njmp 1f\n0: ret\n1: jmp 0b\n0: jmp 1f\n1: ret\n.data\n0: .byte 7\n.byte 1f-0b\n.short 1f-0b\n.long 1f-0b\n.quad 1f-0b\n.balign 16\n1: .long 0b-1b\n.byte ext+3\n.short ext-2\n.long ext\n.quad ext+8\n.section .note.gnu.property,\"a\"\n.align 8\n.long 1f-0f\n.long 4f-1f\n.long 5\n0: .string \"GNU\"\n1: .long 0xc0000002\n.long 3f-2f\n2: .long 3\n3: .align 8\n4:\n";
+            std::fs::write(&source, asm).unwrap();
+            let result = std::process::Command::new("as")
+                .args(["--64"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&reference)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(asm, &output)
+                .unwrap();
+            let inspect = |path: &std::path::Path| {
+                let bytes = std::fs::read(path).unwrap();
+                let headers = u64_at(&bytes, 40) as usize;
+                let count = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+                let strings = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+                let names = &bytes[u64_at(&bytes, headers + strings * 64 + 24) as usize..];
+                let mut sections = std::collections::BTreeMap::new();
+                for i in 1..count {
+                    let h = headers + i * 64;
+                    let n = u32::from_le_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+                    let name = names[n..].split(|b| *b == 0).next().unwrap();
+                    if [
+                        b".text".as_slice(),
+                        b".data",
+                        b".note.gnu.property",
+                        b".rela.data",
+                    ]
+                    .contains(&name)
+                    {
+                        let start = u64_at(&bytes, h + 24) as usize;
+                        let mut data =
+                            bytes[start..start + u64_at(&bytes, h + 32) as usize].to_vec();
+                        if name == b".rela.data" {
+                            for reloc in data.as_chunks_mut::<24>().0 {
+                                reloc[12..16].fill(0);
+                            }
+                        }
+                        sections.insert(
+                            name.to_vec(),
+                            (bytes[h + 4..h + 16].to_vec(), u64_at(&bytes, h + 48), data),
+                        );
+                    }
+                    if name == b".symtab" {
+                        let start = u64_at(&bytes, h + 24) as usize;
+                        let symbols = &bytes[start..start + u64_at(&bytes, h + 32) as usize];
+                        let globals: Vec<_> = symbols
+                            .as_chunks::<24>()
+                            .0
+                            .iter()
+                            .filter(|sym| sym[4] >> 4 == 1)
+                            .collect();
+                        assert_eq!(globals.len(), 1);
+                        assert_eq!(&globals[0][6..8], &[0, 0]);
+                    }
+                }
+                sections
+            };
+            assert_eq!(inspect(&output), inspect(&reference));
+        }
+
+        #[test]
+        fn undefined_numeric_labels_and_cross_section_differences_fail() {
+            let tmp = TempDir::new("invalid_labels");
+            let path = tmp.path().join("invalid_labels.o");
+            for (asm, error) in [
+                (".long 1f", "Undefined numeric label: 1f"),
+                ("jmp 1b\n1: ret", "Undefined numeric label: 1b"),
+                (
+                    ".data\nx: .long x-y\n.text\ny: ret",
+                    "Undefined or cross-section label in difference: y",
+                ),
+            ] {
+                let result = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                    .unwrap()
+                    .assemble(asm, &path);
+                assert!(result.unwrap_err().to_string().contains(error));
+            }
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn section_name_may_be_quoted() {
+            let tmp = TempDir::new("quoted");
+            let dir = tmp.path();
+            let body = ".text\n.globl f\nf: ret\n";
+            let assemble = |source: &str, name: &str| {
+                let path = dir.join(name);
+                Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                    .unwrap()
+                    .assemble(source, &path)
+                    .unwrap();
+                std::fs::read(&path).unwrap()
+            };
+            let quoted = assemble(
+                &format!("{body}.section \".note.GNU-stack\",\"\",@progbits\n"),
+                "quoted.o",
+            );
+            let bare = assemble(
+                &format!("{body}.section .note.GNU-stack,\"\",@progbits\n"),
+                "bare.o",
+            );
+            assert_eq!(quoted, bare);
+        }
+    }
+
+    /// COFF section flags.
+    mod coff_sections {
+        use crate::Ras;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+        const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+        const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
+        const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+        const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+        fn u16_at(bytes: &[u8], at: usize) -> usize {
+            u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize
+        }
+
+        fn u32_at(bytes: &[u8], at: usize) -> u32 {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        }
+
+        /// Characteristics of the named COFF section. Names longer than eight bytes are
+        /// held in the string table and the header keeps `/offset`.
+        fn characteristics(bytes: &[u8], name: &str) -> u32 {
+            let sections = u16_at(bytes, 2);
+            let strtab = u32_at(bytes, 8) as usize + u32_at(bytes, 12) as usize * 18;
+            let header = (0..sections)
+                .map(|i| 20 + 40 * i)
+                .find(|&h| {
+                    let raw = bytes[h..h + 8].split(|b| *b == 0).next().unwrap();
+                    let raw = match raw.strip_prefix(b"/") {
+                        Some(offset) => {
+                            let at = strtab
+                                + std::str::from_utf8(offset)
+                                    .unwrap()
+                                    .parse::<usize>()
+                                    .unwrap();
+                            bytes[at..].split(|b| *b == 0).next().unwrap()
+                        }
+                        None => raw,
+                    };
+                    raw == name.as_bytes()
+                })
+                .expect("section present");
+            u32_at(bytes, header + 36)
+        }
+
+        fn assemble_windows(source: &str) -> Vec<u8> {
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Windows)
+                .unwrap()
+                .assemble_to_bytes(source)
+                .unwrap()
+        }
+
+        #[test]
+        fn custom_code_section_is_kept_code() {
+            let obj = assemble_windows(
+                ".text\n\
+                 .globl main\n\
+                 main:\n\
+                     call custom\n\
+                     ret\n\
+                 .section .text.custom,\"xr\"\n\
+                 .globl custom\n\
+                 custom:\n\
+                     ret\n",
+            );
+            let flags = characteristics(&obj, ".text.custom");
+            assert_eq!(
+                flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE),
+                IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE
+            );
+            assert_eq!(flags & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_DISCARDABLE), 0);
+        }
+
+        #[test]
+        fn data_section_flags_set_write_and_discard() {
+            let obj = assemble_windows(
+                ".section .tls$,\"dw\"\n\
+                     .quad 0\n\
+                 .section .rdata$x,\"dr\"\n\
+                     .quad 0\n\
+                 .section .drop,\"drD\"\n\
+                     .quad 0\n\
+                 .section .debug$x,\"dr\"\n\
+                     .quad 0\n\
+                 .text\n\
+                 .globl main\n\
+                 main:\n\
+                     ret\n",
+            );
+            let tls = characteristics(&obj, ".tls$");
+            assert_ne!(tls & IMAGE_SCN_CNT_INITIALIZED_DATA, 0);
+            assert_ne!(tls & IMAGE_SCN_MEM_WRITE, 0);
+            assert_eq!(tls & IMAGE_SCN_MEM_DISCARDABLE, 0);
+            let rdata = characteristics(&obj, ".rdata$x");
+            assert_eq!(rdata & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_DISCARDABLE), 0);
+            for discarded in [".drop", ".debug$x"] {
+                let flags = characteristics(&obj, discarded);
+                assert_ne!(flags & IMAGE_SCN_MEM_DISCARDABLE, 0, "{discarded}");
+                assert_eq!(flags & IMAGE_SCN_MEM_WRITE, 0, "{discarded}");
+            }
+        }
+    }
+
+    /// Section relative relocations.
+    mod coff_secrel {
+        use crate::Ras;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
+        const IMAGE_REL_AMD64_SECREL: u16 = 0x000b;
+        const IMAGE_REL_AMD64_SREL32: u16 = 0x000e;
+
+        fn u16_at(bytes: &[u8], at: usize) -> usize {
+            u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize
+        }
+
+        fn u32_at(bytes: &[u8], at: usize) -> u32 {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        }
+
+        /// `(offset, type, field)` for each relocation of the named COFF section, where
+        /// `field` is the 32-bit value stored at the relocated position.
+        fn section_relocations(bytes: &[u8], name: &str) -> Vec<(u32, u16, u32)> {
+            let sections = u16_at(bytes, 2);
+            let header = (0..sections)
+                .map(|i| 20 + 40 * i)
+                .find(|&h| bytes[h..h + 8].split(|b| *b == 0).next() == Some(name.as_bytes()))
+                .expect("section present");
+            let raw = u32_at(bytes, header + 20) as usize;
+            let relocs = u32_at(bytes, header + 24) as usize;
+            let count = u16_at(bytes, header + 32);
+            (0..count)
+                .map(|i| {
+                    let at = relocs + 10 * i;
+                    let offset = u32_at(bytes, at);
+                    let ty = u16_at(bytes, at + 8) as u16;
+                    let field = u32_at(bytes, raw + offset as usize);
+                    (offset, ty, field)
+                })
+                .collect()
+        }
+
+        fn assemble_windows(source: &str) -> Vec<u8> {
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Windows)
+                .unwrap()
+                .assemble_to_bytes(source)
+                .unwrap()
+        }
+
+        #[test]
+        fn secrel32_emits_section_relative_type_not_srel32() {
+            let obj = assemble_windows(
+                ".text\n\
+                 .globl f\n\
+                 f:\n\
+                     leaq _x@SECREL32(%rax), %rax\n\
+                     movl _x@SECREL32+8(%rsp), %ecx\n\
+                     ret\n\
+                 .section .tls$,\"aw\"\n\
+                 .p2align 3\n\
+                 _x:\n\
+                     .zero 16\n",
+            );
+            let relocs = section_relocations(&obj, ".text");
+            assert_eq!(relocs.len(), 2, "{relocs:?}");
+            for (_, ty, _) in &relocs {
+                assert_eq!(*ty, IMAGE_REL_AMD64_SECREL);
+                assert_ne!(*ty, IMAGE_REL_AMD64_SREL32);
+            }
+            assert_eq!(relocs[0].0, 3);
+            assert_eq!(relocs[1].0, 10);
+            assert_eq!(relocs[1].2, 8);
+        }
+
+        #[test]
+        fn rva_and_imgrel_emit_image_relative_addr32nb() {
+            let obj = assemble_windows(
+                ".text\n\
+                 .globl f\n\
+                 f:\n\
+                     ret\n\
+                 .Lend:\n\
+                 .section .xdata,\"dr\"\n\
+                 .Linfo:\n\
+                     .long 0\n\
+                 .section .pdata,\"dr\"\n\
+                     .rva f, .Lend\n\
+                     .long .Linfo@IMGREL\n",
+            );
+            let relocs = section_relocations(&obj, ".pdata");
+            assert_eq!(relocs.len(), 3, "{relocs:?}");
+            for (index, (offset, ty, _)) in relocs.iter().enumerate() {
+                assert_eq!(*ty, IMAGE_REL_AMD64_ADDR32NB, "{relocs:?}");
+                assert_eq!(*offset, 4 * index as u32, "{relocs:?}");
+            }
+        }
+
+        #[test]
+        fn rva_is_refused_outside_coff() {
+            let error = Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble_to_bytes(".text\n.globl f\nf:\n    ret\n.data\n    .rva f\n")
+                .expect_err("ELF has no image base");
+            assert!(
+                error.to_string().contains("only supported in COFF objects"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The ARM64 COFF writer: which relocations it maps, and what it refuses.
+    mod aarch64_coff {
+        use crate::Ras;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+
+        const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
+        const SECTION_HEADER_SIZE: usize = 40;
+        const SYMBOL_SIZE: usize = 18;
+        const RELOC_SIZE: usize = 10;
+
+        fn assemble(asm: &str) -> Result<Vec<u8>, String> {
+            Ras::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Windows)
+                .map_err(|e| e.to_string())?
+                .assemble_to_bytes(asm)
+                .map_err(|e| e.to_string())
+        }
+
+        fn object(asm: &str) -> Vec<u8> {
+            assemble(asm).expect("aarch64 COFF object")
+        }
+
+        fn u16_at(bytes: &[u8], at: usize) -> u16 {
+            u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
+        }
+
+        fn u32_at(bytes: &[u8], at: usize) -> u32 {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        }
+
+        fn symbol_names(bytes: &[u8]) -> Vec<String> {
+            let sym_ptr = u32_at(bytes, 8) as usize;
+            let nsyms = u32_at(bytes, 12) as usize;
+            let strtab = sym_ptr + nsyms * SYMBOL_SIZE;
+            let mut names = Vec::new();
+            let mut i = 0;
+            while i < nsyms {
+                let e = sym_ptr + i * SYMBOL_SIZE;
+                let raw = &bytes[e..e + 8];
+                let name = if raw[..4] == [0, 0, 0, 0] {
+                    let off = strtab + u32_at(raw, 4) as usize;
+                    let end = bytes[off..].iter().position(|&b| b == 0).unwrap();
+                    String::from_utf8(bytes[off..off + end].to_vec()).unwrap()
+                } else {
+                    String::from_utf8(raw.iter().copied().take_while(|&b| b != 0).collect())
+                        .unwrap()
+                };
+                names.push(name);
+                i += 1 + bytes[e + 17] as usize;
+            }
+            names
+        }
+
+        /// `(section name, offset, relocation type, target symbol name)` for every relocation.
+        fn relocations(bytes: &[u8]) -> Vec<(String, u32, u16, String)> {
+            let names = symbol_names(bytes);
+            let nsections = u16_at(bytes, 2) as usize;
+            let sym_ptr = u32_at(bytes, 8) as usize;
+            let nsyms = u32_at(bytes, 12) as usize;
+            let strtab = sym_ptr + nsyms * SYMBOL_SIZE;
+            // Symbol indices count auxiliary records, so build an index-to-name map.
+            let mut by_index = vec![String::new(); nsyms];
+            let mut i = 0;
+            let mut n = 0;
+            while i < nsyms {
+                by_index[i] = names[n].clone();
+                i += 1 + bytes[sym_ptr + i * SYMBOL_SIZE + 17] as usize;
+                n += 1;
+            }
+            let mut out = Vec::new();
+            for s in 0..nsections {
+                let h = 20 + s * SECTION_HEADER_SIZE;
+                let raw = &bytes[h..h + 8];
+                let section = if raw[0] == b'/' {
+                    let off: usize = std::str::from_utf8(&raw[1..])
+                        .unwrap()
+                        .trim_end_matches('\0')
+                        .parse()
+                        .unwrap();
+                    let at = strtab + off;
+                    let end = bytes[at..].iter().position(|&b| b == 0).unwrap();
+                    String::from_utf8(bytes[at..at + end].to_vec()).unwrap()
+                } else {
+                    String::from_utf8(raw.iter().copied().take_while(|&b| b != 0).collect())
+                        .unwrap()
+                };
+                let reloc_ptr = u32_at(bytes, h + 24) as usize;
+                for r in 0..u16_at(bytes, h + 32) as usize {
+                    let e = reloc_ptr + r * RELOC_SIZE;
+                    out.push((
+                        section.clone(),
+                        u32_at(bytes, e),
+                        u16_at(bytes, e + 8),
+                        by_index[u32_at(bytes, e + 4) as usize].clone(),
+                    ));
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn object_header_names_the_arm64_machine() {
+            let obj = object(".text\n.globl main\nmain:\n    ret\n");
+            assert_eq!(u16_at(&obj, 0), IMAGE_FILE_MACHINE_ARM64);
+        }
+
+        #[test]
+        fn page_and_page_offset_pairs_become_pagebase_rel21_and_pageoffset_12a() {
+            let obj = object(
+                ".data\nmsg:\n    .byte 0x68, 0x00\n\
+                 .text\n.globl main\nmain:\n    adrp x0, msg\n    add x0, x0, :lo12:msg\n    ret\n",
+            );
+            assert_eq!(
+                relocations(&obj),
+                vec![
+                    (".text".into(), 0, 0x0004, "msg".into()),
+                    (".text".into(), 4, 0x0006, "msg".into()),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_relocated_load_becomes_pageoffset_12l() {
+            let obj = object(
+                ".data\n.p2align 3\nslot:\n    .quad 0\n\
+                 .text\n.globl main\nmain:\n    adrp x0, slot\n    ldr x1, [x0, #:lo12:slot]\n    ret\n",
+            );
+            let kinds: Vec<u16> = relocations(&obj).iter().map(|r| r.2).collect();
+            assert_eq!(kinds, vec![0x0004, 0x0007]);
+        }
+
+        #[test]
+        fn a_call_to_an_external_function_becomes_branch26() {
+            let obj = object(".text\n.globl main\nmain:\n    bl other\n    ret\n");
+            assert_eq!(
+                relocations(&obj),
+                vec![(".text".into(), 0, 0x0003, "other".into())]
+            );
+        }
+
+        #[test]
+        fn branches_to_a_global_keep_their_field_width() {
+            let obj = object(
+                ".text\n.globl main\n.globl far\nmain:\n\
+                     b.ne far\n    tbz x0, #3, far\n    b far\n    ret\nfar:\n    ret\n",
+            );
+            let kinds: Vec<u16> = relocations(&obj).iter().map(|r| r.2).collect();
+            assert_eq!(kinds, vec![0x000F, 0x0010, 0x0003]);
+        }
+
+        #[test]
+        fn an_absolute_pointer_becomes_addr64_with_the_addend_in_the_field() {
+            let obj =
+                object(".data\nslot:\n    .quad target + 24\n.text\n.globl main\nmain:\n    ret\n");
+            let relocs = relocations(&obj);
+            assert_eq!(relocs.len(), 1);
+            assert_eq!((relocs[0].2, relocs[0].3.as_str()), (0x000E, "target"));
+
+            let data_header = (0..u16_at(&obj, 2) as usize)
+                .map(|s| 20 + s * SECTION_HEADER_SIZE)
+                .find(|&h| obj[h..h + 5] == *b".data")
+                .expect(".data header");
+            let at = u32_at(&obj, data_header + 20) as usize + relocs[0].1 as usize;
+            assert_eq!(u64::from_le_bytes(obj[at..at + 8].try_into().unwrap()), 24);
+        }
+
+        #[test]
+        fn an_image_relative_address_becomes_addr32nb() {
+            let obj = object(
+                ".text\n.globl main\nmain:\n    ret\n.section .pdata,\"dr\"\n    .rva main\n",
+            );
+            let relocs = relocations(&obj);
+            assert_eq!(relocs.len(), 1);
+            assert_eq!(
+                (relocs[0].0.as_str(), relocs[0].2, relocs[0].3.as_str()),
+                (".pdata", 0x0002, "main")
+            );
+        }
+
+        #[test]
+        fn instruction_relocations_leave_the_instruction_word_untouched() {
+            let obj =
+                object(".data\nmsg:\n    .byte 0\n.text\n.globl main\nmain:\n    adrp x0, msg\n");
+            let text_header = (0..u16_at(&obj, 2) as usize)
+                .map(|s| 20 + s * SECTION_HEADER_SIZE)
+                .find(|&h| obj[h..h + 5] == *b".text")
+                .expect(".text header");
+            let at = u32_at(&obj, text_header + 20) as usize;
+            assert_eq!(u32_at(&obj, at), 0x9000_0000);
+        }
+
+        #[test]
+        fn elf_mapping_symbols_stay_out_of_coff_objects() {
+            let obj = object(".text\n.globl main\nmain:\n    ret\n.data\nd:\n    .byte 1\n");
+            let names = symbol_names(&obj);
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.starts_with("$x") || n.starts_with("$d")),
+                "{names:?}"
+            );
+        }
+
+        #[test]
+        fn a_got_page_relocation_is_refused_by_name() {
+            let error = assemble(".text\n.globl main\nmain:\n    adrp x0, :got:sym\n    ret\n")
+                .expect_err("refused");
+            assert!(error.contains("R_AARCH64_ADR_GOT_PAGE"), "{error}");
+            assert!(error.contains("sym"), "{error}");
+        }
+
+        #[test]
+        fn a_got_low12_relocation_is_refused_by_name() {
+            let error =
+                assemble(".text\n.globl main\nmain:\n    ldr x0, [x0, #:got_lo12:sym]\n    ret\n")
+                    .expect_err("refused");
+            assert!(error.contains("R_AARCH64_LD64_GOT_LO12_NC"), "{error}");
+        }
+
+        #[test]
+        fn an_addend_on_an_instruction_relocation_is_refused() {
+            let error = assemble(
+                ".data\nmsg:\n    .byte 0\n.text\n.globl main\nmain:\n    adrp x0, msg+8\n    ret\n",
+            )
+            .expect_err("refused");
+            assert!(error.contains("R_AARCH64_ADR_PREL_PG_HI21"), "{error}");
+            assert!(error.contains("addend 8"), "{error}");
+        }
+
+        #[test]
+        fn a_pc_relative_data_difference_is_refused_by_name() {
+            let error = assemble(
+                ".text\n.globl main\nmain:\n    ret\n.data\nhere:\n    .word there - here\n",
+            )
+            .expect_err("refused");
+            assert!(error.contains("R_AARCH64_PREL32"), "{error}");
+        }
+    }
+
+    /// The same DWARF, carried in a Mach-O object.
+    ///
+    /// Mach-O spells a debug section `__DWARF,__debug_*` and marks it `S_ATTR_DEBUG`, and
+    /// its linker drops those sections rather than relocating them, so the only relocation
+    /// left is the one that names code. Every assertion below is a structural one, and
+    /// nothing in this file claims a debugger ran.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod macho_debug_info {
+        use crate::test_support::TempDir;
+        use crate::{
+            BaseType, DebugInfoRequest, DebugType, DeclSite, FormalParameter, ObjectWriteOptions,
+            Ras, Subprogram,
+        };
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+        use std::path::Path;
+        use std::process::Command;
+
+        const RELOC_UNSIGNED: u32 = 0;
+
+        const SOURCE: &str = ".file 1 \"shapes.lamina\"\n\
+        .text\n\
+        .globl _twice\n\
+        _twice:\n\
+        .loc 1 1 1\n\
+        addl %edi, %edi\n\
+        movl %edi, %eax\n\
+        ret\n\
+        _half:\n\
+        .loc 1 6 1\n\
+        movl %edi, %eax\n\
+        ret\n";
+
+        /// The DWARF name is the source name and the object label carries Mach-O's underscore,
+        /// so the two differ for every function here.
+        fn request() -> DebugInfoRequest {
+            let describe = |name: &str, line: u32| Subprogram {
+                name: name.into(),
+                symbol: Some(format!("_{name}")),
+                external: name == "twice",
+                decl: Some(DeclSite { file: 1, line }),
+                ret: Some(DebugType::Base(BaseType::I32)),
+                params: vec![FormalParameter {
+                    name: Some("n".into()),
+                    ty: Some(DebugType::Base(BaseType::I32)),
+                }],
+                variadic: false,
+            };
+            DebugInfoRequest {
+                producer: Some("ras test".into()),
+                subprograms: vec![describe("twice", 1), describe("half", 6)],
+            }
+        }
+
+        fn assemble(arch: TargetArchitecture, path: &Path) {
+            let options = ObjectWriteOptions {
+                function_symbols: vec!["_twice".into(), "_half".into()],
+                debug_info: Some(request()),
+                ..ObjectWriteOptions::default()
+            };
+            let source = match arch {
+                TargetArchitecture::Aarch64 => SOURCE
+                    .replace("addl %edi, %edi", "add w0, w0, w0")
+                    .replace("movl %edi, %eax", "mov w0, w0"),
+                _ => SOURCE.to_string(),
+            };
+            Ras::with_object_write_options(arch, TargetOperatingSystem::MacOS, options)
+                .expect("assembler")
+                .assemble(&source, path)
+                .expect("assemble");
+        }
+
+        fn which(tool: &str) -> Option<String> {
+            for name in [tool.to_string(), format!("{tool}-18"), format!("{tool}-19")] {
+                let found = Command::new(&name)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success());
+                if found {
+                    return Some(name);
+                }
+            }
+            // Xcode keeps its LLVM tools out of PATH.
+            let output = Command::new("xcrun")
+                .args(["--find", tool])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())?;
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        #[test]
+        fn the_debug_sections_are_in_the_dwarf_segment_and_marked_debug() {
+            if which("llvm-readobj").is_none() {
+                return;
+            }
+            let dir = TempDir::new("macho_debug_sections");
+            let path = dir.path().join("out.o");
+            assemble(TargetArchitecture::X86_64, &path);
+            let output = Command::new(which("llvm-readobj").expect("llvm-readobj"))
+                .arg("--sections")
+                .arg(&path)
+                .output()
+                .expect("llvm-readobj");
+            let dump = String::from_utf8_lossy(&output.stdout).into_owned();
+
+            for name in ["__debug_line", "__debug_abbrev", "__debug_info"] {
+                let section = dump
+                    .split("    Index:")
+                    .find(|part| part.contains(&format!("Name: {name} ")))
+                    .unwrap_or_else(|| panic!("no section {name} in {dump}"));
+                assert!(section.contains("Segment: __DWARF "), "{section}");
+                assert!(section.contains("Debug ("), "{section}");
+            }
+        }
+
+        /// `ld` discards the `__DWARF` sections instead of rebasing them, so an offset from one
+        /// into another is already final. Only the addresses that name code may be relocated.
+        #[test]
+        fn the_only_relocations_in_the_debug_sections_name_the_text_section() {
+            let dir = TempDir::new("macho_debug_relocs");
+            let path = dir.path().join("out.o");
+            assemble(TargetArchitecture::X86_64, &path);
+            let object = std::fs::read(&path).expect("read object");
+            let macho = Macho::parse(&object);
+
+            let text = macho
+                .sections
+                .iter()
+                .position(|s| s.name == "__text")
+                .expect("a text section");
+            let mut relocated = 0;
+            for section in macho.sections.iter().filter(|s| s.segment == "__DWARF") {
+                for &(_, info) in &section.relocs {
+                    assert_eq!(info >> 28, RELOC_UNSIGNED, "{} type", section.name);
+                    assert_eq!((info >> 25) & 3, 3, "{} width", section.name);
+                    assert_eq!((info >> 24) & 1, 0, "{} pcrel", section.name);
+                    assert_eq!((info >> 27) & 1, 0, "{} extern", section.name);
+                    assert_eq!(info & 0x00ff_ffff, text as u32 + 1, "{}", section.name);
+                    relocated += 1;
+                }
+            }
+            assert_eq!(
+                relocated, 4,
+                "the unit's and both subprograms' low_pc, and the line table's first address"
+            );
+            assert!(
+                macho
+                    .sections
+                    .iter()
+                    .any(|s| s.name == "__debug_abbrev" && s.relocs.is_empty())
+            );
+        }
+
+        #[test]
+        fn a_subprogram_is_named_without_the_object_underscore() {
+            let Some(dwarfdump) = which("llvm-dwarfdump") else {
+                return;
+            };
+            let dir = TempDir::new("macho_debug_names");
+            let path = dir.path().join("out.o");
+            assemble(TargetArchitecture::X86_64, &path);
+            let output = Command::new(dwarfdump)
+                .arg("--debug-info")
+                .arg(&path)
+                .output()
+                .expect("llvm-dwarfdump");
+            let dump = String::from_utf8_lossy(&output.stdout).into_owned();
+
+            assert!(dump.contains("DW_AT_name\t(\"twice\")"), "{dump}");
+            assert!(dump.contains("DW_AT_name\t(\"half\")"), "{dump}");
+            assert!(!dump.contains("\"_twice\""), "{dump}");
+            assert_eq!(dump.matches("DW_TAG_subprogram").count(), 2, "{dump}");
+        }
+
+        /// The property the ELF path holds, held here too: nothing knows where the allocator
+        /// put a parameter, so the answer must be silence rather than a guess.
+        #[test]
+        fn a_parameter_without_a_known_location_is_given_none() {
+            let Some(dwarfdump) = which("llvm-dwarfdump") else {
+                return;
+            };
+            let dir = TempDir::new("macho_debug_no_location");
+            let path = dir.path().join("out.o");
+            assemble(TargetArchitecture::X86_64, &path);
+            let output = Command::new(dwarfdump)
+                .arg("--debug-info")
+                .arg(&path)
+                .output()
+                .expect("llvm-dwarfdump");
+            let dump = String::from_utf8_lossy(&output.stdout).into_owned();
+
+            assert!(!dump.contains("DW_AT_location"), "{dump}");
+        }
+
+        #[test]
+        fn both_mach_o_architectures_pass_the_dwarf_verifier() {
+            let Some(dwarfdump) = which("llvm-dwarfdump") else {
+                return;
+            };
+            for arch in [TargetArchitecture::X86_64, TargetArchitecture::Aarch64] {
+                let dir = TempDir::new("macho_debug_verify");
+                let path = dir.path().join("out.o");
+                assemble(arch, &path);
+                let output = Command::new(&dwarfdump)
+                    .arg("--verify")
+                    .arg(&path)
+                    .output()
+                    .expect("llvm-dwarfdump");
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(output.status.success(), "{arch:?}: {text}");
+                assert!(text.contains("No errors."), "{arch:?}: {text}");
+            }
+        }
+
+        /// `dsymutil` reads the objects themselves, so feeding it a debug map that names this
+        /// object is the whole of the dSYM path short of a linker that writes one. It relocates
+        /// `low_pc` and the line table to the addresses the map gives and verifies its output.
+        #[test]
+        fn dsymutil_links_the_debug_info_to_the_addresses_a_debug_map_gives() {
+            let Some(dsymutil) = which("dsymutil") else {
+                return;
+            };
+            let dir = TempDir::new("macho_debug_dsym");
+            let path = dir.path().join("out.o");
+            assemble(TargetArchitecture::X86_64, &path);
+            let base = 0x1_0000_1000u64;
+            let map = dir.path().join("map.yaml");
+            let entries: String = [("_twice", 0u64, 5u64), ("_half", 5, 3)]
+                .iter()
+                .map(|(name, at, size)| {
+                    format!(
+                        "      - {{ sym: {name}, objAddr: 0x{at:X}, binAddr: 0x{:X}, size: 0x{size:X} }}\n",
+                        base + at
+                    )
+                })
+                .collect();
+            std::fs::write(
+                &map,
+                format!(
+                    "---\ntriple:          'x86_64-apple-darwin'\nbinary-path:     '{0}'\nobjects:\n  - filename:        '{0}'\n    timestamp:       0\n    symbols:\n{entries}...\n",
+                    path.display()
+                ),
+            )
+            .expect("write debug map");
+
+            let out = dir.path().join("out.dwarf");
+            let run = Command::new(dsymutil)
+                .args(["-y", "-f", "--verify-dwarf=all", "-o"])
+                .arg(&out)
+                .arg(&map)
+                .output()
+                .expect("dsymutil");
+            assert!(
+                run.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+
+            let dwarfdump = which("llvm-dwarfdump").expect("llvm-dwarfdump beside dsymutil");
+            let dump = Command::new(dwarfdump)
+                .arg("--debug-info")
+                .arg(&out)
+                .output()
+                .expect("llvm-dwarfdump");
+            let dump = String::from_utf8_lossy(&dump.stdout).into_owned();
+            assert!(
+                dump.contains(&format!("DW_AT_low_pc\t(0x{base:016x})")),
+                "{dump}"
+            );
+            assert!(
+                dump.contains(&format!("DW_AT_low_pc\t(0x{:016x})", base + 5)),
+                "half moved with the debug map: {dump}"
+            );
+        }
+
+        struct MachoSection {
+            segment: String,
+            name: String,
+            relocs: Vec<(u32, u32)>,
+        }
+
+        struct Macho {
+            sections: Vec<MachoSection>,
+        }
+
+        impl Macho {
+            fn parse(object: &[u8]) -> Self {
+                let u32_at =
+                    |at: usize| u32::from_le_bytes(object[at..at + 4].try_into().expect("four"));
+                let name16 = |at: usize| {
+                    let field = &object[at..at + 16];
+                    let end = field.iter().position(|&b| b == 0).unwrap_or(16);
+                    String::from_utf8_lossy(&field[..end]).into_owned()
+                };
+                assert_eq!(u32_at(0), 0xfeed_facf, "Mach-O 64 magic");
+                let mut sections = Vec::new();
+                let mut command = 32;
+                for _ in 0..u32_at(16) {
+                    if u32_at(command) == 0x19 {
+                        let count = u32_at(command + 64) as usize;
+                        for index in 0..count {
+                            let header = command + 72 + 80 * index;
+                            let relocation_offset = u32_at(header + 56) as usize;
+                            let relocation_count = u32_at(header + 60) as usize;
+                            sections.push(MachoSection {
+                                name: name16(header),
+                                segment: name16(header + 16),
+                                relocs: (0..relocation_count)
+                                    .map(|entry| {
+                                        let at = relocation_offset + 8 * entry;
+                                        (u32_at(at), u32_at(at + 4))
+                                    })
+                                    .collect(),
+                            });
+                        }
+                    }
+                    command += u32_at(command + 4) as usize;
+                }
+                Self { sections }
+            }
+        }
+    }
 }

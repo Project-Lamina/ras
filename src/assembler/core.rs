@@ -3361,3 +3361,1028 @@ mod label_difference_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// These compare ras against GNU binutils and clang on ELF objects, so they
+    /// only run where both the reference assembler and the format are available.
+    #[cfg(target_os = "linux")]
+    mod cpp_support {
+        use crate::test_support::ras_binary;
+        fn ras_binary_str() -> String {
+            ras_binary().to_string_lossy().into_owned()
+        }
+        use crate::Ras;
+        use crate::test_support::TempDir;
+        use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
+        use std::path::Path;
+        use std::process::Command;
+
+        fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        }
+
+        fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        }
+
+        fn string(bytes: &[u8], offset: usize) -> &str {
+            std::str::from_utf8(bytes[offset..].split(|b| *b == 0).next().unwrap()).unwrap()
+        }
+
+        struct Object(Vec<u8>);
+
+        impl Object {
+            fn header(&self, index: usize) -> &[u8] {
+                let start = u64_at(&self.0, 40) as usize + index * 64;
+                &self.0[start..start + 64]
+            }
+
+            fn contents(&self, index: usize) -> &[u8] {
+                let header = self.header(index);
+                let start = u64_at(header, 24) as usize;
+                &self.0[start..start + u64_at(header, 32) as usize]
+            }
+
+            fn section_name(&self, index: usize) -> &str {
+                let names = u16::from_le_bytes(self.0[62..64].try_into().unwrap()) as usize;
+                string(self.contents(names), u32_at(self.header(index), 0) as usize)
+            }
+
+            fn section(&self, name: &str) -> usize {
+                let count = u16::from_le_bytes(self.0[60..62].try_into().unwrap()) as usize;
+                (1..count).find(|i| self.section_name(*i) == name).unwrap()
+            }
+
+            fn symbols(&self) -> Vec<(&str, &[u8])> {
+                let symbols = self.section(".symtab");
+                let strings = self.contents(u32_at(self.header(symbols), 40) as usize);
+                self.contents(symbols)
+                    .as_chunks::<24>()
+                    .0
+                    .iter()
+                    .map(|s| (string(strings, u32_at(s, 0) as usize), s.as_slice()))
+                    .collect()
+            }
+
+            fn symbol(&self, name: &str) -> &[u8] {
+                self.symbols()
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                    .unwrap()
+                    .1
+            }
+
+            fn relocations(&self, section: &str) -> Vec<(u64, u32, String, i64)> {
+                let symbols = self.symbols();
+                self.contents(self.section(section))
+                    .as_chunks::<24>()
+                    .0
+                    .iter()
+                    .map(|r| {
+                        let info = u64_at(r, 8);
+                        (
+                            u64_at(r, 0),
+                            info as u32,
+                            symbols[(info >> 32) as usize].0.into(),
+                            u64_at(r, 16) as i64,
+                        )
+                    })
+                    .collect()
+            }
+
+            fn group(&self) -> (&str, Vec<&str>) {
+                let group = self.section(".group");
+                let header = self.header(group);
+                assert_eq!(u32_at(header, 4), 17);
+                assert_eq!(u32_at(header, 40) as usize, self.section(".symtab"));
+                assert_eq!(u64_at(header, 48), 4);
+                assert_eq!(u64_at(header, 56), 4);
+                let words: Vec<_> = self
+                    .contents(group)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| u32_at(w, 0))
+                    .collect();
+                assert_eq!(words[0], 1);
+                let mut members = Vec::new();
+                for index in &words[1..] {
+                    assert_ne!(u64_at(self.header(*index as usize), 8) & 0x200, 0);
+                    members.push(self.section_name(*index as usize));
+                }
+                members.sort();
+                (self.symbols()[u32_at(header, 44) as usize].0, members)
+            }
+        }
+
+        fn run(command: &mut Command) -> Vec<u8> {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{command:?}: {:?}\n{}\n{}",
+                result.status,
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            result.stdout
+        }
+
+        fn assemble_pair(dir: &Path, source: &str) -> (Object, Object) {
+            let input = dir.join("input.s");
+            let reference = dir.join("gas.o");
+            let output = dir.join("ras.o");
+            std::fs::write(&input, source).unwrap();
+            run(Command::new("as")
+                .arg("--64")
+                .arg(&input)
+                .arg("-o")
+                .arg(&reference));
+            Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                .unwrap()
+                .assemble(source, &output)
+                .unwrap();
+            (
+                Object(std::fs::read(output).unwrap()),
+                Object(std::fs::read(reference).unwrap()),
+            )
+        }
+
+        #[test]
+        fn weak_hidden_comdat_and_relative_relocations_match_gas() {
+            let dir = TempDir::new("cpp_metadata");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".section .gcc_except_table,\"a\"\n.long DW.ref.type-.\n.byte 7\nbase: .long DW.ref.type-base\n.long DW.ref.type-base\n.hidden DW.ref.type\n.weak DW.ref.type\n.section .data.ref,\"awG\",@progbits,DW.ref.type,comdat\n.balign 8\n.type DW.ref.type,@object\n.size DW.ref.type,8\nDW.ref.type: .quad external\n.weak external\n.hidden external\n",
+            );
+            for name in ["DW.ref.type", "external"] {
+                let a = ras.symbol(name);
+                let b = gas.symbol(name);
+                assert_eq!(&a[4..6], &b[4..6]);
+                assert_eq!(u64_at(a, 8), u64_at(b, 8));
+                assert_eq!(u64_at(a, 16), u64_at(b, 16));
+            }
+            assert_eq!(ras.group(), gas.group());
+            for name in [".rela.gcc_except_table", ".rela.data.ref"] {
+                assert_eq!(ras.relocations(name), gas.relocations(name));
+            }
+            assert_eq!(
+                ras.relocations(".rela.gcc_except_table")
+                    .iter()
+                    .map(|r| r.3)
+                    .collect::<Vec<_>>(),
+                [0, 0, 4]
+            );
+        }
+
+        #[test]
+        fn implicit_group_signature_is_defined_locally() {
+            let dir = TempDir::new("group_signature");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".section .text.inline,\"axG\",@progbits,signature,comdat\n.weak function\nfunction: ret\n",
+            );
+            assert_eq!(ras.group(), gas.group());
+            for object in [&ras, &gas] {
+                let signature = object.symbol("signature");
+                assert_eq!(signature[4] >> 4, 0);
+                let section = u16::from_le_bytes(signature[6..8].try_into().unwrap()) as usize;
+                assert_eq!(object.section_name(section), ".group");
+            }
+        }
+
+        #[test]
+        fn symbolic_leb128_and_aliases_match_gas() {
+            let dir = TempDir::new("leb128");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".text\nstart: .space 130\nend: ret\n.weak alias\n.set alias,start\n.data\n.uleb128 end-start,0,127,128,16384\n.sleb128 -65,-64,63,64,start-end\n.uleb128 tail-head\nhead: .space 128\ntail:\n",
+            );
+            assert_eq!(
+                ras.contents(ras.section(".data")),
+                gas.contents(gas.section(".data"))
+            );
+            assert_eq!(ras.symbol("alias")[4], gas.symbol("alias")[4]);
+            assert_eq!(
+                u64_at(ras.symbol("alias"), 8),
+                u64_at(gas.symbol("alias"), 8)
+            );
+        }
+
+        #[test]
+        fn relaxed_branches_with_symbolic_leb128_match_gas() {
+            let dir = TempDir::new("relaxed_leb128");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".text\nstart: jmp end\n.space 128,0x90\nend: ret\n.data\n.uleb128 end-start\n.sleb128 start-end\n.balign 16\n.byte 7\n",
+            );
+            for section in [".text", ".data"] {
+                assert_eq!(
+                    ras.contents(ras.section(section)),
+                    gas.contents(gas.section(section))
+                );
+            }
+        }
+
+        #[test]
+        fn chained_layout_dependencies_match_gas() {
+            let dir = TempDir::new("layout_dependencies");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".text\nstart: .space 16384\nend: ret\n.data\n.uleb128 tail-head\nhead: .uleb128 end-start\ntail:\n.section .dependent,\"a\"\n.sleb128 tail-head\n",
+            );
+            for section in [".text", ".data", ".dependent"] {
+                assert_eq!(
+                    ras.contents(ras.section(section)),
+                    gas.contents(gas.section(section))
+                );
+            }
+            assert_eq!(ras.contents(ras.section(".data")), &[3, 0x80, 0x80, 1]);
+        }
+
+        #[test]
+        fn cascading_forward_branches_match_gas() {
+            let dir = TempDir::new("branch_cascade");
+            let mut source = String::from(".text\n.globl cascade\ncascade:\n");
+            let count = 16;
+            for index in 0..count {
+                source.push_str(&format!("jmp target{index}\n"));
+                if index > 0 {
+                    source.push_str(&format!("target{}:\n", index - 1));
+                }
+                let padding = if index + 1 == count { 128 } else { 123 };
+                source.push_str(&format!(".space {padding},0x90\n"));
+            }
+            source.push_str(&format!("target{}: ret\n", count - 1));
+            let (ras, gas) = assemble_pair(dir.path(), &source);
+            let text = ras.contents(ras.section(".text"));
+            assert_eq!(text, gas.contents(gas.section(".text")));
+            for index in 0..count {
+                assert_eq!(&text[index * 128..index * 128 + 5], &[0xe9, 128, 0, 0, 0]);
+            }
+        }
+
+        #[test]
+        fn local_and_common_storage_match_gas() {
+            let dir = TempDir::new("common");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".local private\n.comm private,17,16\n.comm shared,24,8\n.local second\n.comm second,8,8\n",
+            );
+            for name in ["private", "shared", "second"] {
+                let a = ras.symbol(name);
+                let b = gas.symbol(name);
+                assert_eq!(a[4], b[4]);
+                assert_eq!(u64_at(a, 8), u64_at(b, 8));
+                assert_eq!(u64_at(a, 16), u64_at(b, 16));
+                if name == "shared" {
+                    assert_eq!(&a[6..8], &b[6..8]);
+                }
+            }
+            assert_eq!(u64_at(ras.header(ras.section(".bss")), 32), 32);
+            assert_eq!(u64_at(ras.header(ras.section(".bss")), 48), 16);
+        }
+
+        #[test]
+        fn unsupported_directives_and_unresolved_leb128_fail() {
+            let dir = TempDir::new("unsupported");
+            for source in [
+                ".unknown 1",
+                ".cfi_startproc\n.cfi_unknown\n.cfi_endproc",
+                ".uleb128 missing",
+                ".uleb128 -1",
+                ".set alias,missing",
+            ] {
+                let path = dir.path().join("bad.o");
+                assert!(
+                    Ras::new(TargetArchitecture::X86_64, TargetOperatingSystem::Linux)
+                        .unwrap()
+                        .assemble(source, &path)
+                        .is_err(),
+                    "{source}"
+                );
+                assert!(!path.exists());
+            }
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[test]
+        fn gcc_cpp_exceptions_unwind_with_pie_and_fixed_addresses() {
+            let dir = TempDir::new("cpp_runtime");
+            std::os::unix::fs::symlink(ras_binary_str(), dir.path().join("as")).unwrap();
+            if let Some(weld) = std::env::var_os("RAS_TEST_WELD") {
+                std::os::unix::fs::symlink(
+                    std::fs::canonicalize(weld).unwrap(),
+                    dir.path().join("ld"),
+                )
+                .unwrap();
+            }
+            let input = dir.path().join("input.cpp");
+            let duplicate = dir.path().join("duplicate.cpp");
+            std::fs::write(&input, include_str!("../../testcases/exceptions.cpp")).unwrap();
+            std::fs::write(
+                &duplicate,
+                "#include <vector>\nint other() { std::vector<int> v; v.push_back(3); return v[0]; }\n",
+            )
+            .unwrap();
+            for mode in ["-pie", "-no-pie"] {
+                let output = dir.path().join("program");
+                run(Command::new("g++")
+                    .arg(mode)
+                    .arg(format!("-B{}/", dir.path().display()))
+                    .arg(&input)
+                    .arg(&duplicate)
+                    .arg("-o")
+                    .arg(&output));
+                assert_eq!(
+                    run(&mut Command::new(&output)),
+                    b"ctor\nsum=285 caught:boom\ndtor\n"
+                );
+            }
+            std::fs::write(&input, "#include <cstdio>\n#include <stdexcept>\nstruct Guard { ~Guard() { puts(\"cleanup\"); } };\n__attribute__((noinline)) void raise() { Guard g; throw std::runtime_error(\"boom\"); }\nint main() { try { raise(); } catch (const std::exception&) { puts(\"caught\"); } }\n").unwrap();
+            for optimization in ["-O0", "-O2"] {
+                let output = dir.path().join("unwind");
+                run(Command::new("g++")
+                    .arg(optimization)
+                    .arg(format!("-B{}/", dir.path().display()))
+                    .arg(&input)
+                    .arg("-o")
+                    .arg(&output));
+                assert_eq!(run(&mut Command::new(&output)), b"cleanup\ncaught\n");
+            }
+        }
+
+        #[test]
+        fn weak_calls_and_global_aliases_match_gas() {
+            let dir = TempDir::new("weak_calls");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".text\n.weak target\n.type target,@function\n.size target,11\ntarget: call target\ncall late\nlate: ret\n.weak late\n.globl alias\n.set alias,target\n",
+            );
+            assert_eq!(ras.relocations(".rela.text"), gas.relocations(".rela.text"));
+            for name in ["target", "late", "alias"] {
+                assert_eq!(ras.symbol(name)[4], gas.symbol(name)[4]);
+                assert_eq!(u64_at(ras.symbol(name), 8), u64_at(gas.symbol(name), 8));
+            }
+        }
+
+        #[test]
+        fn increment_and_decrement_encodings_match_gas() {
+            let dir = TempDir::new("inc_dec");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".text\nincb %al\ndecb %r8b\nincl %ecx\ndecl %r12d\nincq %r15\ndecq %rdx\nincb (%rax)\ndecq 8(%rbp)\n",
+            );
+            assert_eq!(
+                ras.contents(ras.section(".text")),
+                gas.contents(gas.section(".text"))
+            );
+        }
+
+        #[test]
+        fn temporary_symbols_resolve_without_leaking_internal_labels() {
+            let dir = TempDir::new("temporary_symbols");
+            let source = ".text\n.Lras_cfi: nop\n.Lras_size: nop\n.globl entry\n.type entry,@function\nentry:\n.cfi_startproc\n1: nop\n.Ltarget: ret\n.cfi_endproc\n.size entry,.-entry\n.type .Ltyped,@function\n.Ltyped: ret\n.globl .Lglobal\n.Lglobal: ret\n.set .Lalias,.Ltarget+1\n.data\n.quad .Ltarget+3\n.quad 1b\n.quad .Lalias\n";
+            let input = dir.path().join("input.s");
+            std::fs::write(&input, source).unwrap();
+            let (default, gas) = assemble_pair(dir.path(), source);
+            let targets = |object: &Object| {
+                let symbols = object.symbols();
+                object
+                    .contents(object.section(".rela.data"))
+                    .as_chunks::<24>()
+                    .0
+                    .iter()
+                    .map(|r| {
+                        let info = u64_at(r, 8);
+                        let symbol = symbols[(info >> 32) as usize].1;
+                        let section = u16::from_le_bytes(symbol[6..8].try_into().unwrap()) as usize;
+                        (
+                            object.section_name(section).to_string(),
+                            info as u32,
+                            (u64_at(symbol, 8) as i64).wrapping_add(u64_at(r, 16) as i64),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(targets(&default), targets(&gas));
+            assert!(
+                default
+                    .symbols()
+                    .iter()
+                    .all(|(name, _)| !name.starts_with(".L") || *name == ".Lglobal")
+            );
+            let driver = dir.path().join("as");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(ras_binary_str(), &driver).unwrap();
+            #[cfg(not(unix))]
+            std::fs::copy(ras_binary_str(), &driver).unwrap();
+            for program in [ras_binary().as_path(), &driver] {
+                for flag in ["-L", "--keep-locals"] {
+                    let output = dir.path().join("kept.o");
+                    run(Command::new(program)
+                        .arg(flag)
+                        .arg(&input)
+                        .arg("-o")
+                        .arg(&output));
+                    let kept = Object(std::fs::read(&output).unwrap());
+                    for name in [".Ltarget", ".Ltyped", ".Lalias", ".Lras_cfi", ".Lras_size"] {
+                        kept.symbol(name);
+                    }
+                    assert!(kept.symbols().iter().all(|(name, _)| {
+                        !name.starts_with(".Lras_") || [".Lras_cfi", ".Lras_size"].contains(name)
+                    }));
+                    assert_eq!(targets(&kept), targets(&gas));
+                    assert_eq!(
+                        kept.contents(kept.section(".eh_frame")),
+                        default.contents(default.section(".eh_frame"))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn relocations_retain_merge_and_got_local_symbols() {
+            let dir = TempDir::new("retained_locals");
+            let (ras, gas) = assemble_pair(
+                dir.path(),
+                ".text\nmovq .Lgot@GOTPCREL(%rip),%rax\n.Lgot: ret\nleaq .Lmerged(%rip),%rax\n.section .rodata.str1.1,\"aMS\",@progbits,1\n.Lmerged: .asciz \"kept\"\n.Lunused: .asciz \"discarded\"\n",
+            );
+            for name in [".Lgot", ".Lmerged"] {
+                assert_eq!(u64_at(ras.symbol(name), 8), u64_at(gas.symbol(name), 8));
+            }
+            assert!(ras.symbols().iter().all(|(name, _)| *name != ".Lunused"));
+            assert_eq!(ras.relocations(".rela.text"), gas.relocations(".rela.text"));
+        }
+
+        #[test]
+        fn compact_cfi_preserves_decoded_unwind_rows() {
+            let dir = TempDir::new("compact_cfi");
+            let mut source = String::from(".text\n.cfi_startproc\n");
+            for (index, advance) in [1, 63, 64, 255, 256, 65535, 65536].iter().enumerate() {
+                source.push_str(&format!(
+                    ".space {advance}\n.cfi_def_cfa_offset {}\n",
+                    (index + 2) * 128
+                ));
+            }
+            source.push_str(".cfi_offset 3,-16\n.cfi_offset 64,-24\n.cfi_offset 4,8\n.cfi_val_offset 5,-16\n.cfi_val_offset 6,8\n.cfi_restore 3\n.cfi_restore 64\n.cfi_def_cfa 7,-8\nnop\n.cfi_endproc\n");
+            let (ras, gas) = assemble_pair(dir.path(), &source);
+            assert!(
+                ras.contents(ras.section(".eh_frame")).len()
+                    <= gas.contents(gas.section(".eh_frame")).len()
+            );
+            let rows = |path: &Path| {
+                let output = run(Command::new("readelf")
+                    .arg("--debug-dump=frames-interp")
+                    .arg(path));
+                let output = String::from_utf8(output).unwrap();
+                let mut in_fde = false;
+                output
+                    .lines()
+                    .filter_map(|line| {
+                        if line.contains(" FDE ") {
+                            in_fde = true;
+                            return Some(line.split_once("pc=").unwrap().1.to_string());
+                        }
+                        if line.contains(" CIE ") {
+                            in_fde = false;
+                        }
+                        (in_fde && !line.trim().is_empty())
+                            .then(|| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rows(&dir.path().join("ras.o")),
+                rows(&dir.path().join("gas.o"))
+            );
+        }
+
+        #[test]
+        fn cies_share_only_compatible_unwind_metadata() {
+            let dir = TempDir::new("shared_cies");
+            let mut source = String::from(".text\n");
+            for (simple, directives) in [
+                ("", ""),
+                ("", ""),
+                ("simple", ""),
+                ("", ".cfi_signal_frame\n"),
+                ("", ".cfi_return_column 15\n"),
+                ("", ".cfi_personality 0x1b,personality\n"),
+                ("", ".cfi_personality 0x1b,other\n"),
+                (
+                    "",
+                    ".cfi_personality 0x1b,personality\n.cfi_lsda 0x1b,lsda1\n",
+                ),
+                (
+                    "",
+                    ".cfi_personality 0x1b,personality\n.cfi_lsda 0x1b,lsda2\n",
+                ),
+                ("", ".cfi_personality 0x1b,personality\n.cfi_lsda 0,lsda1\n"),
+            ] {
+                source.push_str(&format!(
+                    ".cfi_startproc {simple}\n{directives}.space 4\n.cfi_endproc\n"
+                ));
+            }
+            for architecture in [TargetArchitecture::X86_64, TargetArchitecture::Aarch64] {
+                let output = dir.path().join("frames.o");
+                Ras::new(architecture, TargetOperatingSystem::Linux)
+                    .unwrap()
+                    .assemble(&source, &output)
+                    .unwrap();
+                let object = Object(std::fs::read(&output).unwrap());
+                let frames = object.contents(object.section(".eh_frame"));
+                let mut cies = std::collections::HashSet::new();
+                let mut fdes = 0;
+                let mut offset = 0;
+                while offset < frames.len() {
+                    let length = u32_at(frames, offset) as usize;
+                    assert!(length > 0);
+                    let pointer = u32_at(frames, offset + 4) as usize;
+                    if pointer == 0 {
+                        cies.insert(offset);
+                    } else {
+                        assert!(cies.contains(&(offset + 4 - pointer)));
+                        fdes += 1;
+                    }
+                    offset += 4 + length;
+                }
+                assert_eq!(cies.len(), 8);
+                assert_eq!(fdes, 10);
+                let relocations = object.relocations(".rela.eh_frame");
+                assert_eq!(
+                    relocations.iter().filter(|r| r.2 == "personality").count(),
+                    3
+                );
+                assert_eq!(relocations.iter().filter(|r| r.2 == "lsda1").count(), 2);
+                assert_eq!(relocations.iter().filter(|r| r.2 == "lsda2").count(), 1);
+            }
+        }
+    }
+
+    /// Assemble what clang writes on macOS, link it with clang and run it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod darwin_clang_asm {
+        use crate::test_support::ras_binary;
+        fn ras_binary_str() -> String {
+            ras_binary().to_string_lossy().into_owned()
+        }
+        use crate::test_support::TempDir;
+        use std::fs;
+        use std::process::Command;
+
+        fn exit_code(tag: &str, source: &str) -> i32 {
+            let guard = TempDir::new(tag);
+            let dir = guard.path();
+            let input = dir.join("input.s");
+            let object = dir.join("input.o");
+            let exe = dir.join("input");
+            fs::write(&input, source).expect("write assembly");
+            let assemble = Command::new(ras_binary_str())
+                .arg(&input)
+                .arg("-o")
+                .arg(&object)
+                .output()
+                .expect("run ras");
+            assert!(
+                assemble.status.success(),
+                "{}",
+                String::from_utf8_lossy(&assemble.stderr)
+            );
+            let link = Command::new("clang")
+                .arg(&object)
+                .arg("-o")
+                .arg(&exe)
+                .output()
+                .expect("run clang");
+            assert!(
+                link.status.success(),
+                "{}",
+                String::from_utf8_lossy(&link.stderr)
+            );
+            Command::new(&exe)
+                .status()
+                .expect("run program")
+                .code()
+                .expect("exit code")
+        }
+
+        #[test]
+        fn darwin_hint_directives_and_w29_cfi_assemble() {
+            let source = "\t.build_version macos, 27, 0\tsdk_version 27, 0\n\
+                \t.section __TEXT,__text,regular,pure_instructions\n\
+                \t.globl _main\n\
+                \t.p2align 2\n\
+                _main:\n\
+                \t.cfi_startproc\n\
+                \tstp x29, x30, [sp, #-16]!\n\
+                \tmov x29, sp\n\
+                \t.cfi_def_cfa w29, 16\n\
+                Lloh0:\n\
+                \tmov w0, #42\n\
+                \tldp x29, x30, [sp], #16\n\
+                \tret\n\
+                \t.loh AdrpAdd Lloh0 Lloh0\n\
+                \t.cfi_endproc\n\
+                .subsections_via_symbols\n";
+            assert_eq!(exit_code("ras-darwin-hints", source), 42);
+        }
+
+        #[test]
+        fn darwin_exception_tables_are_refused_by_name() {
+            let guard = TempDir::new("ras-darwin-eh");
+            let input = guard.path().join("input.s");
+            fs::write(
+                &input,
+                "_main:\n.cfi_startproc\n.cfi_personality 155, ___gxx_personality_v0\nret\n.cfi_endproc\n",
+            )
+            .expect("write assembly");
+            let assemble = Command::new(ras_binary_str())
+                .arg(&input)
+                .arg("-o")
+                .arg(guard.path().join("input.o"))
+                .output()
+                .expect("run ras");
+            assert!(!assemble.status.success());
+            let stderr = String::from_utf8_lossy(&assemble.stderr);
+            assert!(stderr.contains("Mach-O exception tables"), "{stderr}");
+        }
+
+        #[test]
+        fn darwin_semicolon_starts_a_comment() {
+            let source = "\t.globl _main ; -- Begin function main\n\
+                \t.p2align 2 ; -- Begin\n\
+                _main: ; @main\n\
+                \tmov w0, #7 ; =0x7\n\
+                \tret\n";
+            assert_eq!(exit_code("ras-darwin-semicolon", source), 7);
+        }
+
+        #[test]
+        fn darwin_literal_sections_link_and_load() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \t.globl _main\n\
+                \t.p2align 2\n\
+                _main:\n\
+                \tadrp x8, lCPI@PAGE\n\
+                \tldr x0, [x8, lCPI@PAGEOFF]\n\
+                \tadrp x8, l_.str@PAGE\n\
+                \tadd x8, x8, l_.str@PAGEOFF\n\
+                \tldrb w8, [x8]\n\
+                \tadd w0, w0, w8\n\
+                \tret\n\
+                \t.section __TEXT,__literal8,8byte_literals\n\
+                \t.p2align 3\n\
+                lCPI:\n\
+                \t.quad 2\n\
+                \t.section __TEXT,__cstring,cstring_literals\n\
+                l_.str:\n\
+                \t.asciz \"(\"\n";
+            assert_eq!(exit_code("ras-darwin-literals", source), 42);
+        }
+
+        /// `otool -t` of the only section, as hex words.
+        fn text_words(object: &std::path::Path) -> String {
+            let output = Command::new("otool")
+                .arg("-t")
+                .arg(object)
+                .output()
+                .expect("run otool");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .skip(2)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[test]
+        fn register_offset_loads_match_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tldr w0, [x9, w8, uxtw #2]\n\
+                \tldr w0, [x9, w8, sxtw]\n\
+                \tldr x1, [x2, x3]\n\
+                \tldr x1, [x2, x3, lsl #3]\n\
+                \tstr x1, [x2, x3, lsl #3]\n\
+                \tldrb w1, [x2, x3]\n\
+                \tldrh w1, [x2, x3, lsl #1]\n\
+                \tldrsw x1, [x2, x3, sxtx #2]\n\
+                \tstrb w1, [x2, w3, uxtw]\n\
+                \tldr d0, [x2, x3, lsl #3]\n\
+                \tldr s0, [x2, w3, sxtw #2]\n\
+                \tldr q0, [x2, x3, lsl #4]\n\
+                \tldr x1, [x2, #16]\n";
+            assert_matches_clang("ras-register-offset", source);
+        }
+
+        #[test]
+        fn fmov_constants_match_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tfmov d0, #1.00000000\n\
+                \tfmov d1, #2.00000000\n\
+                \tfmov s2, #-0.5\n\
+                \tfmov d3, #31.0\n\
+                \tfmov s4, #0.125\n";
+            assert_matches_clang("ras-fmov-constant", source);
+        }
+
+        #[test]
+        fn dotted_neon_spelling_matches_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tadd.4s v0, v1, v2\n\
+                \tadd.16b v3, v4, v5\n\
+                \tsub.2d v0, v1, v2\n\
+                \tmul.8h v0, v1, v2\n\
+                \tand.16b v0, v1, v2\n\
+                \teor.8b v3, v4, v5\n\
+                \tfmul.2s v0, v1, v2\n\
+                \tfmul.2d v2, v3, v4\n\
+                \tdup.4s v0, w12\n\
+                \tdup.2d v2, x3\n\
+                \tdup.16b v1, w0\n\
+                \tmov.s v0[1], w10\n\
+                \tmov.d v2[1], x3\n\
+                \tmov.s w12, v0[3]\n";
+            assert_matches_clang("ras-dotted-neon", source);
+        }
+
+        #[test]
+        fn neon_float_and_logic_match_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tfadd.4s v0, v1, v2\n\
+                \tfadd.2d v3, v4, v5\n\
+                \tfsub.2s v6, v7, v8\n\
+                \tfsub.2d v9, v10, v11\n\
+                \tfdiv.2s v12, v13, v14\n\
+                \tfdiv.4s v15, v16, v17\n\
+                \tfdiv.2d v18, v19, v20\n\
+                \torr.16b v0, v1, v2\n\
+                \torr.8b v3, v4, v5\n\
+                \tmov.16b v6, v7\n\
+                \tmov.8b v8, v9\n\
+                \tfmla.4s v0, v1, v2\n\
+                \tfmla.2d v3, v4, v5\n\
+                \tfmls.2s v6, v7, v8\n\
+                \tfmls.2d v9, v10, v11\n";
+            assert_matches_clang("ras-neon-float", source);
+        }
+
+        #[test]
+        fn neon_reductions_match_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \taddv.8b b0, v1\n\
+                \taddv.16b b2, v3\n\
+                \taddv.4h h4, v5\n\
+                \taddv.8h h6, v7\n\
+                \taddv.4s s8, v9\n\
+                \taddv s10, v11.4s\n\
+                \tfaddp.4s v0, v1, v2\n\
+                \tfaddp.2s v3, v4, v5\n\
+                \tfaddp.2d v6, v7, v8\n\
+                \tfaddp.2s s9, v10\n\
+                \tfaddp d11, v12.2d\n";
+            assert_matches_clang("ras-neon-reduce", source);
+        }
+
+        #[test]
+        fn neon_ext_matches_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \text.16b v0, v1, v2, #8\n\
+                \text.8b v3, v4, v5, #3\n\
+                \text.16b v6, v7, v8, #0\n\
+                \text.16b v9, v10, v11, #15\n\
+                \text.8b v12, v13, v14, #7\n";
+            assert_matches_clang("ras-neon-ext", source);
+        }
+
+        #[test]
+        fn neon_fmov_high_doubleword_matches_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tfmov.d x0, v1[1]\n\
+                \tfmov.d v2[1], x3\n\
+                \tfmov x4, v5.d[1]\n\
+                \tfmov v6.d[1], x7\n";
+            assert_matches_clang("ras-neon-fmov", source);
+        }
+
+        #[test]
+        fn neon_movi_matches_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tmovi.2d v0, #0\n\
+                \tmovi.16b v1, #0\n\
+                \tmovi.8b v2, #0xff\n\
+                \tmovi.4s v3, #1\n\
+                \tmovi.4s v4, #0x1, lsl #8\n\
+                \tmovi.4s v5, #0x3, lsl #16\n\
+                \tmovi.2s v6, #0x3, lsl #24\n\
+                \tmovi.8h v7, #0x2, lsl #8\n\
+                \tmovi.4h v8, #0x2\n\
+                \tmovi.2d v9, #0xff00ff00ff00ff00\n\
+                \tmovi.2d v10, #0xffffffffffffffff\n\
+                \tmovi.2d v11, #0x00ff00ff00ff00ff\n\
+                \tmovi.16b v12, #0x42\n\
+                \tmovi.4s v13, #0\n";
+            assert_matches_clang("ras-neon-movi", source);
+        }
+
+        #[test]
+        fn neon_structure_loads_and_stores_match_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tld1.4s { v0 }, [x0]\n\
+                \tld1.4s { v1, v2 }, [x2]\n\
+                \tld1.16b { v3, v4, v5 }, [x1]\n\
+                \tld1.8h { v6, v7, v8, v9 }, [x3]\n\
+                \tld1.2d { v10 }, [sp]\n\
+                \tld1.8b { v11 }, [x12]\n\
+                \tst1.2s { v13 }, [x4]\n\
+                \tst1.4h { v31 }, [sp]\n\
+                \tst1.2d { v14, v15 }, [x5]\n\
+                \tst1.16b { v16, v17, v18, v19 }, [x6]\n\
+                \tld1.4s { v31, v0 }, [x7]\n";
+            assert_matches_clang("ras-neon-ld1", source);
+        }
+
+        #[test]
+        fn neon_dup_element_matches_clang_bytes() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                \tdup.4s v0, v1[2]\n\
+                \tdup.2d v2, v3[1]\n\
+                \tdup.8b v4, v5[7]\n\
+                \tdup.16b v6, v7[15]\n\
+                \tdup.8h v8, v9[3]\n\
+                \tdup.4h v10, v11[0]\n\
+                \tdup.2s v12, v13[1]\n";
+            assert_matches_clang("ras-neon-dup", source);
+        }
+
+        fn assert_matches_clang(tag: &str, source: &str) {
+            let guard = TempDir::new(tag);
+            let dir = guard.path();
+            let input = dir.join("input.s");
+            fs::write(&input, source).expect("write assembly");
+            let ras_object = dir.join("ras.o");
+            let clang_object = dir.join("clang.o");
+            let assemble = Command::new(ras_binary_str())
+                .arg(&input)
+                .arg("-o")
+                .arg(&ras_object)
+                .output()
+                .expect("run ras");
+            assert!(
+                assemble.status.success(),
+                "{}",
+                String::from_utf8_lossy(&assemble.stderr)
+            );
+            let reference = Command::new("clang")
+                .args(["-c", "-x", "assembler"])
+                .arg(&input)
+                .arg("-o")
+                .arg(&clang_object)
+                .output()
+                .expect("run clang");
+            assert!(reference.status.success());
+            assert_eq!(text_words(&ras_object), text_words(&clang_object));
+        }
+
+        #[test]
+        fn zerofill_defines_zeroed_symbol_and_returns_to_section() {
+            let source = "\t.section __TEXT,__text,regular,pure_instructions\n\
+                .zerofill __DATA,__bss,_slot,16,3\n\
+                \t.globl _main\n\
+                \t.p2align 2\n\
+                _main:\n\
+                \tadrp x8, _slot@PAGE\n\
+                \tldr x0, [x8, _slot@PAGEOFF]\n\
+                \tadd x0, x0, #9\n\
+                \tret\n";
+            assert_eq!(exit_code("ras-zerofill", source), 9);
+        }
+
+        #[test]
+        fn assignment_names_an_absolute_value() {
+            let source = "SIZE = 42\n\
+                \t.globl _main\n\
+                \t.p2align 2\n\
+                _main:\n\
+                \tadrp x8, _value@PAGE\n\
+                \tldr w0, [x8, _value@PAGEOFF]\n\
+                \tret\n\
+                \t.section __DATA,__data\n\
+                \t.p2align 2\n\
+                _value:\n\
+                \t.long SIZE\n";
+            assert_eq!(exit_code("ras-assignment", source), 42);
+        }
+
+        /// The data of a Mach-O debug section as `otool -s` prints it, without the addresses.
+        fn debug_section_words(object: &std::path::Path, section: &str) -> String {
+            let output = Command::new("otool")
+                .args(["-s", "__DWARF", section])
+                .arg(object)
+                .output()
+                .expect("run otool");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .skip(2)
+                .map(|line| {
+                    line.split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        const CLANG_DEBUG_SOURCE: &str = "int add(int a, int b) {\n  return a + b;\n}\n\
+        int main(void) {\n  return add(2, 3) - 5;\n}\n";
+
+        /// clang's `-S -g` output, optionally without the `.file` and `.loc` lines that name
+        /// the line table.
+        fn clang_debug_assembly(dir: &std::path::Path, strip_lines: bool) -> std::path::PathBuf {
+            let source = dir.join("input.c");
+            let assembly = dir.join(if strip_lines { "stripped.s" } else { "input.s" });
+            fs::write(&source, CLANG_DEBUG_SOURCE).expect("write C");
+            let emit = Command::new("clang")
+                .args(["-S", "-g", "-arch", "arm64", "-O0"])
+                .arg(&source)
+                .arg("-o")
+                .arg(dir.join("clang.s"))
+                .output()
+                .expect("run clang");
+            assert!(emit.status.success());
+            let text = fs::read_to_string(dir.join("clang.s")).expect("read assembly");
+            let text: String = text
+                .lines()
+                .filter(|line| {
+                    let line = line.trim_start();
+                    !(strip_lines && (line.starts_with(".loc") || line.starts_with(".file")))
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            fs::write(&assembly, text).expect("write assembly");
+            assembly
+        }
+
+        #[test]
+        fn clang_debug_sections_match_clang_bytes_without_line_table() {
+            let guard = TempDir::new("ras-clang-debug");
+            let dir = guard.path();
+            let input = clang_debug_assembly(dir, true);
+            let ras_object = dir.join("ras.o");
+            let clang_object = dir.join("clang.o");
+            let assemble = Command::new(ras_binary_str())
+                .arg(&input)
+                .arg("-o")
+                .arg(&ras_object)
+                .output()
+                .expect("run ras");
+            assert!(
+                assemble.status.success(),
+                "{}",
+                String::from_utf8_lossy(&assemble.stderr)
+            );
+            let reference = Command::new("clang")
+                .args(["-c", "-x", "assembler"])
+                .arg(&input)
+                .arg("-o")
+                .arg(&clang_object)
+                .output()
+                .expect("run clang");
+            assert!(reference.status.success());
+            for section in [
+                "__debug_abbrev",
+                "__debug_info",
+                "__debug_str",
+                "__debug_str_offs",
+                "__debug_addr",
+                "__debug_names",
+                "__debug_line",
+            ] {
+                assert_eq!(
+                    debug_section_words(&ras_object, section),
+                    debug_section_words(&clang_object, section),
+                    "{section}"
+                );
+            }
+        }
+
+        #[test]
+        fn clang_line_table_is_refused_until_ras_writes_debug_line() {
+            let guard = TempDir::new("ras-clang-line");
+            let dir = guard.path();
+            let input = clang_debug_assembly(dir, false);
+            let assemble = Command::new(ras_binary_str())
+                .arg(&input)
+                .arg("-o")
+                .arg(dir.join("ras.o"))
+                .output()
+                .expect("run ras");
+            assert!(!assemble.status.success());
+            let stderr = String::from_utf8_lossy(&assemble.stderr);
+            assert!(
+                stderr.contains("source defines .debug_* sections; ras cannot add .loc DWARF"),
+                "{stderr}"
+            );
+        }
+    }
+}
