@@ -31,6 +31,22 @@ half:\n\
 movl %edi, %eax\n\
 ret\n";
 
+/// The same two functions in aarch64 instructions, so the Windows-on-ARM relocation
+/// types get read back from a real object rather than only from x86_64 ones.
+const AARCH64_SOURCE: &str = ".file 1 \"shapes.lamina\"\n\
+.text\n\
+.globl twice\n\
+twice:\n\
+.loc 1 1 1\n\
+add w0, w0, w0\n\
+.loc 1 2 1\n\
+ret\n\
+.p2align 4\n\
+half:\n\
+.loc 1 6 1\n\
+asr w0, w0, #1\n\
+ret\n";
+
 const DEBUG_S_SYMBOLS: u32 = 0xf1;
 const DEBUG_S_LINES: u32 = 0xf2;
 const DEBUG_S_STRINGTABLE: u32 = 0xf3;
@@ -52,6 +68,8 @@ const LOCATION_RECORDS: std::ops::RangeInclusive<u16> = 0x113e..=0x1145;
 
 const IMAGE_REL_AMD64_SECTION: u16 = 0x000a;
 const IMAGE_REL_AMD64_SECREL: u16 = 0x000b;
+const IMAGE_REL_ARM64_SECREL: u16 = 0x0008;
+const IMAGE_REL_ARM64_SECTION: u16 = 0x000d;
 
 fn request() -> DebugInfoRequest {
     DebugInfoRequest {
@@ -96,9 +114,9 @@ fn request() -> DebugInfoRequest {
     }
 }
 
-fn object() -> Vec<u8> {
+fn object_for(arch: TargetArchitecture, source: &str) -> Vec<u8> {
     Ras::with_object_write_options(
-        TargetArchitecture::X86_64,
+        arch,
         TargetOperatingSystem::Windows,
         ObjectWriteOptions {
             function_symbols: vec!["twice".into(), "half".into()],
@@ -108,7 +126,7 @@ fn object() -> Vec<u8> {
         },
     )
     .expect("assembler")
-    .assemble_to_bytes(SOURCE)
+    .assemble_to_bytes(source)
     .expect("assemble")
 }
 
@@ -132,7 +150,15 @@ struct Reloc {
 
 impl Coff {
     fn new() -> Self {
-        Self { bytes: object() }
+        Self {
+            bytes: object_for(TargetArchitecture::X86_64, SOURCE),
+        }
+    }
+
+    fn aarch64() -> Self {
+        Self {
+            bytes: object_for(TargetArchitecture::Aarch64, AARCH64_SOURCE),
+        }
     }
 
     fn section_header(&self, name: &str) -> Option<usize> {
@@ -356,6 +382,33 @@ fn a_procedure_addresses_its_function_through_relocations() {
     assert_eq!(segment.symbol, "twice");
 }
 
+/// The ARM64 machine type numbers its relocations differently from AMD64, and a
+/// procedure's segment halfword is the one type the two tables disagree about most
+/// easily: `IMAGE_REL_ARM64_SECTION` is `0x000D`, not an AMD64 value reused.
+#[test]
+fn a_procedure_on_aarch64_addresses_its_function_through_arm64_relocations() {
+    let coff = Coff::aarch64();
+    let section = coff.section(".debug$S");
+    let body = symbol_records(&section)
+        .into_iter()
+        .find(|(kind, body, _)| *kind == S_GPROC32_ID && procedure(body).0 == "twice")
+        .expect("twice")
+        .2;
+    let relocs = coff.relocs(".debug$S");
+    let at = |offset: usize| {
+        relocs
+            .iter()
+            .find(|r| r.offset as usize == offset)
+            .unwrap_or_else(|| panic!("no relocation at {offset}"))
+    };
+    let code_offset = at(body + 7 * 4);
+    assert_eq!(code_offset.kind, IMAGE_REL_ARM64_SECREL);
+    assert_eq!(code_offset.symbol, "twice");
+    let segment = at(body + 8 * 4);
+    assert_eq!(segment.kind, IMAGE_REL_ARM64_SECTION);
+    assert_eq!(segment.symbol, "twice");
+}
+
 #[test]
 fn a_line_subsection_maps_code_offsets_to_source_lines() {
     let coff = Coff::new();
@@ -508,7 +561,7 @@ fn llvm_pdbutil_reads_the_records_back() {
     };
     let dir = TempDir::new("codeview_pdbutil");
     let path = dir.path().join("shapes.obj");
-    std::fs::write(&path, object()).expect("write");
+    std::fs::write(&path, object_for(TargetArchitecture::X86_64, SOURCE)).expect("write");
     let output = Command::new(pdbutil)
         .args(["dump", "--symbols", "--types", "-l"])
         .arg(&path)
