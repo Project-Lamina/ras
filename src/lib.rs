@@ -5,6 +5,7 @@
 
 pub mod assembler;
 mod cfi;
+pub mod cli;
 pub mod codeview;
 pub mod debug;
 pub mod dwarf;
@@ -87,6 +88,8 @@ impl Ras {
         self.assembler.compile_mir_to_binary(module)
     }
 }
+
+pub use cli::main;
 
 #[cfg(test)]
 mod tests {
