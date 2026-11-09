@@ -44,6 +44,8 @@ use crate::assembler::RasAssembler;
 
 #[cfg(feature = "encoder")]
 use lamina_mir::Module as MirModule;
+#[cfg(feature = "encoder")]
+use std::collections::HashMap;
 
 /// Executable memory for JIT-compiled code
 pub struct ExecutableMemory {
@@ -308,29 +310,58 @@ impl RasRuntime {
 
     #[cfg(feature = "encoder")]
     pub fn compile_to_memory(&mut self, module: &MirModule) -> Result<ExecutableMemory, RasError> {
+        self.compile_with_offsets(module).map(|(mem, _)| mem)
+    }
+
+    /// Leaks the executable mapping so the returned pointer stays valid. Prefer
+    /// [`compile_to_memory`](Self::compile_to_memory) and keep the `ExecutableMemory` alive.
+    ///
+    /// `function_name` is matched with or without a leading `@`.
+    #[cfg(feature = "encoder")]
+    pub fn compile_function<T>(
+        &mut self,
+        module: &MirModule,
+        function_name: &str,
+    ) -> Result<unsafe extern "C" fn() -> T, RasError> {
+        let (mem, offsets) = self.compile_with_offsets(module)?;
+        let offset = entry_offset(&offsets, function_name)?;
+        let entry = mem.ptr.wrapping_add(offset);
+        let f: unsafe extern "C" fn() -> T = unsafe { core::mem::transmute(entry) };
+        std::mem::forget(mem);
+        Ok(f)
+    }
+
+    #[cfg(feature = "encoder")]
+    fn compile_with_offsets(
+        &mut self,
+        module: &MirModule,
+    ) -> Result<(ExecutableMemory, HashMap<String, usize>), RasError> {
         let mut assembler = RasAssembler::new(self.target_arch, self.target_os)?;
-        let (code, _) = assembler.compile_mir_to_binary_function(module, None)?;
+        let (code, offsets) = assembler.compile_mir_to_binary_function(module, None)?;
 
         let mut mem = ExecutableMemory::allocate_writable(code.len())?;
         mem.write_code(&code)?;
         mem.make_executable()?;
 
-        Ok(mem)
+        Ok((mem, offsets))
     }
+}
 
-    /// Leaks the executable mapping so the returned pointer stays valid. Prefer
-    /// [`compile_to_memory`](Self::compile_to_memory) and keep the `ExecutableMemory` alive.
-    #[cfg(feature = "encoder")]
-    pub fn compile_function<T>(
-        &mut self,
-        module: &MirModule,
-        _function_name: &str,
-    ) -> Result<unsafe extern "C" fn() -> T, RasError> {
-        let mem = self.compile_to_memory(module)?;
-        let f: unsafe extern "C" fn() -> T = unsafe { core::mem::transmute(mem.ptr) };
-        std::mem::forget(mem);
-        Ok(f)
+#[cfg(feature = "encoder")]
+fn entry_offset(offsets: &HashMap<String, usize>, name: &str) -> Result<usize, RasError> {
+    let alternate = match name.strip_prefix('@') {
+        Some(bare) => bare.to_string(),
+        None => format!("@{name}"),
+    };
+    if let Some(&offset) = offsets.get(name).or_else(|| offsets.get(&alternate)) {
+        return Ok(offset);
     }
+    let mut available: Vec<&str> = offsets.keys().map(String::as_str).collect();
+    available.sort_unstable();
+    Err(RasError::InvalidInput(format!(
+        "JIT entry function '{name}' is not in the module (functions: {})",
+        available.join(", ")
+    )))
 }
 
 #[cfg(test)]
@@ -378,7 +409,11 @@ mod jit_host_exec_tests {
         TargetArchitecture, TargetOperatingSystem, detect_host_architecture_only, detect_host_os,
     };
 
-    use crate::{assembler::core::RasAssembler, error::RasError, runtime::ExecutableMemory};
+    use crate::{
+        assembler::core::RasAssembler,
+        error::RasError,
+        runtime::{ExecutableMemory, RasRuntime},
+    };
 
     fn host_jit_pair() -> Option<(TargetArchitecture, TargetOperatingSystem)> {
         let arch = TargetArchitecture::from_str(detect_host_architecture_only()).ok()?;
@@ -709,5 +744,45 @@ mod jit_host_exec_tests {
             return;
         };
         assert_eq!(ne, 0);
+    }
+
+    fn module_two_constants() -> Module {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let mut module = Module::new("host_two_functions");
+        for (name, value) in [("first", 1), ("second", 2)] {
+            let mut f = Function::new(Signature::new(name).with_return(i64_ty));
+            let mut entry = Block::new("entry");
+            entry.push(Instruction::Ret {
+                value: Some(ii64(value)),
+            });
+            f.add_block(entry);
+            module.add_function(f);
+        }
+        module
+    }
+
+    #[test]
+    fn compile_function_enters_the_named_function() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_two_constants();
+        let mut runtime = RasRuntime::new(arch, os);
+        for (name, expected) in [("first", 1), ("second", 2), ("@second", 2)] {
+            let f = runtime
+                .compile_function::<i64>(&module, name)
+                .expect("compile");
+            assert_eq!(unsafe { f() }, expected, "entry {name}");
+        }
+    }
+
+    #[test]
+    fn compile_function_rejects_an_unknown_name() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let result =
+            RasRuntime::new(arch, os).compile_function::<i64>(&module_two_constants(), "third");
+        assert!(matches!(result, Err(RasError::InvalidInput(_))));
     }
 }
