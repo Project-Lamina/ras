@@ -2050,6 +2050,7 @@ fn encode_mir_instruction_with_context(
             variadic_fixed,
             ret,
             ret_ty,
+            ..
         } => {
             // The callee may be a JIT function, which takes every argument by position in a
             // general register, or C, which takes floats in the float registers. Both agree
