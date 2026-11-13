@@ -1815,6 +1815,9 @@ impl X86_64Encoder {
             "fildq" => Some((0xdf, 5)),
             "fistpl" => Some((0xdb, 3)),
             "fistpq" => Some((0xdf, 7)),
+            "fistpll" => Some((0xdf, 7)),
+            "fisttpl" => Some((0xdb, 1)),
+            "fisttpq" | "fisttpll" => Some((0xdd, 1)),
             "fldcw" => Some((0xd9, 5)),
             "fnstcw" => Some((0xd9, 7)),
             "fsts" => Some((0xd9, 2)),
@@ -1855,6 +1858,7 @@ impl X86_64Encoder {
                 .ok_or_else(|| RasError::EncodingError("expected x87 stack register".into()))
         };
         let (byte, field) = match (opcode, operands) {
+            ("fxch", []) => (0xd9, 0xc9),
             ("fld" | "fxch" | "fstp", [operand]) => {
                 let reg = stack(operand)?;
                 match opcode {
@@ -1864,7 +1868,8 @@ impl X86_64Encoder {
                 }
             }
             (
-                "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "fcomi" | "fcomip" | "fucomip",
+                "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "faddp" | "fsubp" | "fdivrp"
+                | "fcomi" | "fcomip" | "fucomip",
                 [src, dst],
             ) => {
                 let src = stack(src)?;
@@ -1874,7 +1879,10 @@ impl X86_64Encoder {
                     "fmul" if src == 0 => (0xdc, 0xc8 + dst),
                     "fsub" if dst == 0 => (0xd8, 0xe0 + src),
                     "fsub" if src == 0 => (0xdc, 0xe0 + dst),
+                    "faddp" if src == 0 => (0xde, 0xc0 + dst),
                     "fmulp" if src == 0 => (0xde, 0xc8 + dst),
+                    "fsubp" if src == 0 => (0xde, 0xe0 + dst),
+                    "fdivrp" if src == 0 => (0xde, 0xf8 + dst),
                     "fdivp" if src == 0 => (0xde, 0xf0 + dst),
                     "fsubrp" if src == 0 => (0xde, 0xe8 + dst),
                     "fcomi" if dst == 0 => (0xdb, 0xf0 + src),
@@ -2184,6 +2192,8 @@ impl InstructionEncoder for X86_64Encoder {
                     | "cdq"
                     | "cltd"
                     | "ud2"
+                    | "frndint"
+                    | "fprem"
                     | "hlt"
                     | "cli"
                     | "sti"
@@ -2340,7 +2350,8 @@ impl InstructionEncoder for X86_64Encoder {
             "flds" | "fldl" | "fldt" | "fsts" | "fstl" | "fstps" | "fstpl" | "fstpt" | "fildl"
             | "fildq" | "fildll" | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl"
             | "fmuls" | "fmull" | "fsubs" | "fsubl" | "fdivs" | "fdivl" | "fld" | "fxch"
-            | "fstp" | "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "fcomi" | "fcomip"
+            | "fstp" | "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "faddp" | "fsubp"
+            | "fdivrp" | "fistpll" | "fisttpl" | "fisttpq" | "fisttpll" | "fcomi" | "fcomip"
             | "fucomip" => {
                 code = self.emit(self.encode_x87(&opcode, &inst.operands)?);
             }
@@ -3033,6 +3044,10 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_sse_shift(group, digit, &inst.operands)?;
                 code = self.emit(enc);
             }
+            // The two x87 operations with no operand that the extended-precision
+            // helpers need: round to integer, and the remainder step.
+            "frndint" => code.extend_from_slice(&[0xd9, 0xfc]),
+            "fprem" => code.extend_from_slice(&[0xd9, 0xf8]),
             "cwtl" => code.push(0x98),
             "ud2" => code.extend_from_slice(&[0x0f, 0x0b]),
             // The instructions that stop, wait or trap, which is what a naked body
@@ -6262,6 +6277,16 @@ mod tests {
             ("fucomip %st(1), %st", &[0xdf, 0xe9]),
             ("int $0x80", &[0xcd, 0x80]),
             ("ud2", &[0x0f, 0x0b]),
+            ("faddp %st, %st(1)", &[0xde, 0xc1]),
+            ("fsubp %st, %st(1)", &[0xde, 0xe1]),
+            ("fdivrp %st, %st(1)", &[0xde, 0xf9]),
+            ("faddp %st, %st(3)", &[0xde, 0xc3]),
+            ("fxch", &[0xd9, 0xc9]),
+            ("fistpll (%rax)", &[0xdf, 0x38]),
+            ("fisttpll (%rax)", &[0xdd, 0x08]),
+            ("fisttpl (%rax)", &[0xdb, 0x08]),
+            ("frndint", &[0xd9, 0xfc]),
+            ("fprem", &[0xd9, 0xf8]),
             ("hlt", &[0xf4]),
             ("cli", &[0xfa]),
             ("sti", &[0xfb]),
