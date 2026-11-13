@@ -2184,6 +2184,11 @@ impl InstructionEncoder for X86_64Encoder {
                     | "cdq"
                     | "cltd"
                     | "ud2"
+                    | "hlt"
+                    | "cli"
+                    | "sti"
+                    | "int3"
+                    | "cpuid"
                     | "syscall"
                     | "mfence"
                     | "rdtsc"
@@ -3030,6 +3035,13 @@ impl InstructionEncoder for X86_64Encoder {
             }
             "cwtl" => code.push(0x98),
             "ud2" => code.extend_from_slice(&[0x0f, 0x0b]),
+            // The instructions that stop, wait or trap, which is what a naked body
+            // and a startup stub reach for when there is nowhere left to go.
+            "hlt" => code.push(0xf4),
+            "cli" => code.push(0xfa),
+            "sti" => code.push(0xfb),
+            "int3" => code.push(0xcc),
+            "cpuid" => code.extend_from_slice(&[0x0f, 0xa2]),
             "cltq" => code.extend_from_slice(&[0x48, 0x98]),
             "movslq" => {
                 let enc = self.encode_movsxd(&inst.operands)?;
@@ -5157,7 +5169,8 @@ fn protected_mode_supported(opcode: &str) -> bool {
     const PLAIN: &[&str] = &[
         "bswap", "bswapl", "call", "cdq", "cltd", "cwtl", "endbr32", "int", "jmp", "lea", "leal",
         "leave", "mov", "movb", "movl", "movw", "movsbl", "movsbw", "movswl", "movzbl", "movzwl",
-        "movsx", "movzx", "nop", "pop", "popl", "push", "pushl", "ret", "ud2", "imul", "imull",
+        "movsx", "movzx", "nop", "pop", "popl", "push", "pushl", "ret", "ud2", "hlt", "cli",
+        "sti", "int3", "imul", "imull",
         "btl", "btsl", "btrl", "btcl", "bsfl", "bsrl", "xchgb", "xchgw", "xchgl", "xaddb", "xaddw",
         "xaddl", "cmpxchgb", "cmpxchgw", "cmpxchgl", "lock",
     ];
@@ -6249,6 +6262,14 @@ mod tests {
             ("fucomip %st(1), %st", &[0xdf, 0xe9]),
             ("int $0x80", &[0xcd, 0x80]),
             ("ud2", &[0x0f, 0x0b]),
+            ("hlt", &[0xf4]),
+            ("cli", &[0xfa]),
+            ("sti", &[0xfb]),
+            ("int3", &[0xcc]),
+            ("pause", &[0xf3, 0x90]),
+            ("cpuid", &[0x0f, 0xa2]),
+            ("lfence", &[0x0f, 0xae, 0xe8]),
+            ("sfence", &[0x0f, 0xae, 0xf8]),
             ("leave", &[0xc9]),
             ("ret", &[0xc3]),
             ("ret $8", &[0xc2, 0x08, 0x00]),
