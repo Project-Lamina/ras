@@ -118,11 +118,16 @@ pub fn compile_mir_x86_64_function(
             }
         }
 
-        let stack_size = stack_slots.len() * 8;
+        // rbx is the second scratch register this encoder works in, and the C ABI
+        // leaves it to the callee to put back. One slot below the locals holds the
+        // caller's copy for as long as the function runs.
+        let saved_rbx = X86Frame::calculate_stack_offset(stack_slots.len());
+        let stack_size = (stack_slots.len() + 1) * 8;
         let aligned_stack_size = (stack_size + 15) & !15;
 
         let prologue = encode_prologue_x86_64(aligned_stack_size as u32)?;
         code.extend_from_slice(&prologue);
+        code.extend_from_slice(&encode_mov_reg_mem_x86_64("rbx", saved_rbx)?);
 
         let skip_epilogue_and_ret = matches!(
             func.blocks[0].terminator(),
@@ -164,6 +169,7 @@ pub fn compile_mir_x86_64_function(
         }
 
         if !skip_epilogue_and_ret {
+            code.extend_from_slice(&encode_mov_mem_reg_x86_64(saved_rbx, "rbx")?);
             let epilogue = encode_epilogue_x86_64()?;
             code.extend_from_slice(&epilogue);
             code.push(0xC3);
@@ -1468,6 +1474,30 @@ mod x86_64_jit_inst_tests {
 
     fn subslice_present(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The C ABI leaves rbx to the callee to put back, and this encoder works in it,
+    /// so a caller that kept something there must find it again.
+    #[test]
+    fn a_compiled_function_puts_rbx_back() {
+        let code = compile_single_i64_binop(IntBinOp::Add);
+        // push rbp; mov rbp, rsp
+        assert_eq!(&code[..4], &[0x55, 0x48, 0x89, 0xE5], "{code:02x?}");
+        // The save comes first, before anything that could write rbx. A prologue is
+        // eleven bytes at the most, which is `sub` with a 32-bit immediate.
+        let at = code
+            .windows(3)
+            .position(|w| w == [0x48, 0x89, 0x5D])
+            .expect("no mov %rbx, d(%rbp) anywhere");
+        assert!(
+            at <= 11,
+            "rbx is saved at {at}, after the prologue: {code:02x?}"
+        );
+        let slot = code[at + 3];
+        // The restore is the last thing before `mov %rsp, %rbp; pop %rbp; ret`, and it
+        // reads back the slot the save wrote.
+        let tail = [0x48, 0x8B, 0x5D, slot, 0x48, 0x89, 0xEC, 0x5D, 0xC3];
+        assert_eq!(&code[code.len() - tail.len()..], &tail, "{code:02x?}");
     }
 
     fn compile_single_i32_binop(op: IntBinOp) -> Vec<u8> {
