@@ -2374,9 +2374,8 @@ impl InstructionEncoder for X86_64Encoder {
             | "fildq" | "fildll" | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl"
             | "fmuls" | "fmull" | "fsubs" | "fsubl" | "fdivs" | "fdivl" | "fld" | "fxch"
             | "fstp" | "fmul" | "fsub" | "fsubr" | "fadd" | "fdiv" | "fdivr" | "fmulp"
-            | "fdivp" | "fsubrp" | "faddp" | "fsubp"
-            | "fdivrp" | "fistpll" | "fisttpl" | "fisttpq" | "fisttpll" | "fcomi" | "fcomip"
-            | "fucomip" => {
+            | "fdivp" | "fsubrp" | "faddp" | "fsubp" | "fdivrp" | "fistpll" | "fisttpl"
+            | "fisttpq" | "fisttpll" | "fcomi" | "fcomip" | "fucomip" => {
                 code = self.emit(self.encode_x87(&opcode, &inst.operands)?);
             }
             "fldz" | "fchs" | "fabs" | "fsqrt" => {
@@ -5223,16 +5222,21 @@ fn protected_mode_supported(opcode: &str) -> bool {
     const PLAIN: &[&str] = &[
         "bswap", "bswapl", "call", "cdq", "cltd", "cwtl", "endbr32", "int", "jmp", "lea", "leal",
         "leave", "mov", "movb", "movl", "movw", "movsbl", "movsbw", "movswl", "movzbl", "movzwl",
-        "movsx", "movzx", "nop", "pop", "popl", "push", "pushl", "ret", "ud2", "hlt", "cli",
-        "sti", "int3", "imul", "imull",
-        "btl", "btsl", "btrl", "btcl", "bsfl", "bsrl", "xchgb", "xchgw", "xchgl", "xaddb", "xaddw",
-        "xaddl", "cmpxchgb", "cmpxchgw", "cmpxchgl", "lock",
+        "movsx", "movzx", "nop", "pop", "popl", "push", "pushl", "ret", "ud2", "hlt", "cli", "sti",
+        "int3", "cpuid", "pause", "lfence", "sfence", "mfence", "imul", "imull", "btl", "btsl",
+        "btrl", "btcl", "bsfl", "bsrl", "xchgb", "xchgw", "xchgl", "xaddb", "xaddw", "xaddl",
+        "cmpxchgb", "cmpxchgw", "cmpxchgl", "lock",
     ];
     const X87: &[&str] = &[
         "fabs", "fadds", "faddl", "fchs", "fcomi", "fcomip", "fdivs", "fdivl", "fdivp", "fild",
         "fildl", "fildll", "fistpl", "fistpq", "fld", "fld1", "fldcw", "fldl", "flds", "fldt",
         "fldz", "fmul", "fmuls", "fmull", "fmulp", "fnstcw", "fsqrt", "fst", "fstl", "fsts",
         "fstp", "fstpl", "fstps", "fstpt", "fsub", "fsubs", "fsubl", "fsubrp", "fucomip", "fxch",
+        // The x87 unit is the same one in both modes, so everything it does is as
+        // available to a 32-bit program as to a 64-bit one.
+        "f2xm1", "fadd", "faddp", "fcos", "fdivr", "fdivrp", "fistpll", "fisttpl", "fisttpq",
+        "fisttpll", "fldl2e", "fldl2t", "fldlg2", "fldln2", "fldpi", "fpatan", "fprem", "fprem1",
+        "fptan", "frndint", "fscale", "fsin", "fsincos", "fsubp", "fsubr", "fyl2x", "fyl2xp1",
     ];
     if PLAIN.contains(&opcode) || X87.contains(&opcode) {
         return true;
@@ -6321,9 +6325,9 @@ mod tests {
             ("fdivrp %st, %st(1)", &[0xde, 0xf9]),
             ("faddp %st, %st(3)", &[0xde, 0xc3]),
             ("fxch", &[0xd9, 0xc9]),
-            ("fistpll (%rax)", &[0xdf, 0x38]),
-            ("fisttpll (%rax)", &[0xdd, 0x08]),
-            ("fisttpl (%rax)", &[0xdb, 0x08]),
+            ("fistpll (%eax)", &[0xdf, 0x38]),
+            ("fisttpll (%eax)", &[0xdd, 0x08]),
+            ("fisttpl (%eax)", &[0xdb, 0x08]),
             ("frndint", &[0xd9, 0xfc]),
             ("fprem", &[0xd9, 0xf8]),
             ("fprem1", &[0xd9, 0xf5]),
