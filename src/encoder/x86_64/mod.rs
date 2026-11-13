@@ -1868,8 +1868,8 @@ impl X86_64Encoder {
                 }
             }
             (
-                "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "faddp" | "fsubp" | "fdivrp"
-                | "fcomi" | "fcomip" | "fucomip",
+                "fmul" | "fsub" | "fsubr" | "fadd" | "fdiv" | "fdivr" | "fmulp" | "fdivp"
+                | "fsubrp" | "faddp" | "fsubp" | "fdivrp" | "fcomi" | "fcomip" | "fucomip",
                 [src, dst],
             ) => {
                 let src = stack(src)?;
@@ -1879,6 +1879,14 @@ impl X86_64Encoder {
                     "fmul" if src == 0 => (0xdc, 0xc8 + dst),
                     "fsub" if dst == 0 => (0xd8, 0xe0 + src),
                     "fsub" if src == 0 => (0xdc, 0xe0 + dst),
+                    "fsubr" if dst == 0 => (0xd8, 0xe8 + src),
+                    "fsubr" if src == 0 => (0xdc, 0xe8 + dst),
+                    "fadd" if dst == 0 => (0xd8, 0xc0 + src),
+                    "fadd" if src == 0 => (0xdc, 0xc0 + dst),
+                    "fdiv" if dst == 0 => (0xd8, 0xf0 + src),
+                    "fdiv" if src == 0 => (0xdc, 0xf0 + dst),
+                    "fdivr" if dst == 0 => (0xd8, 0xf8 + src),
+                    "fdivr" if src == 0 => (0xdc, 0xf8 + dst),
                     "faddp" if src == 0 => (0xde, 0xc0 + dst),
                     "fmulp" if src == 0 => (0xde, 0xc8 + dst),
                     "fsubp" if src == 0 => (0xde, 0xe0 + dst),
@@ -2194,6 +2202,21 @@ impl InstructionEncoder for X86_64Encoder {
                     | "ud2"
                     | "frndint"
                     | "fprem"
+                    | "fprem1"
+                    | "fpatan"
+                    | "fsin"
+                    | "fcos"
+                    | "fptan"
+                    | "fsincos"
+                    | "fyl2x"
+                    | "fyl2xp1"
+                    | "f2xm1"
+                    | "fscale"
+                    | "fldln2"
+                    | "fldlg2"
+                    | "fldl2e"
+                    | "fldl2t"
+                    | "fldpi"
                     | "hlt"
                     | "cli"
                     | "sti"
@@ -2350,7 +2373,8 @@ impl InstructionEncoder for X86_64Encoder {
             "flds" | "fldl" | "fldt" | "fsts" | "fstl" | "fstps" | "fstpl" | "fstpt" | "fildl"
             | "fildq" | "fildll" | "fistpl" | "fistpq" | "fldcw" | "fnstcw" | "fadds" | "faddl"
             | "fmuls" | "fmull" | "fsubs" | "fsubl" | "fdivs" | "fdivl" | "fld" | "fxch"
-            | "fstp" | "fmul" | "fsub" | "fmulp" | "fdivp" | "fsubrp" | "faddp" | "fsubp"
+            | "fstp" | "fmul" | "fsub" | "fsubr" | "fadd" | "fdiv" | "fdivr" | "fmulp"
+            | "fdivp" | "fsubrp" | "faddp" | "fsubp"
             | "fdivrp" | "fistpll" | "fisttpl" | "fisttpq" | "fisttpll" | "fcomi" | "fcomip"
             | "fucomip" => {
                 code = self.emit(self.encode_x87(&opcode, &inst.operands)?);
@@ -3044,10 +3068,25 @@ impl InstructionEncoder for X86_64Encoder {
                 let enc = self.encode_sse_shift(group, digit, &inst.operands)?;
                 code = self.emit(enc);
             }
-            // The two x87 operations with no operand that the extended-precision
-            // helpers need: round to integer, and the remainder step.
+            // The x87 operations with no operand: rounding, the remainder steps,
+            // the transcendental kernels and the constants they are built on.
             "frndint" => code.extend_from_slice(&[0xd9, 0xfc]),
             "fprem" => code.extend_from_slice(&[0xd9, 0xf8]),
+            "fprem1" => code.extend_from_slice(&[0xd9, 0xf5]),
+            "fpatan" => code.extend_from_slice(&[0xd9, 0xf3]),
+            "fsin" => code.extend_from_slice(&[0xd9, 0xfe]),
+            "fcos" => code.extend_from_slice(&[0xd9, 0xff]),
+            "fptan" => code.extend_from_slice(&[0xd9, 0xf2]),
+            "fsincos" => code.extend_from_slice(&[0xd9, 0xfb]),
+            "fyl2x" => code.extend_from_slice(&[0xd9, 0xf1]),
+            "fyl2xp1" => code.extend_from_slice(&[0xd9, 0xf9]),
+            "f2xm1" => code.extend_from_slice(&[0xd9, 0xf0]),
+            "fscale" => code.extend_from_slice(&[0xd9, 0xfd]),
+            "fldln2" => code.extend_from_slice(&[0xd9, 0xed]),
+            "fldlg2" => code.extend_from_slice(&[0xd9, 0xec]),
+            "fldl2e" => code.extend_from_slice(&[0xd9, 0xea]),
+            "fldl2t" => code.extend_from_slice(&[0xd9, 0xe9]),
+            "fldpi" => code.extend_from_slice(&[0xd9, 0xeb]),
             "cwtl" => code.push(0x98),
             "ud2" => code.extend_from_slice(&[0x0f, 0x0b]),
             // The instructions that stop, wait or trap, which is what a naked body
@@ -6287,6 +6326,22 @@ mod tests {
             ("fisttpl (%rax)", &[0xdb, 0x08]),
             ("frndint", &[0xd9, 0xfc]),
             ("fprem", &[0xd9, 0xf8]),
+            ("fprem1", &[0xd9, 0xf5]),
+            ("fpatan", &[0xd9, 0xf3]),
+            ("fsin", &[0xd9, 0xfe]),
+            ("fcos", &[0xd9, 0xff]),
+            ("fptan", &[0xd9, 0xf2]),
+            ("fsincos", &[0xd9, 0xfb]),
+            ("fyl2x", &[0xd9, 0xf1]),
+            ("fyl2xp1", &[0xd9, 0xf9]),
+            ("f2xm1", &[0xd9, 0xf0]),
+            ("fscale", &[0xd9, 0xfd]),
+            ("fldln2", &[0xd9, 0xed]),
+            ("fldlg2", &[0xd9, 0xec]),
+            ("fldl2e", &[0xd9, 0xea]),
+            ("fldl2t", &[0xd9, 0xe9]),
+            ("fldpi", &[0xd9, 0xeb]),
+            ("fsubr %st(0), %st(1)", &[0xdc, 0xe9]),
             ("hlt", &[0xf4]),
             ("cli", &[0xfa]),
             ("sti", &[0xfb]),
