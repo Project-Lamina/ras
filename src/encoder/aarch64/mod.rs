@@ -3928,6 +3928,8 @@ mod tests {
                 variadic_fixed: None,
                 ret: Some(v(1)),
                 ret_ty: Some(I64),
+                ret_aggregate: None,
+                arg_aggregates: vec![None],
             });
             ret(&mut entry, 1);
             let mut main = Function::new(Signature::new("main").with_return(I64));
@@ -4737,11 +4739,13 @@ mod tests {
             let mut entry = Block::new("entry");
             entry.push(Instruction::CallIndirect {
                 target: reg(0),
+                arg_aggregates: vec![None; args.len()],
                 arg_types,
                 args,
                 variadic_fixed: None,
                 ret: Some(v(1)),
                 ret_ty: Some(I64),
+                ret_aggregate: None,
             });
             ret(&mut entry, 1);
             let mut main = Function::new(
@@ -4825,6 +4829,8 @@ mod tests {
                 variadic_fixed: None,
                 ret: Some(v(1)),
                 ret_ty: Some(I64),
+                ret_aggregate: None,
+                arg_aggregates: vec![None, None],
             });
             ret(&mut entry, 1);
             let mut main = Function::new(Signature::new("main").with_return(I64));
@@ -5648,11 +5654,13 @@ mod tests {
             let mut entry = Block::new("entry");
             entry.push(Instruction::CallIndirect {
                 target: reg(0),
+                arg_aggregates: vec![None; args.len()],
                 arg_types,
                 args,
                 variadic_fixed: None,
                 ret: Some(v(1)),
                 ret_ty: Some(ret_ty),
+                ret_aggregate: None,
             });
             ret(&mut entry, 1);
             let mut main = Function::new(
@@ -5783,6 +5791,8 @@ mod tests {
                     variadic_fixed: None,
                     ret: Some(v(1)),
                     ret_ty: Some(F64_TY),
+                    ret_aggregate: None,
+                    arg_aggregates: vec![None],
                 });
                 entry.push(Instruction::Bitcast {
                     from: F64_TY,
@@ -5861,6 +5871,8 @@ mod tests {
                     variadic_fixed: None,
                     ret: Some(v(1)),
                     ret_ty: Some(ty),
+                    ret_aggregate: None,
+                    arg_aggregates: vec![],
                 });
                 ret(&mut entry, 1);
                 let mut main = Function::new(Signature::new("main").with_return(I64));
