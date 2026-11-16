@@ -400,7 +400,9 @@ mod jit_host_exec_tests {
     use lamina_mir::{
         block::Block,
         function::{Function, Parameter, Signature},
-        instruction::{Immediate, Instruction, IntBinOp, IntCmpOp, Operand},
+        instruction::{
+            FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp, IntCmpOp, Operand,
+        },
         module::Module,
         register::{Register, VirtualReg},
         types::{MirType, ScalarType},
@@ -607,7 +609,9 @@ mod jit_host_exec_tests {
             })
             .collect();
         let out = Register::Virtual(VirtualReg::gpr(param_tys.len() as u32));
-        let sig = Signature::new("mixed").with_params(params).with_return(i64_ty);
+        let sig = Signature::new("mixed")
+            .with_params(params)
+            .with_return(i64_ty);
         let mut f = Function::new(sig);
         let mut entry = Block::new("entry");
         entry.push(Instruction::IntBinary {
@@ -626,12 +630,219 @@ mod jit_host_exec_tests {
         module
     }
 
+    fn module_with_body(
+        name: &str,
+        params: &[ScalarType],
+        ret: ScalarType,
+        body: impl FnOnce(&[Operand], Register) -> Instruction,
+    ) -> Module {
+        let param_regs: Vec<Register> = (0..params.len())
+            .map(|i| Register::Virtual(VirtualReg::gpr(i as u32)))
+            .collect();
+        let out = Register::Virtual(VirtualReg::gpr(params.len() as u32));
+        let sig = Signature::new(name)
+            .with_params(
+                param_regs
+                    .iter()
+                    .zip(params)
+                    .map(|(r, t)| Parameter::new(r.clone(), MirType::Scalar(*t)))
+                    .collect(),
+            )
+            .with_return(MirType::Scalar(ret));
+        let operands: Vec<Operand> = param_regs.into_iter().map(Operand::Register).collect();
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(body(&operands, out.clone()));
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(out)),
+        });
+        f.add_block(entry);
+        let mut module = Module::new(name);
+        module.add_function(f);
+        module
+    }
+
+    fn jit_host_entry<F: Copy>(module: &Module) -> Option<(ExecutableMemory, F)> {
+        let (arch, os) = host_jit_pair()?;
+        let mem = compile_to_executable(arch, os, module).expect("compile");
+        let f = unsafe { mem.entry_fn::<F>() };
+        Some((mem, f))
+    }
+
+    #[test]
+    fn jit_host_exec_f64_return_passes_through() {
+        let module = module_with_body("f64_id", &[ScalarType::F64], ScalarType::F64, |p, out| {
+            Instruction::Copy {
+                ty: MirType::Scalar(ScalarType::F64),
+                dst: out,
+                src: p[0].clone(),
+            }
+        });
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(f64) -> f64>(&module) else {
+            return;
+        };
+        assert_eq!(f(2.5), 2.5);
+    }
+
+    #[test]
+    fn jit_host_exec_f64_arithmetic_on_params() {
+        let ops = [
+            (FloatBinOp::FAdd, 14.0),
+            (FloatBinOp::FSub, 6.0),
+            (FloatBinOp::FMul, 40.0),
+            (FloatBinOp::FDiv, 2.5),
+        ];
+        for (op, expected) in ops {
+            let module = module_with_body(
+                "f64_bin",
+                &[ScalarType::F64; 2],
+                ScalarType::F64,
+                |p, out| Instruction::FloatBinary {
+                    op,
+                    ty: MirType::Scalar(ScalarType::F64),
+                    dst: out,
+                    lhs: p[0].clone(),
+                    rhs: p[1].clone(),
+                },
+            );
+            let Some((_mem, f)) = jit_host_entry::<extern "C" fn(f64, f64) -> f64>(&module) else {
+                return;
+            };
+            assert_eq!(f(10.0, 4.0), expected, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn jit_host_exec_f32_add_on_params() {
+        let module = module_with_body(
+            "f32_add",
+            &[ScalarType::F32; 2],
+            ScalarType::F32,
+            |p, out| Instruction::FloatBinary {
+                op: FloatBinOp::FAdd,
+                ty: MirType::Scalar(ScalarType::F32),
+                dst: out,
+                lhs: p[0].clone(),
+                rhs: p[1].clone(),
+            },
+        );
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(f32, f32) -> f32>(&module) else {
+            return;
+        };
+        assert_eq!(f(1.5, 0.25), 1.75);
+    }
+
+    #[test]
+    fn jit_host_exec_f64_neg_and_sqrt() {
+        let neg = module_with_body("f64_neg", &[ScalarType::F64], ScalarType::F64, |p, out| {
+            Instruction::FloatUnary {
+                op: FloatUnOp::FNeg,
+                ty: MirType::Scalar(ScalarType::F64),
+                dst: out,
+                src: p[0].clone(),
+            }
+        });
+        let sqrt = module_with_body("f64_sqrt", &[ScalarType::F64], ScalarType::F64, |p, out| {
+            Instruction::FloatUnary {
+                op: FloatUnOp::FSqrt,
+                ty: MirType::Scalar(ScalarType::F64),
+                dst: out,
+                src: p[0].clone(),
+            }
+        });
+        let Some((_m1, f)) = jit_host_entry::<extern "C" fn(f64) -> f64>(&neg) else {
+            return;
+        };
+        assert_eq!(f(3.0), -3.0);
+        let Some((_m2, g)) = jit_host_entry::<extern "C" fn(f64) -> f64>(&sqrt) else {
+            return;
+        };
+        assert_eq!(g(16.0), 4.0);
+    }
+
+    #[test]
+    fn jit_host_exec_f64_compare_is_false_on_nan_except_ne() {
+        let cases: [(FloatCmpOp, f64, f64, i32); 7] = [
+            (FloatCmpOp::Lt, 1.0, 2.0, 1),
+            (FloatCmpOp::Le, 2.0, 2.0, 1),
+            (FloatCmpOp::Gt, 3.0, 2.0, 1),
+            (FloatCmpOp::Ge, 1.0, 2.0, 0),
+            (FloatCmpOp::Eq, f64::NAN, f64::NAN, 0),
+            (FloatCmpOp::Ne, f64::NAN, f64::NAN, 1),
+            (FloatCmpOp::Lt, f64::NAN, 1.0, 0),
+        ];
+        for (op, a, b, expected) in cases {
+            let module = module_with_body(
+                "f64_cmp",
+                &[ScalarType::F64; 2],
+                ScalarType::I32,
+                |p, out| Instruction::FloatCmp {
+                    op,
+                    ty: MirType::Scalar(ScalarType::F64),
+                    dst: out,
+                    lhs: p[0].clone(),
+                    rhs: p[1].clone(),
+                },
+            );
+            let Some((_mem, f)) = jit_host_entry::<extern "C" fn(f64, f64) -> i32>(&module) else {
+                return;
+            };
+            assert_eq!(f(a, b), expected, "{op:?} {a} {b}");
+        }
+    }
+
+    #[test]
+    fn jit_host_exec_float_width_and_int_conversions() {
+        let widen = module_with_body("widen", &[ScalarType::F32], ScalarType::F64, |p, out| {
+            Instruction::FloatConvert {
+                from: MirType::Scalar(ScalarType::F32),
+                to: MirType::Scalar(ScalarType::F64),
+                dst: out,
+                src: p[0].clone(),
+            }
+        });
+        let Some((_m1, f)) = jit_host_entry::<extern "C" fn(f32) -> f64>(&widen) else {
+            return;
+        };
+        assert_eq!(f(1.5), 1.5);
+
+        let to_float =
+            module_with_body("to_float", &[ScalarType::I64], ScalarType::F64, |p, out| {
+                Instruction::IntToFloat {
+                    from: MirType::Scalar(ScalarType::I64),
+                    to: MirType::Scalar(ScalarType::F64),
+                    signed: true,
+                    dst: out,
+                    src: p[0].clone(),
+                }
+            });
+        let Some((_m2, g)) = jit_host_entry::<extern "C" fn(i64) -> f64>(&to_float) else {
+            return;
+        };
+        assert_eq!(g(-7), -7.0);
+
+        let to_int = module_with_body("to_int", &[ScalarType::F64], ScalarType::I64, |p, out| {
+            Instruction::FloatToInt {
+                from: MirType::Scalar(ScalarType::F64),
+                to: MirType::Scalar(ScalarType::I64),
+                signed: true,
+                dst: out,
+                src: p[0].clone(),
+            }
+        });
+        let Some((_m3, h)) = jit_host_entry::<extern "C" fn(f64) -> i64>(&to_int) else {
+            return;
+        };
+        assert_eq!(h(-7.9), -7);
+    }
+
     #[test]
     fn jit_host_exec_ints_after_leading_float_param() {
         let Some((arch, os)) = host_jit_pair() else {
             return;
         };
-        let module = module_params_added(&[ScalarType::F64, ScalarType::I64, ScalarType::I64], 1, 2);
+        let module =
+            module_params_added(&[ScalarType::F64, ScalarType::I64, ScalarType::I64], 1, 2);
         let mem = compile_to_executable(arch, os, &module).expect("compile");
         let f = unsafe { mem.entry_fn::<extern "C" fn(f64, i64, i64) -> i64>() };
         assert_eq!(f(0.5, 7, 35), 42);
@@ -642,7 +853,8 @@ mod jit_host_exec_tests {
         let Some((arch, os)) = host_jit_pair() else {
             return;
         };
-        let module = module_params_added(&[ScalarType::I64, ScalarType::F64, ScalarType::I64], 0, 2);
+        let module =
+            module_params_added(&[ScalarType::I64, ScalarType::F64, ScalarType::I64], 0, 2);
         let mem = compile_to_executable(arch, os, &module).expect("compile");
         let f = unsafe { mem.entry_fn::<extern "C" fn(i64, f64, i64) -> i64>() };
         assert_eq!(f(7, 0.5, 35), 42);
