@@ -403,7 +403,7 @@ mod jit_host_exec_tests {
         function::{Function, Parameter, Signature},
         instruction::{
             AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp,
-            IntCmpOp, MemoryAttrs, Operand,
+            IntCmpOp, IntOverflowOp, MemoryAttrs, Operand,
         },
         module::Module,
         register::{Register, VirtualReg},
@@ -1076,6 +1076,87 @@ mod jit_host_exec_tests {
         assert_eq!(f(-1e30), i64::MIN);
         assert_eq!(f(f64::NAN), 0);
         assert_eq!(f(-7.9), -7);
+    }
+
+    fn overflow_module(
+        op: IntOverflowOp,
+        ty: ScalarType,
+        signed: bool,
+        params: &[ScalarType],
+    ) -> Module {
+        module_with_body("overflow", params, ScalarType::I64, |p, out| {
+            Instruction::IntOverflow {
+                op,
+                ty: MirType::Scalar(ty),
+                signed,
+                dst: out,
+                lhs: p[0].clone(),
+                rhs: p[1].clone(),
+            }
+        })
+    }
+
+    #[test]
+    fn jit_host_exec_signed_narrow_overflow_flags() {
+        use IntOverflowOp::{Add, Mul, Sub};
+        let i8_2 = [ScalarType::I8, ScalarType::I8];
+        let m = overflow_module(Add, ScalarType::I8, true, &i8_2);
+        let Some((_m1, f)) = jit_host_entry::<extern "C" fn(i8, i8) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(f(100, 100), 1);
+        assert_eq!(f(100, 27), 0);
+        let m = overflow_module(Sub, ScalarType::I8, true, &i8_2);
+        let Some((_m2, g)) = jit_host_entry::<extern "C" fn(i8, i8) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(g(-128, 1), 1);
+        assert_eq!(g(-100, 27), 0);
+        let i32_2 = [ScalarType::I32, ScalarType::I32];
+        let m = overflow_module(Mul, ScalarType::I32, true, &i32_2);
+        let Some((_m3, h)) = jit_host_entry::<extern "C" fn(i32, i32) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(h(65536, 65536), 1);
+        assert_eq!(h(65536, 2), 0);
+    }
+
+    #[test]
+    fn jit_host_exec_unsigned_overflow_flags() {
+        use IntOverflowOp::{Add, Mul, Sub};
+        let i8_2 = [ScalarType::I8, ScalarType::I8];
+        let m = overflow_module(Add, ScalarType::I8, false, &i8_2);
+        let Some((_m1, f)) = jit_host_entry::<extern "C" fn(u8, u8) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(f(200, 100), 1);
+        assert_eq!(f(200, 55), 0);
+        let m = overflow_module(Sub, ScalarType::I8, false, &i8_2);
+        let Some((_m2, g)) = jit_host_entry::<extern "C" fn(u8, u8) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(g(1, 2), 1);
+        assert_eq!(g(5, 2), 0);
+        let i16_2 = [ScalarType::I16, ScalarType::I16];
+        let m = overflow_module(Mul, ScalarType::I16, false, &i16_2);
+        let Some((_m3, h)) = jit_host_entry::<extern "C" fn(u16, u16) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(h(300, 300), 1);
+        assert_eq!(h(255, 255), 0);
+        let i64_2 = [ScalarType::I64, ScalarType::I64];
+        let m = overflow_module(Add, ScalarType::I64, true, &i64_2);
+        let Some((_m4, k)) = jit_host_entry::<extern "C" fn(i64, i64) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(k(i64::MAX, 1), 1);
+        assert_eq!(k(i64::MAX, -1), 0);
+        let m = overflow_module(Mul, ScalarType::I64, false, &i64_2);
+        let Some((_m5, u)) = jit_host_entry::<extern "C" fn(u64, u64) -> i64>(&m) else {
+            return;
+        };
+        assert_eq!(u(1 << 32, 1 << 32), 1);
+        assert_eq!(u(1 << 32, 3), 0);
     }
 
     #[test]
