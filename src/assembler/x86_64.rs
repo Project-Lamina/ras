@@ -28,7 +28,13 @@ pub fn compile_mir_x86_64_function(
         .filter(|(_, f)| !f.blocks.is_empty())
         .map(|(name, _)| name.clone())
         .collect();
-    let mut call_fixups: Vec<(usize, String)> = Vec::new();
+    let mut image_fixups: Vec<(usize, ImageTarget)> = Vec::new();
+    let defined_globals: HashSet<String> = module
+        .globals
+        .iter()
+        .filter(|(_, g)| !g.is_extern && g.thread_local.is_none())
+        .map(|(name, _)| name.clone())
+        .collect();
 
     let functions_to_compile: Vec<(String, &lamina_mir::Function)> =
         if let Some(name) = function_name {
@@ -163,6 +169,7 @@ pub fn compile_mir_x86_64_function(
             windows,
             gp_arg_regs: abi.arg_registers(),
             internal: &internal_names,
+            defined_globals: &defined_globals,
         };
 
         let prologue = encode_prologue_x86_64(aligned_stack_size as u32)?;
@@ -247,7 +254,15 @@ pub fn compile_mir_x86_64_function(
 
         for (at, label) in fixups {
             if let Some(callee) = label.strip_prefix(CALL_LABEL_PREFIX) {
-                call_fixups.push((at, callee.to_string()));
+                image_fixups.push((at, ImageTarget::Code(callee.to_string())));
+                continue;
+            }
+            if let Some(callee) = label.strip_prefix(FUNC_LABEL_PREFIX) {
+                image_fixups.push((at, ImageTarget::Code(callee.to_string())));
+                continue;
+            }
+            if let Some(global) = label.strip_prefix(DATA_LABEL_PREFIX) {
+                image_fixups.push((at, ImageTarget::Data(global.to_string())));
                 continue;
             }
             let target = *labels.get(&label).ok_or_else(|| {
@@ -260,17 +275,122 @@ pub fn compile_mir_x86_64_function(
         }
     }
 
-    for (at, callee) in call_fixups {
-        let target = *function_offsets.get(&callee).ok_or_else(|| {
+    let (data_offsets, image) = lay_out_globals(&mut code, module, &function_offsets)?;
+
+    for (at, target) in image_fixups {
+        let (table, name) = match &target {
+            ImageTarget::Code(name) => (&function_offsets, name),
+            ImageTarget::Data(name) => (&data_offsets, name),
+        };
+        let offset = *table.get(name).ok_or_else(|| {
             RasError::EncodingError(format!(
-                "x86_64 JIT encoder: call to function '{}' not in the module",
-                callee
+                "x86_64 JIT encoder: reference to '{}' not in the module",
+                name
             ))
         })?;
-        patch_rel32(&mut code, at, target);
+        patch_rel32(&mut code, at, offset);
     }
 
+    assembler.jit_image = Some(image);
     Ok((code, function_offsets))
+}
+
+const PAGE_SIZE: usize = 4096;
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.div_ceil(align.max(1)) * align.max(1)
+}
+
+/// Appends the module's global objects to the image, read-only ones first, each on its
+/// own alignment and the two sections on separate pages. Returns the data offsets by
+/// global name and the pointer-sized values the loader must write.
+fn place_global<'g>(
+    code: &mut Vec<u8>,
+    offsets: &mut HashMap<String, usize>,
+    placed: &mut Vec<(usize, &'g lamina_mir::Global)>,
+    name: &str,
+    global: &'g lamina_mir::Global,
+) {
+    let offset = align_up(code.len(), global.align);
+    code.resize(offset, 0);
+    let init = global.initializer.as_deref().unwrap_or(&[]);
+    code.extend_from_slice(init);
+    code.resize(offset + global.size.max(init.len()), 0);
+    offsets.insert(name.to_string(), offset);
+    placed.push((offset, global));
+}
+
+fn lay_out_globals(
+    code: &mut Vec<u8>,
+    module: &lamina_mir::Module,
+    function_offsets: &HashMap<String, usize>,
+) -> Result<(HashMap<String, usize>, JitImage), RasError> {
+    let mut globals: Vec<(&String, &lamina_mir::Global)> = module
+        .globals
+        .iter()
+        .filter(|(_, g)| !g.is_extern && g.thread_local.is_none())
+        .collect();
+    globals.sort_by(|a, b| a.0.cmp(b.0));
+    if globals.is_empty() {
+        return Ok((
+            HashMap::new(),
+            JitImage {
+                writable_start: code.len(),
+                relocs: Vec::new(),
+            },
+        ));
+    }
+    let (readonly, writable): (Vec<_>, Vec<_>) = globals.into_iter().partition(|(_, g)| !g.mutable);
+
+    code.resize(align_up(code.len(), PAGE_SIZE), 0);
+    let mut data_offsets: HashMap<String, usize> = HashMap::new();
+    let mut placed: Vec<(usize, &lamina_mir::Global)> = Vec::new();
+    for (name, global) in &readonly {
+        place_global(code, &mut data_offsets, &mut placed, name, global);
+    }
+    code.resize(align_up(code.len(), PAGE_SIZE), 0);
+    let writable_start = code.len();
+    for (name, global) in &writable {
+        place_global(code, &mut data_offsets, &mut placed, name, global);
+    }
+    code.resize(align_up(code.len(), PAGE_SIZE), 0);
+
+    let mut image = JitImage {
+        writable_start,
+        relocs: Vec::new(),
+    };
+    for (offset, global) in placed {
+        for reloc in &global.relocations {
+            let at = offset + reloc.offset;
+            let bare = reloc.symbol.trim_start_matches('@');
+            let target = if let Some(key) =
+                name_variants(&reloc.symbol).find(|candidate| data_offsets.contains_key(candidate))
+            {
+                data_offsets[&key]
+            } else if let Some(key) = name_variants(&reloc.symbol)
+                .find(|candidate| function_offsets.contains_key(candidate))
+            {
+                function_offsets[&key]
+            } else if let Some(addr) = resolve_host_symbol(bare) {
+                let value = (addr as i64).wrapping_add(reloc.addend) as u64;
+                let bytes = value.to_le_bytes();
+                code[at..at + reloc.size].copy_from_slice(&bytes[..reloc.size]);
+                continue;
+            } else {
+                return Err(RasError::EncodingError(format!(
+                    "x86_64 JIT encoder: global initializer refers to unknown symbol '{}'",
+                    reloc.symbol
+                )));
+            };
+            image.relocs.push(JitDataReloc {
+                at,
+                target,
+                addend: reloc.addend,
+                size: reloc.size,
+            });
+        }
+    }
+    Ok((data_offsets, image))
 }
 
 /// Label of the shared epilogue that every `ret` jumps to.
@@ -279,11 +399,37 @@ const EXIT_LABEL: &str = "\u{0}exit";
 /// Prefix of the fixup labels that name a function to call. Such fixups resolve
 /// against the start of every function in the module, not the current one.
 const CALL_LABEL_PREFIX: &str = "\u{1}call:";
+const FUNC_LABEL_PREFIX: &str = "\u{1}func:";
+const DATA_LABEL_PREFIX: &str = "\u{1}data:";
 
 struct CallEnv<'a> {
     windows: bool,
     gp_arg_regs: &'static [&'static str],
     internal: &'a HashSet<String>,
+    defined_globals: &'a HashSet<String>,
+}
+
+/// A symbol the image resolves once every function and data object has an offset.
+enum ImageTarget {
+    Code(String),
+    Data(String),
+}
+
+/// A pointer-sized value written into the mapped image once its base address is known.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JitDataReloc {
+    pub(crate) at: usize,
+    pub(crate) target: usize,
+    pub(crate) addend: i64,
+    pub(crate) size: usize,
+}
+
+/// Where the data section of a JIT image starts, and what it must patch at load time.
+/// Code and read-only data come first; from `writable_start` on the pages stay writable.
+#[derive(Debug, Default)]
+pub(crate) struct JitImage {
+    pub(crate) writable_start: usize,
+    pub(crate) relocs: Vec<JitDataReloc>,
 }
 
 impl CallEnv<'_> {
@@ -292,14 +438,17 @@ impl CallEnv<'_> {
     }
 
     fn internal_name(&self, name: &str) -> Option<String> {
-        [
-            name.to_string(),
-            name.trim_start_matches('@').to_string(),
-            format!("@{}", name.trim_start_matches('@')),
-        ]
-        .into_iter()
-        .find(|candidate| self.internal.contains(candidate))
+        name_variants(name).find(|candidate| self.internal.contains(candidate))
     }
+
+    fn global_name(&self, name: &str) -> Option<String> {
+        name_variants(name).find(|candidate| self.defined_globals.contains(candidate))
+    }
+}
+
+fn name_variants(name: &str) -> impl Iterator<Item = String> + '_ {
+    let bare = name.trim_start_matches('@');
+    [name.to_string(), bare.to_string(), format!("@{bare}")].into_iter()
 }
 
 fn is_lamina_io_intrinsic(name: &str, args: &[lamina_mir::Operand]) -> bool {
@@ -1531,6 +1680,32 @@ fn encode_mir_instruction_x86_64(
                 code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x0F, 0x95, 0xC0]);
             }
             code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::SymbolAddress { dst, symbol } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for SymbolAddress not supported".into(),
+                ));
+            };
+            if let Some(global) = calls.global_name(symbol) {
+                code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                push_rel32(&mut code, fixups, &format!("{DATA_LABEL_PREFIX}{global}"));
+            } else if let Some(function) = calls.internal_name(symbol) {
+                code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                push_rel32(&mut code, fixups, &format!("{FUNC_LABEL_PREFIX}{function}"));
+            } else {
+                let addr =
+                    resolve_host_symbol(symbol.trim_start_matches('@')).ok_or_else(|| {
+                        RasError::EncodingError(format!(
+                            "x86_64 JIT encoder: cannot resolve symbol '{}' in this process",
+                            symbol
+                        ))
+                    })?;
+                code.extend_from_slice(&[0x48, 0xB8]);
+                code.extend_from_slice(&(addr as u64).to_le_bytes());
+            }
             code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
         }

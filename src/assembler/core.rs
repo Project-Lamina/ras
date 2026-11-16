@@ -142,6 +142,9 @@ pub struct RasAssembler {
     /// Module being compiled, used to tell internal calls from external ones.
     #[cfg(feature = "encoder")]
     pub(crate) current_module: Option<*const lamina_mir::Module>,
+    /// Data layout and load-time relocations of the last JIT image compiled for x86_64.
+    #[cfg(feature = "encoder")]
+    pub(crate) jit_image: Option<crate::assembler::x86_64::JitImage>,
 }
 
 enum PatchPoint {
@@ -293,6 +296,8 @@ impl RasAssembler {
             function_pointers: HashMap::new(),
             #[cfg(feature = "encoder")]
             current_module: None,
+            #[cfg(feature = "encoder")]
+            jit_image: None,
         })
     }
 
@@ -2518,6 +2523,7 @@ impl RasAssembler {
         function_name: Option<&str>,
     ) -> Result<(Vec<u8>, std::collections::HashMap<String, usize>), RasError> {
         self.current_module = Some(module);
+        self.jit_image = None;
         match self.target_arch {
             TargetArchitecture::X86_64 => {
                 crate::assembler::x86_64::compile_mir_x86_64_function(self, module, function_name)
