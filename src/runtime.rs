@@ -203,6 +203,62 @@ impl ExecutableMemory {
         Ok(mem)
     }
 
+    /// Writes `bytes` at `offset`, for load-time values of a JIT image. Call before
+    /// `make_executable`, while the mapping is still writable.
+    pub(crate) fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<(), RasError> {
+        if offset
+            .checked_add(bytes.len())
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(RasError::IoError(
+                "JIT image patch out of range".to_string(),
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), bytes.len());
+        }
+        Ok(())
+    }
+
+    /// Makes the pages from `offset` to the end readable and writable, not executable.
+    /// `offset` must be a page boundary.
+    pub(crate) fn make_writable_from(&mut self, offset: usize) -> Result<(), RasError> {
+        if offset >= self.size {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use libc::{PROT_READ, PROT_WRITE, mprotect};
+            let result = unsafe {
+                mprotect(
+                    self.ptr.add(offset).cast(),
+                    self.size - offset,
+                    PROT_READ | PROT_WRITE,
+                )
+            };
+            if result != 0 {
+                return Err(RasError::IoError("mprotect failed".to_string()));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use crate::runtime::windows_memory::{PAGE_READWRITE, VirtualProtect};
+            let mut old_protect = 0;
+            let result = unsafe {
+                VirtualProtect(
+                    self.ptr.add(offset).cast(),
+                    self.size - offset,
+                    PAGE_READWRITE,
+                    &mut old_protect,
+                )
+            };
+            if result == 0 {
+                return Err(RasError::IoError("VirtualProtect failed".to_string()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_code(&mut self, code: &[u8]) -> Result<(), RasError> {
         if code.len() > self.size {
             return Err(RasError::IoError("Code too large".to_string()));
@@ -331,17 +387,37 @@ impl RasRuntime {
         Ok(f)
     }
 
+    /// Compiles every function and global of `module` into one mapping and returns it with
+    /// the offset of each function from its start.
+    ///
+    /// Read-only data is mapped with the code. Writable globals sit on their own pages,
+    /// which stay writable after the mapping is made executable.
     #[cfg(feature = "encoder")]
-    fn compile_with_offsets(
+    pub fn compile_with_offsets(
         &mut self,
         module: &MirModule,
     ) -> Result<(ExecutableMemory, HashMap<String, usize>), RasError> {
         let mut assembler = RasAssembler::new(self.target_arch, self.target_os)?;
         let (code, offsets) = assembler.compile_mir_to_binary_function(module, None)?;
+        let image = assembler.jit_image.take();
 
         let mut mem = ExecutableMemory::allocate_writable(code.len())?;
         mem.write_code(&code)?;
+        if let Some(image) = &image {
+            let base = mem.code_start() as usize as i64;
+            for reloc in &image.relocs {
+                let value = base
+                    .wrapping_add(reloc.target as i64)
+                    .wrapping_add(reloc.addend) as u64;
+                mem.patch(reloc.at, &value.to_le_bytes()[..reloc.size])?;
+            }
+        }
         mem.make_executable()?;
+        if let Some(image) = &image
+            && image.writable_start < code.len()
+        {
+            mem.make_writable_from(image.writable_start)?;
+        }
 
         Ok((mem, offsets))
     }
@@ -410,7 +486,8 @@ mod jit_host_exec_tests {
         types::{MirType, ScalarType},
     };
     use lamina_platform::{
-        TargetArchitecture, TargetOperatingSystem, detect_host_architecture_only, detect_host_os,
+        PointerWidth, TargetArchitecture, TargetOperatingSystem, detect_host_architecture_only,
+        detect_host_os,
     };
 
     use crate::{
@@ -1159,6 +1236,219 @@ mod jit_host_exec_tests {
         assert_eq!(u(1 << 32, 3), 0);
     }
 
+    fn global_object(
+        name: &str,
+        ty: ScalarType,
+        bytes: Vec<u8>,
+        mutable: bool,
+    ) -> lamina_mir::Global {
+        let mut g = lamina_mir::Global::new(name, MirType::Scalar(ty), PointerWidth::Bits64);
+        g.size = bytes.len().max(8);
+        g.mutable = mutable;
+        g.initializer = Some(bytes);
+        g
+    }
+
+    fn module_with_global(global: lamina_mir::Global, function: Function) -> Module {
+        let mut module = Module::new("data");
+        module.globals.insert(global.name.clone(), global);
+        module.add_function(function);
+        module
+    }
+
+    #[test]
+    fn jit_host_exec_writable_global_stores_and_loads() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let f = function_with_body(
+            "store_then_load",
+            &[],
+            ScalarType::I64,
+            vec![
+                Instruction::SymbolAddress {
+                    dst: vreg(0),
+                    symbol: "counter".into(),
+                },
+                Instruction::Store {
+                    ty: i64_ty,
+                    src: ii64(35),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        offset: 0,
+                    },
+                    attrs: MemoryAttrs::default(),
+                },
+                Instruction::Load {
+                    ty: i64_ty,
+                    dst: vreg(1),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        offset: 0,
+                    },
+                    attrs: MemoryAttrs::default(),
+                },
+                Instruction::IntBinary {
+                    op: IntBinOp::Add,
+                    ty: i64_ty,
+                    dst: vreg(2),
+                    lhs: reg_op(1),
+                    rhs: ii64(7),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let module = module_with_global(
+            global_object(
+                "counter",
+                ScalarType::I64,
+                0i64.to_le_bytes().to_vec(),
+                true,
+            ),
+            f,
+        );
+        let Some((_mem, g)) =
+            jit_host_entry_named::<extern "C" fn() -> i64>(&module, "store_then_load")
+        else {
+            return;
+        };
+        assert_eq!(g(), 42);
+    }
+
+    #[test]
+    fn jit_host_exec_readonly_string_is_read_from_the_image() {
+        let f = function_with_body(
+            "second_byte",
+            &[],
+            ScalarType::I8,
+            vec![
+                Instruction::SymbolAddress {
+                    dst: vreg(0),
+                    symbol: "msg".into(),
+                },
+                Instruction::Load {
+                    ty: MirType::Scalar(ScalarType::I8),
+                    dst: vreg(1),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        offset: 1,
+                    },
+                    attrs: MemoryAttrs::default(),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let module = module_with_global(
+            global_object("msg", ScalarType::I8, b"hi\0".to_vec(), false),
+            f,
+        );
+        let Some((_mem, g)) = jit_host_entry_named::<extern "C" fn() -> i8>(&module, "second_byte")
+        else {
+            return;
+        };
+        assert_eq!(g(), b'i' as i8);
+    }
+
+    #[test]
+    fn jit_host_exec_global_pointer_follows_relocation() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let ptr_ty = MirType::Scalar(ScalarType::Ptr);
+        let f = function_with_body(
+            "through_pointer",
+            &[],
+            ScalarType::I64,
+            vec![
+                Instruction::SymbolAddress {
+                    dst: vreg(0),
+                    symbol: "slot".into(),
+                },
+                Instruction::Load {
+                    ty: ptr_ty,
+                    dst: vreg(1),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        offset: 0,
+                    },
+                    attrs: MemoryAttrs::default(),
+                },
+                Instruction::Load {
+                    ty: i64_ty,
+                    dst: vreg(2),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(1),
+                        offset: 0,
+                    },
+                    attrs: MemoryAttrs::default(),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut slot = global_object("slot", ScalarType::Ptr, vec![0; 8], true);
+        slot.relocations.push(lamina_mir::GlobalRelocation {
+            offset: 0,
+            symbol: "answer".into(),
+            addend: 0,
+            size: 8,
+        });
+        let mut module = module_with_global(slot, f);
+        module.globals.insert(
+            "answer".into(),
+            global_object(
+                "answer",
+                ScalarType::I64,
+                42i64.to_le_bytes().to_vec(),
+                false,
+            ),
+        );
+        let Some((_mem, g)) =
+            jit_host_entry_named::<extern "C" fn() -> i64>(&module, "through_pointer")
+        else {
+            return;
+        };
+        assert_eq!(g(), 42);
+    }
+
+    #[test]
+    fn jit_host_exec_external_symbol_address_is_nonzero() {
+        let f = function_with_body(
+            "has_llabs",
+            &[],
+            ScalarType::I64,
+            vec![
+                Instruction::SymbolAddress {
+                    dst: vreg(0),
+                    symbol: "llabs".into(),
+                },
+                Instruction::IntCmp {
+                    op: IntCmpOp::Ne,
+                    ty: MirType::Scalar(ScalarType::I64),
+                    dst: vreg(1),
+                    lhs: reg_op(0),
+                    rhs: ii64(0),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let mut module = Module::new("symbols");
+        module.add_function(f);
+        let Some((_mem, g)) = jit_host_entry_named::<extern "C" fn() -> i64>(&module, "has_llabs")
+        else {
+            return;
+        };
+        assert_eq!(g(), 1);
+    }
+
     #[test]
     fn jit_host_exec_stack_region_round_trips_words() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
@@ -1226,13 +1516,9 @@ mod jit_host_exec_tests {
 
     fn jit_host_entry_named<F: Copy>(module: &Module, name: &str) -> Option<(ExecutableMemory, F)> {
         let (arch, os) = host_jit_pair()?;
-        let mut asm = RasAssembler::new(arch, os).expect("assembler");
-        let (code, offsets) = asm
-            .compile_mir_to_binary_function(module, None)
+        let (mem, offsets) = RasRuntime::new(arch, os)
+            .compile_with_offsets(module)
             .expect("compile");
-        let mut mem = ExecutableMemory::allocate_writable(code.len()).expect("alloc");
-        mem.write_code(&code).expect("write");
-        mem.make_executable().expect("executable");
         let entry = mem.code_start() as usize + offsets[name];
         let f = unsafe { std::mem::transmute_copy::<usize, F>(&entry) };
         Some((mem, f))
