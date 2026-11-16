@@ -1572,10 +1572,17 @@ fn encode_mir_instruction_x86_64(
                             1,
                             unsigned_div_like,
                         )?);
-                        code.extend_from_slice(&emit_int_binop_i32_alu_x86_64(*op));
-                        if matches!(ty, MirType::Scalar(ScalarType::I1)) {
-                            code.extend_from_slice(&[0x83, 0xE0, 0x01]);
+                        if matches!(ty, MirType::Scalar(ScalarType::I1))
+                            && matches!(
+                                op,
+                                IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul | IntBinOp::Shl
+                            )
+                        {
+                            return Err(RasError::EncodingError(
+                                "x86_64 JIT refuses i1 add, sub, mul and shl: the AOT backend's i1 result differs at wrap-around".into(),
+                            ));
                         }
+                        code.extend_from_slice(&emit_int_binop_i32_alu_x86_64(*op));
                         code.extend_from_slice(&store_int_binop_result_x86_64(stack_slots, v, ty)?);
                     }
                     MirType::Scalar(ScalarType::F32 | ScalarType::F64) => {
