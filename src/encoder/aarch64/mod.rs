@@ -4859,10 +4859,10 @@ mod tests {
         const DMB_ISHLD: u32 = 0xD503_39BF;
 
         fn count_word(code: &[u8], word: u32) -> usize {
-            code.chunks_exact(4)
-                .filter(|chunk| {
-                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) == word
-                })
+            code.as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|chunk| u32::from_le_bytes(**chunk) == word)
                 .count()
         }
 
