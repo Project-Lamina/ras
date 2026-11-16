@@ -301,6 +301,11 @@ impl ExecutableMemory {
         Ok(())
     }
 
+    /// Bytes mapped for this region, rounded up to a page.
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
+
     pub fn code_start(&self) -> *const u8 {
         self.ptr
     }
