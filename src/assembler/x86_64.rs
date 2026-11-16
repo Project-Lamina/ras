@@ -4,7 +4,7 @@
 
 use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_mir::{MirType, ScalarType};
-use lamina_platform::{PointerWidth, TargetArchitecture};
+use lamina_platform::{PointerWidth, TargetArchitecture, TargetOperatingSystem};
 use std::collections::HashMap;
 
 const X86_64_POINTER: PointerWidth = TargetArchitecture::X86_64.pointer_width();
@@ -134,22 +134,55 @@ pub fn compile_mir_x86_64_function(
             Some(lamina_mir::Instruction::Unreachable)
         );
 
-        if !func.sig.params.is_empty() {
-            let arg_regs = abi.arg_registers();
-            for (index, param) in func.sig.params.iter().enumerate() {
-                if let Register::Virtual(vreg) = &param.reg
-                    && let Some(slot_off) = stack_slots.get(vreg)
-                {
-                    if index < arg_regs.len() {
-                        let mov_bytes = encode_mov_reg_mem_x86_64(arg_regs[index], *slot_off)?;
-                        code.extend_from_slice(&mov_bytes);
-                    } else {
-                        let caller_off = 16 + ((index - arg_regs.len()) as i32) * 8;
-                        let mov1 = encode_mov_mem_reg_x86_64(caller_off, "rax")?;
-                        code.extend_from_slice(&mov1);
-                        let mov2 = encode_mov_reg_mem_x86_64("rax", *slot_off)?;
-                        code.extend_from_slice(&mov2);
-                    }
+        let windows = matches!(assembler.target_os, TargetOperatingSystem::Windows);
+        let gp_arg_regs = abi.arg_registers();
+        let (xmm_arg_count, stack_arg_base) = if windows { (4, 48) } else { (8, 16) };
+        let mut next_gp = 0usize;
+        let mut next_xmm = 0usize;
+        let mut next_stack = 0i32;
+        for (position, param) in func.sig.params.iter().enumerate() {
+            let is_float = matches!(param.ty, MirType::Scalar(ScalarType::F32 | ScalarType::F64));
+            let double = matches!(param.ty, MirType::Scalar(ScalarType::F64));
+            let source = if is_float {
+                let slot = if windows { position } else { next_xmm };
+                if slot < xmm_arg_count {
+                    next_xmm += 1;
+                    ArgSource::Xmm(slot as u8)
+                } else {
+                    ArgSource::Stack
+                }
+            } else {
+                let slot = if windows { position } else { next_gp };
+                if slot < gp_arg_regs.len() {
+                    next_gp += 1;
+                    ArgSource::Gp(gp_arg_regs[slot])
+                } else {
+                    ArgSource::Stack
+                }
+            };
+            let caller_off = if matches!(source, ArgSource::Stack) {
+                let off = stack_arg_base + next_stack * 8;
+                next_stack += 1;
+                off
+            } else {
+                0
+            };
+            let Register::Virtual(vreg) = &param.reg else {
+                continue;
+            };
+            let Some(slot_off) = stack_slots.get(vreg) else {
+                continue;
+            };
+            match source {
+                ArgSource::Gp(reg) => {
+                    code.extend_from_slice(&encode_mov_reg_mem_x86_64(reg, *slot_off)?);
+                }
+                ArgSource::Xmm(xmm) => {
+                    code.extend_from_slice(&encode_store_xmm_rbp_x86_64(xmm, *slot_off, double));
+                }
+                ArgSource::Stack => {
+                    code.extend_from_slice(&encode_mov_mem_reg_x86_64(caller_off, "rax")?);
+                    code.extend_from_slice(&encode_mov_reg_mem_x86_64("rax", *slot_off)?);
                 }
             }
         }
@@ -207,6 +240,30 @@ fn encode_epilogue_x86_64() -> Result<Vec<u8>, RasError> {
     // pop rbp: 5D
     code.push(0x5D);
     Ok(code)
+}
+
+#[derive(Clone, Copy)]
+enum ArgSource {
+    Gp(&'static str),
+    Xmm(u8),
+    Stack,
+}
+
+/// `movsd`/`movss [rbp+disp], xmm`: stores the low 64 or 32 bits of an argument register.
+fn encode_store_xmm_rbp_x86_64(xmm: u8, disp: i32, double: bool) -> Vec<u8> {
+    let mut code = vec![if double { 0xF2 } else { 0xF3 }];
+    if xmm >= 8 {
+        code.push(0x44);
+    }
+    code.extend_from_slice(&[0x0F, 0x11]);
+    if (-128..=127).contains(&disp) {
+        code.push(modrm(0b01, xmm, 0b101));
+        code.push(disp as u8);
+    } else {
+        code.push(modrm(0b10, xmm, 0b101));
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+    code
 }
 
 fn encode_mov_reg_mem_x86_64(src_reg: &str, offset: i32) -> Result<Vec<u8>, RasError> {
