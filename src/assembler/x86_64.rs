@@ -109,8 +109,26 @@ pub fn compile_mir_x86_64_function(
         // leaves it to the callee to put back. One slot below the locals holds the
         // caller's copy for as long as the function runs.
         let saved_rbx = X86Frame::calculate_stack_offset(stack_slots.len());
-        let stack_size = (stack_slots.len() + 1) * 8;
-        let aligned_stack_size = (stack_size + 15) & !15;
+        let mut frame_bytes = (stack_slots.len() + 1) * 8;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            let lamina_mir::Instruction::StackAddr { slot, .. } = &inst.instr else {
+                continue;
+            };
+            if stack_slots.contains_key(slot) {
+                continue;
+            }
+            let words = 1 + func.stack_reservations.get(slot).copied().unwrap_or(0);
+            let align = func.stack_alignments.get(slot).copied().unwrap_or(8);
+            if align == 0 || align > 16 {
+                return Err(RasError::EncodingError(format!(
+                    "x86_64 JIT encoder: stack alignment {} in '{}' exceeds the 16-byte frame",
+                    align, func_name
+                )));
+            }
+            frame_bytes = (frame_bytes + words * 8).div_ceil(align) * align;
+            stack_slots.insert(*slot, -(frame_bytes as i32));
+        }
+        let aligned_stack_size = (frame_bytes + 15) & !15;
 
         let prologue = encode_prologue_x86_64(aligned_stack_size as u32)?;
         code.extend_from_slice(&prologue);
@@ -1232,6 +1250,17 @@ fn encode_mir_instruction_x86_64(
                     "x86_64 JIT encoder: physical dst registers not supported".into(),
                 ))
             }
+        }
+        lamina_mir::Instruction::StackAddr { dst, slot } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for StackAddr not supported".into(),
+                ));
+            };
+            let disp = vreg_slot(stack_slots, slot)?;
+            code.extend_from_slice(&encode_lea_reg_membase_x86_64(0, 5, disp)?);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
         }
         lamina_mir::Instruction::Lea { dst, base, offset } => {
             let Register::Virtual(dst_v) = dst else {
