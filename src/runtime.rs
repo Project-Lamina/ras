@@ -1101,6 +1101,226 @@ mod jit_host_exec_tests {
         assert_eq!(f(), 42);
     }
 
+    fn jit_host_entry_named<F: Copy>(module: &Module, name: &str) -> Option<(ExecutableMemory, F)> {
+        let (arch, os) = host_jit_pair()?;
+        let mut asm = RasAssembler::new(arch, os).expect("assembler");
+        let (code, offsets) = asm
+            .compile_mir_to_binary_function(module, None)
+            .expect("compile");
+        let mut mem = ExecutableMemory::allocate_writable(code.len()).expect("alloc");
+        mem.write_code(&code).expect("write");
+        mem.make_executable().expect("executable");
+        let entry = mem.code_start() as usize + offsets[name];
+        let f = unsafe { std::mem::transmute_copy::<usize, F>(&entry) };
+        Some((mem, f))
+    }
+
+    fn function_with_body(
+        name: &str,
+        params: &[ScalarType],
+        ret: ScalarType,
+        body: Vec<Instruction>,
+    ) -> Function {
+        let sig = Signature::new(name)
+            .with_params(
+                params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        Parameter::new(
+                            Register::Virtual(VirtualReg::gpr(i as u32)),
+                            MirType::Scalar(*t),
+                        )
+                    })
+                    .collect(),
+            )
+            .with_return(MirType::Scalar(ret));
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        for inst in body {
+            entry.push(inst);
+        }
+        f.add_block(entry);
+        f
+    }
+
+    #[test]
+    fn jit_host_exec_call_to_module_function() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let inc = function_with_body(
+            "inc",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::IntBinary {
+                    op: IntBinOp::Add,
+                    ty: i64_ty,
+                    dst: vreg(1),
+                    lhs: reg_op(0),
+                    rhs: ii64(1),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let twice = function_with_body(
+            "twice",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::Call {
+                    name: "inc".into(),
+                    args: vec![reg_op(0)],
+                    ret: Some(vreg(1)),
+                },
+                Instruction::Call {
+                    name: "inc".into(),
+                    args: vec![reg_op(1)],
+                    ret: Some(vreg(2)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut module = Module::new("calls");
+        module.add_function(inc);
+        module.add_function(twice);
+        let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(i64) -> i64>(&module, "twice")
+        else {
+            return;
+        };
+        assert_eq!(f(40), 42);
+    }
+
+    #[test]
+    fn jit_host_exec_call_to_float_module_function() {
+        let f64_ty = MirType::Scalar(ScalarType::F64);
+        let half = function_with_body(
+            "half",
+            &[ScalarType::F64],
+            ScalarType::F64,
+            vec![
+                Instruction::FloatBinary {
+                    op: FloatBinOp::FMul,
+                    ty: f64_ty,
+                    dst: vreg(1),
+                    lhs: reg_op(0),
+                    rhs: Operand::Immediate(Immediate::F64(0.5)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let quarter = function_with_body(
+            "quarter",
+            &[ScalarType::F64],
+            ScalarType::F64,
+            vec![
+                Instruction::Call {
+                    name: "half".into(),
+                    args: vec![reg_op(0)],
+                    ret: Some(vreg(1)),
+                },
+                Instruction::Call {
+                    name: "half".into(),
+                    args: vec![reg_op(1)],
+                    ret: Some(vreg(2)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut module = Module::new("float_calls");
+        module.add_function(half);
+        module.add_function(quarter);
+        let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(f64) -> f64>(&module, "quarter")
+        else {
+            return;
+        };
+        assert_eq!(f(10.0), 2.5);
+    }
+
+    #[test]
+    fn jit_host_exec_call_passes_stack_arguments() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let eight = [ScalarType::I64; 8];
+        let mut sum_body = Vec::new();
+        let mut acc = ii64(0);
+        for i in 0..8u32 {
+            sum_body.push(Instruction::IntBinary {
+                op: IntBinOp::Add,
+                ty: i64_ty,
+                dst: vreg(8 + i),
+                lhs: acc.clone(),
+                rhs: reg_op(i),
+            });
+            acc = reg_op(8 + i);
+        }
+        sum_body.push(Instruction::Ret { value: Some(acc) });
+        let sum8 = function_with_body("sum8", &eight, ScalarType::I64, sum_body);
+        let forward = function_with_body(
+            "forward",
+            &eight,
+            ScalarType::I64,
+            vec![
+                Instruction::Call {
+                    name: "sum8".into(),
+                    args: (0..8).map(reg_op).collect(),
+                    ret: Some(vreg(8)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(8)),
+                },
+            ],
+        );
+        let mut module = Module::new("stack_calls");
+        module.add_function(sum8);
+        module.add_function(forward);
+        let Some((_mem, f)) = jit_host_entry_named::<
+            extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+        >(&module, "forward") else {
+            return;
+        };
+        assert_eq!(f(1, 2, 3, 4, 5, 6, 7, 8), 36);
+    }
+
+    #[test]
+    fn jit_host_exec_call_to_libc_symbol() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let module = module_blocks(
+            "libc_call",
+            &[ScalarType::I64],
+            vec![(
+                "entry",
+                vec![
+                    Instruction::Call {
+                        name: "llabs".into(),
+                        args: vec![reg_op(0)],
+                        ret: Some(vreg(1)),
+                    },
+                    Instruction::IntBinary {
+                        op: IntBinOp::Add,
+                        ty: i64_ty,
+                        dst: vreg(2),
+                        lhs: reg_op(1),
+                        rhs: ii64(2),
+                    },
+                    Instruction::Ret {
+                        value: Some(reg_op(2)),
+                    },
+                ],
+            )],
+        );
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(i64) -> i64>(&module) else {
+            return;
+        };
+        assert_eq!(f(-40), 42);
+    }
+
     #[test]
     fn jit_host_exec_ints_after_leading_float_param() {
         let Some((arch, os)) = host_jit_pair() else {
