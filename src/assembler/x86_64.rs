@@ -55,22 +55,9 @@ pub fn compile_mir_x86_64_function(
     code.reserve(reserve_hint);
 
     for (func_name, func) in functions_to_compile {
-        // Complex control flow is rejected: the encoder cannot emit it correctly.
-        if func.blocks.len() != 1 {
-            return Err(RasError::EncodingError(format!(
-                "x86_64 JIT encoder currently supports only single-block functions; '{}' has {} block(s)",
-                func_name,
-                func.blocks.len()
-            )));
-        }
-
-        for inst in &func.blocks[0].instructions {
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             match &inst.instr {
-                lamina_mir::Instruction::Jmp { .. }
-                | lamina_mir::Instruction::Br { .. }
-                | lamina_mir::Instruction::Switch { .. }
-                | lamina_mir::Instruction::Call { .. }
-                | lamina_mir::Instruction::TailCall { .. } => {
+                lamina_mir::Instruction::Call { .. } | lamina_mir::Instruction::TailCall { .. } => {
                     return Err(RasError::EncodingError(format!(
                         "x86_64 JIT encoder does not yet support control-flow/calls in '{}': {:?}",
                         func_name, inst
@@ -129,10 +116,11 @@ pub fn compile_mir_x86_64_function(
         code.extend_from_slice(&prologue);
         code.extend_from_slice(&encode_mov_reg_mem_x86_64("rbx", saved_rbx)?);
 
-        let skip_epilogue_and_ret = matches!(
-            func.blocks[0].terminator(),
-            Some(lamina_mir::Instruction::Unreachable)
-        );
+        let has_ret = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|inst| matches!(inst.instr, lamina_mir::Instruction::Ret { .. }));
 
         let windows = matches!(assembler.target_os, TargetOperatingSystem::Windows);
         let gp_arg_regs = abi.arg_registers();
@@ -187,8 +175,12 @@ pub fn compile_mir_x86_64_function(
             }
         }
 
+        let mut labels: HashMap<String, usize> = HashMap::new();
+        let mut fixups: Vec<(usize, String)> = Vec::new();
         for block in &func.blocks {
+            labels.insert(block.label.clone(), code.len());
             for inst in &block.instructions {
+                let mut local_fixups = Vec::new();
                 let inst_bytes = encode_mir_instruction_x86_64(
                     inst,
                     &mut reg_alloc,
@@ -196,21 +188,43 @@ pub fn compile_mir_x86_64_function(
                     aligned_stack_size,
                     &func_name,
                     &func.sig,
+                    &mut local_fixups,
                 )?;
+                let base = code.len();
+                fixups.extend(
+                    local_fixups
+                        .into_iter()
+                        .map(|(at, label)| (base + at, label)),
+                );
                 code.extend_from_slice(&inst_bytes);
             }
         }
 
-        if !skip_epilogue_and_ret {
+        if has_ret {
+            labels.insert(EXIT_LABEL.to_string(), code.len());
             code.extend_from_slice(&encode_mov_mem_reg_x86_64(saved_rbx, "rbx")?);
             let epilogue = encode_epilogue_x86_64()?;
             code.extend_from_slice(&epilogue);
             code.push(0xC3);
         }
+
+        for (at, label) in fixups {
+            let target = *labels.get(&label).ok_or_else(|| {
+                RasError::EncodingError(format!(
+                    "x86_64 JIT encoder: branch to unknown block '{}' in '{}'",
+                    label, func_name
+                ))
+            })?;
+            let rel = target as i64 - (at as i64 + 4);
+            code[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+        }
     }
 
     Ok((code, function_offsets))
 }
+
+/// Label of the shared epilogue that every `ret` jumps to.
+const EXIT_LABEL: &str = "\u{0}exit";
 
 fn encode_prologue_x86_64(stack_size: u32) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::with_capacity(16);
@@ -940,6 +954,16 @@ fn parse_register_x86_64(reg: &str) -> Result<u8, RasError> {
     }
 }
 
+fn push_rel32(code: &mut Vec<u8>, fixups: &mut Vec<(usize, String)>, label: &str) {
+    fixups.push((code.len(), label.to_string()));
+    code.extend_from_slice(&[0, 0, 0, 0]);
+}
+
+fn push_jmp_rel32(code: &mut Vec<u8>, fixups: &mut Vec<(usize, String)>, label: &str) {
+    code.push(0xE9);
+    push_rel32(code, fixups, label);
+}
+
 fn float_is_double(ty: &lamina_mir::MirType) -> Result<bool, RasError> {
     match ty {
         MirType::Scalar(ScalarType::F64) => Ok(true),
@@ -1003,6 +1027,7 @@ fn encode_mir_instruction_x86_64(
     _stack_size: usize,
     _func_name: &str,
     func_sig: &lamina_mir::Signature,
+    fixups: &mut Vec<(usize, String)>,
 ) -> Result<Vec<u8>, RasError> {
     use lamina_mir::{
         AddressMode, Immediate, IntBinOp, IntCmpOp, MirType, Operand, Register, ScalarType,
@@ -1110,6 +1135,7 @@ fn encode_mir_instruction_x86_64(
                     code.extend_from_slice(&materialize_operand_to_reg(stack_slots, v, "rax")?);
                 }
             }
+            push_jmp_rel32(&mut code, fixups, EXIT_LABEL);
             Ok(code)
         }
         lamina_mir::Instruction::IntBinary {
@@ -1279,6 +1305,53 @@ fn encode_mir_instruction_x86_64(
             Ok(code)
         }
         lamina_mir::Instruction::Unreachable => Ok(vec![0x0F, 0x0B]),
+        lamina_mir::Instruction::Jmp { target } => {
+            push_jmp_rel32(&mut code, fixups, target);
+            Ok(code)
+        }
+        lamina_mir::Instruction::Br {
+            cond,
+            true_target,
+            false_target,
+        } => {
+            code.extend_from_slice(&materialize_operand_to_reg(
+                stack_slots,
+                &Operand::Register(cond.clone()),
+                "rax",
+            )?);
+            code.extend_from_slice(&[0x84, 0xC0]);
+            code.extend_from_slice(&[0x0F, 0x85]);
+            push_rel32(&mut code, fixups, true_target);
+            push_jmp_rel32(&mut code, fixups, false_target);
+            Ok(code)
+        }
+        lamina_mir::Instruction::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            code.extend_from_slice(&materialize_operand_to_reg(
+                stack_slots,
+                &Operand::Register(value.clone()),
+                "rax",
+            )?);
+            for (case, label) in cases {
+                match i32::try_from(*case) {
+                    Ok(imm) => {
+                        code.extend_from_slice(&[0x48, 0x3D]);
+                        code.extend_from_slice(&imm.to_le_bytes());
+                    }
+                    Err(_) => {
+                        code.extend_from_slice(&mov_imm64(1, *case));
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+                    }
+                }
+                code.extend_from_slice(&[0x0F, 0x84]);
+                push_rel32(&mut code, fixups, label);
+            }
+            push_jmp_rel32(&mut code, fixups, default);
+            Ok(code)
+        }
         lamina_mir::Instruction::SafePoint => Ok(vec![0x0F, 0x1F, 0x40, 0x00]),
         lamina_mir::Instruction::Comment { .. }
         | lamina_mir::Instruction::StackMap { .. }
