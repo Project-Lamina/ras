@@ -36,21 +36,22 @@ impl Drop for TempDir {
     }
 }
 
-/// The `ras` executable beside this test binary. `cargo test` builds it as part of the
-/// bin target; `cargo test --lib` does not, so say which command is missing rather than
-/// failing later on an absent program.
+/// The `ras` executable this crate builds. `cargo test` builds it as part of the bin
+/// target; `cargo test --lib` does not, so say which command is missing rather than
+/// failing later on an absent program. Cargo places the test binary at a depth that has
+/// changed between releases, so every directory up to `target` is searched.
 #[allow(dead_code)]
 pub(crate) fn ras_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
+    let exe = std::env::current_exe().expect("test binary path");
+    let name = format!("ras{}", std::env::consts::EXE_SUFFIX);
+    for dir in exe.ancestors().skip(1) {
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return candidate;
+        }
+        if dir.file_name().is_some_and(|last| last == "target") {
+            break;
+        }
     }
-    let ras = path.join("ras");
-    assert!(
-        ras.is_file(),
-        "{} is not built: run `cargo build --bin ras`",
-        ras.display()
-    );
-    ras
+    panic!("{name} is not built: run `cargo build --bin ras`");
 }
