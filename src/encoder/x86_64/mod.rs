@@ -6111,7 +6111,6 @@ mod tests {
         use crate::Ras;
         use crate::test_support::TempDir;
         use lamina_platform::{TargetArchitecture, TargetOperatingSystem};
-        use std::process::Command;
 
         fn u16_at(bytes: &[u8], offset: usize) -> u16 {
             u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -6471,6 +6470,8 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         #[test]
         fn a_linked_program_runs_and_prints() {
+            use std::process::Command;
+
             let tmp = TempDir::new("i686-run");
             let probe = Command::new("cc")
                 .args(["-m32", "-xc", "-", "-o"])
