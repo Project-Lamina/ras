@@ -1455,6 +1455,77 @@ mod jit_host_exec_tests {
     }
 
     #[test]
+    fn jit_refuses_by_value_aggregate_returns() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let wide = lamina_mir::Aggregate {
+            size: 16,
+            align: 16,
+            class: lamina_mir::AggregateClass::Integer,
+            shape: lamina_mir::AggregateShape::WideScalar,
+        };
+        let mut f = function_with_body(
+            "wide_ret",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![Instruction::Ret {
+                value: Some(reg_op(0)),
+            }],
+        );
+        f.sig = f.sig.clone().with_return_aggregate(wide);
+        let mut module = Module::new("aggregate_ret");
+        module.add_function(f);
+        let err = RasRuntime::new(arch, os)
+            .compile_with_offsets(&module)
+            .err()
+            .expect("the JIT must refuse a by-value aggregate return");
+        assert!(
+            err.to_string().contains("by-value aggregate return"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn jit_refuses_wide_integer_helper_calls_by_name() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let ptr = MirType::Scalar(ScalarType::Ptr);
+        let helper = Function::new(
+            Signature::new("__divti3")
+                .with_params(vec![
+                    Parameter::new(vreg(0), ptr),
+                    Parameter::new(vreg(1), ptr),
+                ])
+                .with_return(ptr),
+        );
+        let caller = function_with_body(
+            "wide_div",
+            &[ScalarType::Ptr, ScalarType::Ptr],
+            ScalarType::Ptr,
+            vec![
+                Instruction::Call {
+                    name: "__divti3".into(),
+                    args: vec![reg_op(0), reg_op(1)],
+                    ret: Some(vreg(2)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut module = Module::new("wide_helper");
+        module.add_function(helper);
+        module.add_function(caller);
+        let err = RasRuntime::new(arch, os)
+            .compile_with_offsets(&module)
+            .err()
+            .expect("the JIT must refuse a call to a wide integer helper");
+        assert!(err.to_string().contains("__divti3"), "{err}");
+    }
+
+    #[test]
     fn jit_host_exec_stack_region_round_trips_words() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
         let at = |offset: i16| AddressMode::BaseOffset {
