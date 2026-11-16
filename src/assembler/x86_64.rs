@@ -5,7 +5,7 @@
 use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_mir::{MirType, ScalarType};
 use lamina_platform::{PointerWidth, TargetArchitecture, TargetOperatingSystem};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const X86_64_POINTER: PointerWidth = TargetArchitecture::X86_64.pointer_width();
 
@@ -22,6 +22,8 @@ pub fn compile_mir_x86_64_function(
     let abi = X86ABI::new(assembler.target_os);
     let mut code = Vec::new();
     let mut function_offsets: HashMap<String, usize> = HashMap::new();
+    let internal_names: HashSet<String> = module.functions.keys().cloned().collect();
+    let mut call_fixups: Vec<(usize, String)> = Vec::new();
 
     let functions_to_compile: Vec<(String, &lamina_mir::Function)> =
         if let Some(name) = function_name {
@@ -57,7 +59,7 @@ pub fn compile_mir_x86_64_function(
     for (func_name, func) in functions_to_compile {
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             match &inst.instr {
-                lamina_mir::Instruction::Call { .. } | lamina_mir::Instruction::TailCall { .. } => {
+                lamina_mir::Instruction::TailCall { .. } => {
                     return Err(RasError::EncodingError(format!(
                         "x86_64 JIT encoder does not yet support control-flow/calls in '{}': {:?}",
                         func_name, inst
@@ -128,7 +130,32 @@ pub fn compile_mir_x86_64_function(
             frame_bytes = (frame_bytes + words * 8).div_ceil(align) * align;
             stack_slots.insert(*slot, -(frame_bytes as i32));
         }
-        let aligned_stack_size = (frame_bytes + 15) & !15;
+        let windows = matches!(assembler.target_os, TargetOperatingSystem::Windows);
+        let mut outgoing_stack_args = 0usize;
+        let mut makes_call = false;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            let lamina_mir::Instruction::Call { name, args, .. } = &inst.instr else {
+                continue;
+            };
+            if is_lamina_io_intrinsic(name, args) {
+                continue;
+            }
+            makes_call = true;
+            let floats: Vec<bool> = args.iter().map(operand_is_float).collect();
+            let stack_args = assign_arg_sources(&floats, abi.arg_registers(), windows, 0)
+                .iter()
+                .filter(|source| matches!(source, ArgSource::Stack(_)))
+                .count();
+            outgoing_stack_args = outgoing_stack_args.max(stack_args);
+        }
+        let shadow = if makes_call && windows { 32 } else { 0 };
+        let outgoing_bytes = shadow + outgoing_stack_args * 8;
+        let aligned_stack_size = (frame_bytes + outgoing_bytes + 15) & !15;
+        let call_env = CallEnv {
+            windows,
+            gp_arg_regs: abi.arg_registers(),
+            internal: &internal_names,
+        };
 
         let prologue = encode_prologue_x86_64(aligned_stack_size as u32)?;
         code.extend_from_slice(&prologue);
@@ -141,38 +168,21 @@ pub fn compile_mir_x86_64_function(
             .any(|inst| matches!(inst.instr, lamina_mir::Instruction::Ret { .. }));
 
         let windows = matches!(assembler.target_os, TargetOperatingSystem::Windows);
-        let gp_arg_regs = abi.arg_registers();
-        let (xmm_arg_count, stack_arg_base) = if windows { (4, 48) } else { (8, 16) };
-        let mut next_gp = 0usize;
-        let mut next_xmm = 0usize;
-        let mut next_stack = 0i32;
-        for (position, param) in func.sig.params.iter().enumerate() {
-            let is_float = matches!(param.ty, MirType::Scalar(ScalarType::F32 | ScalarType::F64));
+        let float_params: Vec<bool> = func
+            .sig
+            .params
+            .iter()
+            .map(|p| matches!(p.ty, MirType::Scalar(ScalarType::F32 | ScalarType::F64)))
+            .collect();
+        let callee_stack_base = if windows { 48 } else { 16 };
+        let sources = assign_arg_sources(
+            &float_params,
+            abi.arg_registers(),
+            windows,
+            callee_stack_base,
+        );
+        for (param, source) in func.sig.params.iter().zip(sources) {
             let double = matches!(param.ty, MirType::Scalar(ScalarType::F64));
-            let source = if is_float {
-                let slot = if windows { position } else { next_xmm };
-                if slot < xmm_arg_count {
-                    next_xmm += 1;
-                    ArgSource::Xmm(slot as u8)
-                } else {
-                    ArgSource::Stack
-                }
-            } else {
-                let slot = if windows { position } else { next_gp };
-                if slot < gp_arg_regs.len() {
-                    next_gp += 1;
-                    ArgSource::Gp(gp_arg_regs[slot])
-                } else {
-                    ArgSource::Stack
-                }
-            };
-            let caller_off = if matches!(source, ArgSource::Stack) {
-                let off = stack_arg_base + next_stack * 8;
-                next_stack += 1;
-                off
-            } else {
-                0
-            };
             let Register::Virtual(vreg) = &param.reg else {
                 continue;
             };
@@ -186,7 +196,7 @@ pub fn compile_mir_x86_64_function(
                 ArgSource::Xmm(xmm) => {
                     code.extend_from_slice(&encode_store_xmm_rbp_x86_64(xmm, *slot_off, double));
                 }
-                ArgSource::Stack => {
+                ArgSource::Stack(caller_off) => {
                     code.extend_from_slice(&encode_mov_mem_reg_x86_64(caller_off, "rax")?);
                     code.extend_from_slice(&encode_mov_reg_mem_x86_64("rax", *slot_off)?);
                 }
@@ -206,6 +216,7 @@ pub fn compile_mir_x86_64_function(
                     aligned_stack_size,
                     &func_name,
                     &func.sig,
+                    &call_env,
                     &mut local_fixups,
                 )?;
                 let base = code.len();
@@ -227,15 +238,28 @@ pub fn compile_mir_x86_64_function(
         }
 
         for (at, label) in fixups {
+            if let Some(callee) = label.strip_prefix(CALL_LABEL_PREFIX) {
+                call_fixups.push((at, callee.to_string()));
+                continue;
+            }
             let target = *labels.get(&label).ok_or_else(|| {
                 RasError::EncodingError(format!(
                     "x86_64 JIT encoder: branch to unknown block '{}' in '{}'",
                     label, func_name
                 ))
             })?;
-            let rel = target as i64 - (at as i64 + 4);
-            code[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+            patch_rel32(&mut code, at, target);
         }
+    }
+
+    for (at, callee) in call_fixups {
+        let target = *function_offsets.get(&callee).ok_or_else(|| {
+            RasError::EncodingError(format!(
+                "x86_64 JIT encoder: call to function '{}' not in the module",
+                callee
+            ))
+        })?;
+        patch_rel32(&mut code, at, target);
     }
 
     Ok((code, function_offsets))
@@ -243,6 +267,59 @@ pub fn compile_mir_x86_64_function(
 
 /// Label of the shared epilogue that every `ret` jumps to.
 const EXIT_LABEL: &str = "\u{0}exit";
+
+/// Prefix of the fixup labels that name a function to call. Such fixups resolve
+/// against the start of every function in the module, not the current one.
+const CALL_LABEL_PREFIX: &str = "\u{1}call:";
+
+struct CallEnv<'a> {
+    windows: bool,
+    gp_arg_regs: &'static [&'static str],
+    internal: &'a HashSet<String>,
+}
+
+impl CallEnv<'_> {
+    fn shadow_bytes(&self) -> i32 {
+        if self.windows { 32 } else { 0 }
+    }
+
+    fn internal_name(&self, name: &str) -> Option<String> {
+        [
+            name.to_string(),
+            name.trim_start_matches('@').to_string(),
+            format!("@{}", name.trim_start_matches('@')),
+        ]
+        .into_iter()
+        .find(|candidate| self.internal.contains(candidate))
+    }
+}
+
+fn is_lamina_io_intrinsic(name: &str, args: &[lamina_mir::Operand]) -> bool {
+    (name == "lamina.writebyte" && args.len() == 1)
+        || (name == "lamina.readbyte" && args.is_empty())
+}
+
+fn operand_is_float(op: &lamina_mir::Operand) -> bool {
+    use lamina_mir::{Immediate, Operand, Register, RegisterClass};
+    match op {
+        Operand::Immediate(Immediate::F32(_) | Immediate::F64(_)) => true,
+        Operand::Register(Register::Virtual(v)) => v.class == RegisterClass::Fpr,
+        _ => false,
+    }
+}
+
+/// Address of a symbol in the running process, when the process has one.
+#[cfg(unix)]
+fn resolve_host_symbol(name: &str) -> Option<usize> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
+    (!addr.is_null()).then_some(addr as usize)
+}
+
+#[cfg(not(unix))]
+fn resolve_host_symbol(_name: &str) -> Option<usize> {
+    None
+}
 
 fn encode_prologue_x86_64(stack_size: u32) -> Result<Vec<u8>, RasError> {
     let mut code = Vec::with_capacity(16);
@@ -278,7 +355,48 @@ fn encode_epilogue_x86_64() -> Result<Vec<u8>, RasError> {
 enum ArgSource {
     Gp(&'static str),
     Xmm(u8),
-    Stack,
+    /// Displacement from the stack pointer on the caller's side, or from the
+    /// frame base on the callee's, depending on which side assigned it.
+    Stack(i32),
+}
+
+/// Places each argument in the register or stack slot the C ABI gives it. SysV hands
+/// integers and floats out of separate register sequences; Windows counts positions.
+fn assign_arg_sources(
+    float_args: &[bool],
+    gp_regs: &'static [&'static str],
+    windows: bool,
+    stack_base: i32,
+) -> Vec<ArgSource> {
+    let xmm_count = if windows { 4 } else { 8 };
+    let mut next_gp = 0usize;
+    let mut next_xmm = 0usize;
+    let mut next_stack = 0i32;
+    float_args
+        .iter()
+        .enumerate()
+        .map(|(position, &is_float)| {
+            let slot = |next: usize| if windows { position } else { next };
+            let source = if is_float {
+                if slot(next_xmm) < xmm_count {
+                    next_xmm += 1;
+                    Some(ArgSource::Xmm(slot(next_xmm - 1) as u8))
+                } else {
+                    None
+                }
+            } else if slot(next_gp) < gp_regs.len() {
+                next_gp += 1;
+                Some(ArgSource::Gp(gp_regs[slot(next_gp - 1)]))
+            } else {
+                None
+            };
+            source.unwrap_or_else(|| {
+                let off = stack_base + next_stack * 8;
+                next_stack += 1;
+                ArgSource::Stack(off)
+            })
+        })
+        .collect()
 }
 
 /// `movsd`/`movss [rbp+disp], xmm`: stores the low 64 or 32 bits of an argument register.
@@ -972,6 +1090,11 @@ fn parse_register_x86_64(reg: &str) -> Result<u8, RasError> {
     }
 }
 
+fn patch_rel32(code: &mut [u8], at: usize, target: usize) {
+    let rel = target as i64 - (at as i64 + 4);
+    code[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+}
+
 fn push_rel32(code: &mut Vec<u8>, fixups: &mut Vec<(usize, String)>, label: &str) {
     fixups.push((code.len(), label.to_string()));
     code.extend_from_slice(&[0, 0, 0, 0]);
@@ -1045,6 +1168,7 @@ fn encode_mir_instruction_x86_64(
     _stack_size: usize,
     _func_name: &str,
     func_sig: &lamina_mir::Signature,
+    calls: &CallEnv,
     fixups: &mut Vec<(usize, String)>,
 ) -> Result<Vec<u8>, RasError> {
     use lamina_mir::{
@@ -1334,6 +1458,101 @@ fn encode_mir_instruction_x86_64(
             Ok(code)
         }
         lamina_mir::Instruction::Unreachable => Ok(vec![0x0F, 0x0B]),
+        lamina_mir::Instruction::Call { name, args, ret } if is_lamina_io_intrinsic(name, args) => {
+            if calls.windows {
+                return Err(RasError::EncodingError(format!(
+                    "x86_64 JIT encoder: {} is not available on Windows",
+                    name
+                )));
+            }
+            if name == "lamina.writebyte" {
+                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, &args[0], "rax")?);
+                code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);
+                code.extend_from_slice(&[0x88, 0x04, 0x24]);
+                code.extend_from_slice(&[0xB8, 1, 0, 0, 0]);
+                code.extend_from_slice(&[0xBF, 1, 0, 0, 0]);
+                code.extend_from_slice(&[0x48, 0x89, 0xE6]);
+                code.extend_from_slice(&[0xBA, 1, 0, 0, 0]);
+                code.extend_from_slice(&[0x0F, 0x05]);
+                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFE, 0xFF, 0xFF, 0xFF]);
+                code.extend_from_slice(&[0x48, 0x0F, 0x48, 0xC1]);
+                code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
+            } else {
+                code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);
+                code.extend_from_slice(&[0xB8, 0, 0, 0, 0]);
+                code.extend_from_slice(&[0xBF, 0, 0, 0, 0]);
+                code.extend_from_slice(&[0x48, 0x89, 0xE6]);
+                code.extend_from_slice(&[0xBA, 1, 0, 0, 0]);
+                code.extend_from_slice(&[0x0F, 0x05]);
+                code.extend_from_slice(&[0x0F, 0xB6, 0x0C, 0x24]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF]);
+                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                code.extend_from_slice(&[0x48, 0x0F, 0x44, 0xCA]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFE, 0xFF, 0xFF, 0xFF]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x01]);
+                code.extend_from_slice(&[0x48, 0x0F, 0x47, 0xCA]);
+                code.extend_from_slice(&[0x48, 0x89, 0xC8]);
+                code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
+            }
+            if let Some(Register::Virtual(dst_v)) = ret {
+                code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            }
+            Ok(code)
+        }
+        lamina_mir::Instruction::Call { name, args, ret } => {
+            let floats: Vec<bool> = args.iter().map(operand_is_float).collect();
+            let sources = assign_arg_sources(
+                &floats,
+                calls.gp_arg_regs,
+                calls.windows,
+                calls.shadow_bytes(),
+            );
+            for (arg, source) in args.iter().zip(&sources) {
+                if let ArgSource::Stack(off) = source {
+                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, "rax")?);
+                    code.extend_from_slice(&encode_mov_membase_reg_x86_64(0, 4, *off)?);
+                }
+            }
+            for (arg, source) in args.iter().zip(&sources) {
+                if let ArgSource::Xmm(xmm) = source {
+                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, "rax")?);
+                    code.extend_from_slice(&encode_gp_to_xmm_x86_64(*xmm, 0, true));
+                }
+            }
+            for (arg, source) in args.iter().zip(&sources) {
+                if let ArgSource::Gp(reg) = source {
+                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, reg)?);
+                }
+            }
+            let vector_args = sources
+                .iter()
+                .filter(|source| matches!(source, ArgSource::Xmm(_)))
+                .count();
+            code.push(0xB8);
+            code.extend_from_slice(&(vector_args as u32).to_le_bytes());
+            if let Some(callee) = calls.internal_name(name) {
+                code.push(0xE8);
+                push_rel32(&mut code, fixups, &format!("{CALL_LABEL_PREFIX}{callee}"));
+            } else {
+                let addr = resolve_host_symbol(name).ok_or_else(|| {
+                    RasError::EncodingError(format!(
+                        "x86_64 JIT encoder: cannot resolve external symbol '{}' in this process",
+                        name
+                    ))
+                })?;
+                code.extend_from_slice(&[0x49, 0xBB]);
+                code.extend_from_slice(&(addr as u64).to_le_bytes());
+                code.extend_from_slice(&[0x41, 0xFF, 0xD3]);
+            }
+            if let Some(Register::Virtual(dst_v)) = ret {
+                if dst_v.class == lamina_mir::RegisterClass::Fpr {
+                    code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, true));
+                }
+                code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            }
+            Ok(code)
+        }
         lamina_mir::Instruction::Jmp { target } => {
             push_jmp_rel32(&mut code, fixups, target);
             Ok(code)
