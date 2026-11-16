@@ -836,6 +836,204 @@ mod jit_host_exec_tests {
         assert_eq!(h(-7.9), -7);
     }
 
+    fn module_blocks(
+        name: &str,
+        params: &[ScalarType],
+        blocks: Vec<(&str, Vec<Instruction>)>,
+    ) -> Module {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let sig = Signature::new(name)
+            .with_params(
+                params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        Parameter::new(
+                            Register::Virtual(VirtualReg::gpr(i as u32)),
+                            MirType::Scalar(*t),
+                        )
+                    })
+                    .collect(),
+            )
+            .with_return(i64_ty);
+        let mut f = Function::new(sig);
+        for (label, instructions) in blocks {
+            let mut block = Block::new(label);
+            for inst in instructions {
+                block.push(inst);
+            }
+            f.add_block(block);
+        }
+        let mut module = Module::new(name);
+        module.add_function(f);
+        module
+    }
+
+    fn vreg(id: u32) -> Register {
+        Register::Virtual(VirtualReg::gpr(id))
+    }
+
+    fn reg_op(id: u32) -> Operand {
+        Operand::Register(vreg(id))
+    }
+
+    #[test]
+    fn jit_host_exec_branch_selects_a_block() {
+        let module = module_blocks(
+            "branch",
+            &[ScalarType::I64],
+            vec![
+                (
+                    "entry",
+                    vec![
+                        Instruction::IntCmp {
+                            op: IntCmpOp::Eq,
+                            ty: MirType::Scalar(ScalarType::I64),
+                            dst: vreg(1),
+                            lhs: reg_op(0),
+                            rhs: ii64(0),
+                        },
+                        Instruction::Br {
+                            cond: vreg(1),
+                            true_target: "zero".into(),
+                            false_target: "other".into(),
+                        },
+                    ],
+                ),
+                (
+                    "zero",
+                    vec![Instruction::Ret {
+                        value: Some(ii64(10)),
+                    }],
+                ),
+                (
+                    "other",
+                    vec![Instruction::Ret {
+                        value: Some(ii64(20)),
+                    }],
+                ),
+            ],
+        );
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(i64) -> i64>(&module) else {
+            return;
+        };
+        assert_eq!(f(0), 10);
+        assert_eq!(f(5), 20);
+    }
+
+    #[test]
+    fn jit_host_exec_loop_sums_up_to_its_bound() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let module = module_blocks(
+            "sum_to",
+            &[ScalarType::I64],
+            vec![
+                (
+                    "entry",
+                    vec![
+                        Instruction::Copy {
+                            ty: i64_ty,
+                            dst: vreg(1),
+                            src: ii64(0),
+                        },
+                        Instruction::Copy {
+                            ty: i64_ty,
+                            dst: vreg(2),
+                            src: ii64(0),
+                        },
+                        Instruction::Jmp {
+                            target: "loop".into(),
+                        },
+                    ],
+                ),
+                (
+                    "loop",
+                    vec![
+                        Instruction::IntBinary {
+                            op: IntBinOp::Add,
+                            ty: i64_ty,
+                            dst: vreg(2),
+                            lhs: reg_op(2),
+                            rhs: ii64(1),
+                        },
+                        Instruction::IntBinary {
+                            op: IntBinOp::Add,
+                            ty: i64_ty,
+                            dst: vreg(1),
+                            lhs: reg_op(1),
+                            rhs: reg_op(2),
+                        },
+                        Instruction::IntCmp {
+                            op: IntCmpOp::SLt,
+                            ty: i64_ty,
+                            dst: vreg(3),
+                            lhs: reg_op(2),
+                            rhs: reg_op(0),
+                        },
+                        Instruction::Br {
+                            cond: vreg(3),
+                            true_target: "loop".into(),
+                            false_target: "done".into(),
+                        },
+                    ],
+                ),
+                (
+                    "done",
+                    vec![Instruction::Ret {
+                        value: Some(reg_op(1)),
+                    }],
+                ),
+            ],
+        );
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(i64) -> i64>(&module) else {
+            return;
+        };
+        assert_eq!(f(10), 55);
+        assert_eq!(f(1), 1);
+    }
+
+    #[test]
+    fn jit_host_exec_switch_dispatches_on_value() {
+        let module = module_blocks(
+            "dispatch",
+            &[ScalarType::I64],
+            vec![
+                (
+                    "entry",
+                    vec![Instruction::Switch {
+                        value: vreg(0),
+                        cases: vec![(1, "one".into()), (2, "two".into())],
+                        default: "other".into(),
+                    }],
+                ),
+                (
+                    "one",
+                    vec![Instruction::Ret {
+                        value: Some(ii64(10)),
+                    }],
+                ),
+                (
+                    "two",
+                    vec![Instruction::Ret {
+                        value: Some(ii64(20)),
+                    }],
+                ),
+                (
+                    "other",
+                    vec![Instruction::Ret {
+                        value: Some(ii64(30)),
+                    }],
+                ),
+            ],
+        );
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(i64) -> i64>(&module) else {
+            return;
+        };
+        assert_eq!(f(1), 10);
+        assert_eq!(f(2), 20);
+        assert_eq!(f(7), 30);
+    }
+
     #[test]
     fn jit_host_exec_ints_after_leading_float_param() {
         let Some((arch, os)) = host_jit_pair() else {
