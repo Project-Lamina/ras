@@ -1114,6 +1114,20 @@ fn push_jmp_rel32(code: &mut Vec<u8>, fixups: &mut Vec<(usize, String)>, label: 
     push_rel32(code, fixups, label);
 }
 
+/// Widens the low `bits` of general register `src` into `dst`: sign-extended to 64 bits for
+/// signed, zero-extended to 32 bits for unsigned. The overflow check compares against this.
+fn extend_low_bits_x86_64(dst: u8, src: u8, bits: u32, signed: bool) -> Vec<u8> {
+    let m = modrm(0b11, dst, src);
+    match (bits, signed) {
+        (8, true) => vec![0x48, 0x0F, 0xBE, m],
+        (16, true) => vec![0x48, 0x0F, 0xBF, m],
+        (32, true) => vec![0x48, 0x63, m],
+        (8, false) => vec![0x0F, 0xB6, m],
+        (16, false) => vec![0x0F, 0xB7, m],
+        _ => vec![0x89, modrm(0b11, src, dst)],
+    }
+}
+
 fn float_is_double(ty: &lamina_mir::MirType) -> Result<bool, RasError> {
     match ty {
         MirType::Scalar(ScalarType::F64) => Ok(true),
@@ -1467,6 +1481,59 @@ fn encode_mir_instruction_x86_64(
             Ok(code)
         }
         lamina_mir::Instruction::Unreachable => Ok(vec![0x0F, 0x0B]),
+        lamina_mir::Instruction::IntOverflow {
+            op,
+            ty,
+            signed,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for IntOverflow not supported".into(),
+                ));
+            };
+            let bits = match ty {
+                MirType::Scalar(ScalarType::I8) => 8,
+                MirType::Scalar(ScalarType::I16) => 16,
+                MirType::Scalar(ScalarType::I32) => 32,
+                MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => 64,
+                _ => {
+                    return Err(RasError::EncodingError(format!(
+                        "x86_64 JIT IntOverflow: unsupported type {:?}",
+                        ty
+                    )));
+                }
+            };
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, lhs, "rax")?);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, rhs, "rcx")?);
+            if bits < 64 {
+                code.extend_from_slice(&extend_low_bits_x86_64(0, 0, bits, *signed));
+                code.extend_from_slice(&extend_low_bits_x86_64(1, 1, bits, *signed));
+            }
+            match op {
+                lamina_mir::IntOverflowOp::Add => code.extend_from_slice(&[0x48, 0x01, 0xC8]),
+                lamina_mir::IntOverflowOp::Sub => code.extend_from_slice(&[0x48, 0x29, 0xC8]),
+                lamina_mir::IntOverflowOp::Mul if bits == 64 && !*signed => {
+                    code.extend_from_slice(&[0x48, 0xF7, 0xE1]);
+                }
+                lamina_mir::IntOverflowOp::Mul => {
+                    code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]);
+                }
+            }
+            if bits == 64 {
+                // Signed overflow is OF; unsigned is CF (a mul sets both).
+                let setcc = if *signed { 0x90 } else { 0x92 };
+                code.extend_from_slice(&[0x0F, setcc, 0xC0]);
+            } else {
+                code.extend_from_slice(&extend_low_bits_x86_64(2, 0, bits, *signed));
+                code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x0F, 0x95, 0xC0]);
+            }
+            code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
         lamina_mir::Instruction::Bitcast { dst, src, .. } => {
             let Register::Virtual(dst_v) = dst else {
                 return Err(RasError::EncodingError(
