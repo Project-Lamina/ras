@@ -29,7 +29,7 @@ checksum = "8721a0c0037e6db0b44abb7cfe54f2690ae97c333fc7d8386c64e6840dc9c92c"
 
 [[package]]
 name = "lamina-ras"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "lamina-codegen",
  "lamina-mir",
