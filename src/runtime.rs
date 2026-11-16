@@ -1455,6 +1455,19 @@ mod jit_host_exec_tests {
     }
 
     #[test]
+    fn jit_refuses_i1_wrap_around_arithmetic() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_scalar_binop(ScalarType::I1, IntBinOp::Add, ii64(1), ii64(1));
+        let err = RasRuntime::new(arch, os)
+            .compile_with_offsets(&module)
+            .err()
+            .expect("the JIT must refuse i1 add");
+        assert!(err.to_string().contains("i1 add"), "{err}");
+    }
+
+    #[test]
     fn jit_refuses_by_value_aggregate_returns() {
         let Some((arch, os)) = host_jit_pair() else {
             return;
