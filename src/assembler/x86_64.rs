@@ -366,9 +366,8 @@ fn mir_ty_x86_gp_load_kind(ty: &lamina_mir::MirType) -> Result<X86GpLoadFromMemK
         MirType::Scalar(ScalarType::I16) => Ok(X86GpLoadFromMemKind::I16S),
         MirType::Scalar(ScalarType::I32) => Ok(X86GpLoadFromMemKind::I32S),
         MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(X86GpLoadFromMemKind::I64),
-        MirType::Scalar(ScalarType::F32 | ScalarType::F64) => Err(RasError::EncodingError(
-            "x86_64 JIT Load of floating-point type is not supported".into(),
-        )),
+        MirType::Scalar(ScalarType::F32) => Ok(X86GpLoadFromMemKind::I32S),
+        MirType::Scalar(ScalarType::F64) => Ok(X86GpLoadFromMemKind::I64),
         _ => Err(RasError::EncodingError(format!(
             "x86_64 JIT Load: unsupported MIR type {:?}",
             ty
@@ -382,9 +381,8 @@ fn mir_ty_x86_gp_store_kind(ty: &lamina_mir::MirType) -> Result<X86GpStoreToMemK
         MirType::Scalar(ScalarType::I16) => Ok(X86GpStoreToMemKind::I16),
         MirType::Scalar(ScalarType::I32) => Ok(X86GpStoreToMemKind::I32),
         MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(X86GpStoreToMemKind::I64),
-        MirType::Scalar(ScalarType::F32 | ScalarType::F64) => Err(RasError::EncodingError(
-            "x86_64 JIT Store of floating-point type is not supported".into(),
-        )),
+        MirType::Scalar(ScalarType::F32) => Ok(X86GpStoreToMemKind::I32),
+        MirType::Scalar(ScalarType::F64) => Ok(X86GpStoreToMemKind::I64),
         _ => Err(RasError::EncodingError(format!(
             "x86_64 JIT Store: unsupported MIR type {:?}",
             ty
@@ -942,6 +940,51 @@ fn parse_register_x86_64(reg: &str) -> Result<u8, RasError> {
     }
 }
 
+fn float_is_double(ty: &lamina_mir::MirType) -> Result<bool, RasError> {
+    match ty {
+        MirType::Scalar(ScalarType::F64) => Ok(true),
+        MirType::Scalar(ScalarType::F32) => Ok(false),
+        _ => Err(RasError::EncodingError(format!(
+            "x86_64 JIT encoder: expected a floating-point type, found {:?}",
+            ty
+        ))),
+    }
+}
+
+/// `movq xmm, r64` (double) or `movd xmm, r32` (single).
+fn encode_gp_to_xmm_x86_64(xmm: u8, gp: u8, double: bool) -> Vec<u8> {
+    let mut code = vec![0x66];
+    if double {
+        code.push(rex_w_r_b(true, xmm, gp));
+    } else if (xmm | gp) & 8 != 0 {
+        code.push(rex_w_r_b(false, xmm, gp));
+    }
+    code.extend_from_slice(&[0x0F, 0x6E, modrm(0b11, xmm, gp)]);
+    code
+}
+
+/// `movq r64, xmm` (double) or `movd r32, xmm` (single); single zero-extends into the GP register.
+fn encode_xmm_to_gp_x86_64(gp: u8, xmm: u8, double: bool) -> Vec<u8> {
+    let mut code = vec![0x66];
+    if double {
+        code.push(rex_w_r_b(true, xmm, gp));
+    } else if (xmm | gp) & 8 != 0 {
+        code.push(rex_w_r_b(false, xmm, gp));
+    }
+    code.extend_from_slice(&[0x0F, 0x7E, modrm(0b11, xmm, gp)]);
+    code
+}
+
+/// Scalar SSE op `op xmm_dst, xmm_src` with the double (F2) or single (F3) prefix.
+fn encode_sse_scalar_x86_64(opcode: u8, dst: u8, src: u8, double: bool) -> Vec<u8> {
+    vec![
+        if double { 0xF2 } else { 0xF3 },
+        0x0F,
+        opcode,
+        modrm(0b11, dst, src),
+    ]
+}
+
 #[inline]
 fn modrm(mod_bits: u8, reg: u8, rm: u8) -> u8 {
     ((mod_bits & 0b11) << 6) | ((reg & 0b111) << 3) | (rm & 0b111)
@@ -1028,11 +1071,8 @@ fn encode_mir_instruction_x86_64(
                     Immediate::I16(v) => *v as i64,
                     Immediate::I32(v) => *v as i64,
                     Immediate::I64(v) => *v,
-                    Immediate::F32(_) | Immediate::F64(_) => {
-                        return Err(RasError::EncodingError(
-                            "float immediates not supported in x86_64 JIT encoder".into(),
-                        ));
-                    }
+                    Immediate::F32(v) => i64::from(v.to_bits()),
+                    Immediate::F64(v) => v.to_bits() as i64,
                 };
                 let reg = parse_register_x86_64(dst_reg)?;
                 Ok(mov_imm64(reg, v))
@@ -1058,7 +1098,13 @@ fn encode_mir_instruction_x86_64(
     match inst {
         lamina_mir::Instruction::Ret { value } => {
             if let Some(v) = value {
-                if let Some(rt) = &func_sig.ret_ty {
+                if let Some(rt @ MirType::Scalar(ScalarType::F32 | ScalarType::F64)) =
+                    &func_sig.ret_ty
+                {
+                    let double = matches!(rt, MirType::Scalar(ScalarType::F64));
+                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, v, "rax")?);
+                    code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, double));
+                } else if let Some(rt) = &func_sig.ret_ty {
                     code.extend_from_slice(&materialize_return_value_x86_64(stack_slots, v, rt)?);
                 } else {
                     code.extend_from_slice(&materialize_operand_to_reg(stack_slots, v, "rax")?);
@@ -1508,6 +1554,187 @@ fn encode_mir_instruction_x86_64(
                     "x86_64 JIT encoder: physical dst registers not supported".into(),
                 ))
             }
+        }
+        lamina_mir::Instruction::FloatBinary {
+            op,
+            ty,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for FloatBinary not supported".into(),
+                ));
+            };
+            let double = float_is_double(ty)?;
+            let opcode = match op {
+                lamina_mir::FloatBinOp::FAdd => 0x58,
+                lamina_mir::FloatBinOp::FSub => 0x5C,
+                lamina_mir::FloatBinOp::FMul => 0x59,
+                lamina_mir::FloatBinOp::FDiv => 0x5E,
+            };
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, lhs, "rax")?);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, rhs, "rcx")?);
+            code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, double));
+            code.extend_from_slice(&encode_gp_to_xmm_x86_64(1, 1, double));
+            code.extend_from_slice(&encode_sse_scalar_x86_64(opcode, 0, 1, double));
+            code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, double));
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::FloatUnary { op, ty, dst, src } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for FloatUnary not supported".into(),
+                ));
+            };
+            let double = float_is_double(ty)?;
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            match op {
+                lamina_mir::FloatUnOp::FNeg => {
+                    if double {
+                        code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF8, 63]);
+                    } else {
+                        code.extend_from_slice(&[0x0F, 0xBA, 0xF8, 31]);
+                    }
+                }
+                lamina_mir::FloatUnOp::FSqrt => {
+                    code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, double));
+                    code.extend_from_slice(&encode_sse_scalar_x86_64(0x51, 0, 0, double));
+                    code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, double));
+                }
+            }
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::FloatCmp {
+            op,
+            ty,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for FloatCmp not supported".into(),
+                ));
+            };
+            let double = float_is_double(ty)?;
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, lhs, "rax")?);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, rhs, "rcx")?);
+            code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, double));
+            code.extend_from_slice(&encode_gp_to_xmm_x86_64(1, 1, double));
+            // ucomis sets CF/ZF/PF, and an unordered (NaN) pair sets all three, so
+            // seta/setae are false for NaN. Lt and Le compare rhs against lhs.
+            let ucomis_modrm = match op {
+                lamina_mir::FloatCmpOp::Gt | lamina_mir::FloatCmpOp::Ge => 0xC1u8,
+                _ => 0xC8u8,
+            };
+            let ucomis = |code: &mut Vec<u8>| {
+                if double {
+                    code.push(0x66);
+                }
+                code.extend_from_slice(&[0x0F, 0x2E, ucomis_modrm]);
+            };
+            match op {
+                lamina_mir::FloatCmpOp::Eq | lamina_mir::FloatCmpOp::Ne => {
+                    ucomis(&mut code);
+                    if matches!(op, lamina_mir::FloatCmpOp::Eq) {
+                        code.extend_from_slice(&[0x0F, 0x94, 0xC0, 0x0F, 0x9B, 0xC1, 0x20, 0xC8]);
+                    } else {
+                        code.extend_from_slice(&[0x0F, 0x95, 0xC0, 0x0F, 0x9A, 0xC1, 0x08, 0xC8]);
+                    }
+                }
+                _ => {
+                    ucomis(&mut code);
+                    let setcc =
+                        if matches!(op, lamina_mir::FloatCmpOp::Gt | lamina_mir::FloatCmpOp::Lt) {
+                            0x97
+                        } else {
+                            0x93
+                        };
+                    code.extend_from_slice(&[0x0F, setcc, 0xC0]);
+                }
+            }
+            code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::FloatConvert { from, to, dst, src } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for FloatConvert not supported".into(),
+                ));
+            };
+            let from_double = float_is_double(from)?;
+            let to_double = float_is_double(to)?;
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            if from_double != to_double {
+                code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, from_double));
+                // cvtss2sd (F3 0F 5A) widens; cvtsd2ss (F2 0F 5A) narrows.
+                code.extend_from_slice(&encode_sse_scalar_x86_64(0x5A, 0, 0, from_double));
+                code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, to_double));
+            }
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::IntToFloat {
+            from,
+            to,
+            signed,
+            dst,
+            src,
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for IntToFloat not supported".into(),
+                ));
+            };
+            let to_double = float_is_double(to)?;
+            let from_size = from.size_bytes(X86_64_POINTER);
+            if from_size == 8 && !*signed {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: unsigned 64-bit to float not supported".into(),
+                ));
+            }
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            code.extend_from_slice(&encode_extend_rax(from_size, *signed));
+            code.extend_from_slice(&[if to_double { 0xF2 } else { 0xF3 }, 0x48, 0x0F, 0x2A, 0xC0]);
+            code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, to_double));
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::FloatToInt {
+            from,
+            signed,
+            dst,
+            src,
+            ..
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for FloatToInt not supported".into(),
+                ));
+            };
+            if !*signed {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: unsigned float to integer not supported".into(),
+                ));
+            }
+            let from_double = float_is_double(from)?;
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, from_double));
+            // cvttsd2si / cvttss2si with a 64-bit destination.
+            code.extend_from_slice(&[
+                if from_double { 0xF2 } else { 0xF3 },
+                0x48,
+                0x0F,
+                0x2C,
+                0xC0,
+            ]);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
         }
         other => Err(RasError::EncodingError(format!(
             "x86_64 JIT encoder: unsupported instruction {:?}",
