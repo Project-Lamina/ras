@@ -398,10 +398,12 @@ mod jit_host_exec_tests {
     use std::str::FromStr;
 
     use lamina_mir::{
+        AddressSpace,
         block::Block,
         function::{Function, Parameter, Signature},
         instruction::{
-            FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp, IntCmpOp, Operand,
+            AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp,
+            IntCmpOp, MemoryAttrs, Operand,
         },
         module::Module,
         register::{Register, VirtualReg},
@@ -1032,6 +1034,71 @@ mod jit_host_exec_tests {
         assert_eq!(f(1), 10);
         assert_eq!(f(2), 20);
         assert_eq!(f(7), 30);
+    }
+
+    #[test]
+    fn jit_host_exec_stack_region_round_trips_words() {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let at = |offset: i16| AddressMode::BaseOffset {
+            address_space: AddressSpace::default(),
+            base: vreg(0),
+            offset,
+        };
+        let mut module = module_blocks(
+            "stack_pair",
+            &[],
+            vec![(
+                "entry",
+                vec![
+                    Instruction::StackAddr {
+                        dst: vreg(0),
+                        slot: VirtualReg::gpr(9),
+                    },
+                    Instruction::Store {
+                        ty: i64_ty,
+                        src: ii64(35),
+                        addr: at(0),
+                        attrs: MemoryAttrs::default(),
+                    },
+                    Instruction::Store {
+                        ty: i64_ty,
+                        src: ii64(7),
+                        addr: at(8),
+                        attrs: MemoryAttrs::default(),
+                    },
+                    Instruction::Load {
+                        ty: i64_ty,
+                        dst: vreg(1),
+                        addr: at(0),
+                        attrs: MemoryAttrs::default(),
+                    },
+                    Instruction::Load {
+                        ty: i64_ty,
+                        dst: vreg(2),
+                        addr: at(8),
+                        attrs: MemoryAttrs::default(),
+                    },
+                    Instruction::IntBinary {
+                        op: IntBinOp::Add,
+                        ty: i64_ty,
+                        dst: vreg(3),
+                        lhs: reg_op(1),
+                        rhs: reg_op(2),
+                    },
+                    Instruction::Ret {
+                        value: Some(reg_op(3)),
+                    },
+                ],
+            )],
+        );
+        for f in module.functions.values_mut() {
+            f.stack_reservations.insert(VirtualReg::gpr(9), 1);
+            f.stack_alignments.insert(VirtualReg::gpr(9), 16);
+        }
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn() -> i64>(&module) else {
+            return;
+        };
+        assert_eq!(f(), 42);
     }
 
     #[test]
