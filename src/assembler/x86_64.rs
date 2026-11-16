@@ -29,6 +29,12 @@ pub fn compile_mir_x86_64_function(
         .map(|(name, _)| name.clone())
         .collect();
     let mut image_fixups: Vec<(usize, ImageTarget)> = Vec::new();
+    let aggregate_callees: HashSet<String> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| !f.blocks.is_empty() && by_value_abi_refusal(f).is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
     let defined_globals: HashSet<String> = module
         .globals
         .iter()
@@ -70,6 +76,12 @@ pub fn compile_mir_x86_64_function(
     for (func_name, func) in functions_to_compile {
         if func.blocks.is_empty() {
             continue;
+        }
+        if let Some(reason) = by_value_abi_refusal(func) {
+            return Err(RasError::EncodingError(format!(
+                "x86_64 JIT refuses {} in '{}': lamina passes it by pointer, not by the C ABI",
+                reason, func_name
+            )));
         }
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             match &inst.instr {
@@ -170,6 +182,7 @@ pub fn compile_mir_x86_64_function(
             gp_arg_regs: abi.arg_registers(),
             internal: &internal_names,
             defined_globals: &defined_globals,
+            aggregate_callees: &aggregate_callees,
         };
 
         let prologue = encode_prologue_x86_64(aligned_stack_size as u32)?;
@@ -407,6 +420,7 @@ struct CallEnv<'a> {
     gp_arg_regs: &'static [&'static str],
     internal: &'a HashSet<String>,
     defined_globals: &'a HashSet<String>,
+    aggregate_callees: &'a HashSet<String>,
 }
 
 /// A symbol the image resolves once every function and data object has an offset.
@@ -443,6 +457,42 @@ impl CallEnv<'_> {
 
     fn global_name(&self, name: &str) -> Option<String> {
         name_variants(name).find(|candidate| self.defined_globals.contains(candidate))
+    }
+}
+
+/// The compiler-runtime routines lamina calls for 128-bit arithmetic and conversions.
+/// Lamina's module declares them with pointer operands, while a host runtime exports
+/// them with the by-value 128-bit ABI, so the JIT must not call the host copy.
+fn is_wide_integer_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "__divti3"
+            | "__modti3"
+            | "__udivti3"
+            | "__umodti3"
+            | "__fixdfti"
+            | "__fixunsdfti"
+            | "__fixsfti"
+            | "__fixunssfti"
+            | "__floattidf"
+            | "__floatuntidf"
+            | "__floattisf"
+            | "__floatuntisf"
+    )
+}
+
+/// Why the JIT cannot honour the C ABI of `func`, if it cannot. Lamina passes aggregates
+/// and wide integers to a callee by pointer in MIR, and the JIT does not translate that
+/// into the register or stack layout a host caller expects.
+fn by_value_abi_refusal(func: &lamina_mir::Function) -> Option<&'static str> {
+    if func.sig.params.iter().any(|p| p.aggregate.is_some()) {
+        Some("a by-value aggregate parameter")
+    } else if func.sig.ret_aggregate.is_some() {
+        Some("a by-value aggregate return")
+    } else if !func.variadic_wide_arguments.is_empty() || !func.variadic_wide_results.is_empty() {
+        Some("a wide integer in a variadic argument")
+    } else {
+        None
     }
 }
 
@@ -1821,9 +1871,21 @@ fn encode_mir_instruction_x86_64(
             code.push(0xB8);
             code.extend_from_slice(&(vector_args as u32).to_le_bytes());
             if let Some(callee) = calls.internal_name(name) {
+                if calls.aggregate_callees.contains(&callee) {
+                    return Err(RasError::EncodingError(format!(
+                        "x86_64 JIT refuses the call to '{}': it takes or returns a by-value aggregate",
+                        name
+                    )));
+                }
                 code.push(0xE8);
                 push_rel32(&mut code, fixups, &format!("{CALL_LABEL_PREFIX}{callee}"));
             } else {
+                if is_wide_integer_helper(name) {
+                    return Err(RasError::EncodingError(format!(
+                        "x86_64 JIT refuses the wide integer helper '{}': lamina passes i128 values to it by pointer, but the host runtime's routine takes them by value",
+                        name
+                    )));
+                }
                 let addr = resolve_host_symbol(name).ok_or_else(|| {
                     RasError::EncodingError(format!(
                         "x86_64 JIT encoder: cannot resolve external symbol '{}' in this process",
