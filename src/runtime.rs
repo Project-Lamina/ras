@@ -594,6 +594,60 @@ mod jit_host_exec_tests {
         assert_eq!(got, 42);
     }
 
+    fn module_params_added(param_tys: &[ScalarType], lhs: u32, rhs: u32) -> Module {
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let params = param_tys
+            .iter()
+            .enumerate()
+            .map(|(i, scalar)| {
+                Parameter::new(
+                    Register::Virtual(VirtualReg::gpr(i as u32)),
+                    MirType::Scalar(*scalar),
+                )
+            })
+            .collect();
+        let out = Register::Virtual(VirtualReg::gpr(param_tys.len() as u32));
+        let sig = Signature::new("mixed").with_params(params).with_return(i64_ty);
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::IntBinary {
+            op: IntBinOp::Add,
+            ty: i64_ty,
+            dst: out.clone(),
+            lhs: Operand::Register(Register::Virtual(VirtualReg::gpr(lhs))),
+            rhs: Operand::Register(Register::Virtual(VirtualReg::gpr(rhs))),
+        });
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(out)),
+        });
+        f.add_block(entry);
+        let mut module = Module::new("host_mixed_params");
+        module.add_function(f);
+        module
+    }
+
+    #[test]
+    fn jit_host_exec_ints_after_leading_float_param() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_params_added(&[ScalarType::F64, ScalarType::I64, ScalarType::I64], 1, 2);
+        let mem = compile_to_executable(arch, os, &module).expect("compile");
+        let f = unsafe { mem.entry_fn::<extern "C" fn(f64, i64, i64) -> i64>() };
+        assert_eq!(f(0.5, 7, 35), 42);
+    }
+
+    #[test]
+    fn jit_host_exec_ints_around_middle_float_param() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let module = module_params_added(&[ScalarType::I64, ScalarType::F64, ScalarType::I64], 0, 2);
+        let mem = compile_to_executable(arch, os, &module).expect("compile");
+        let f = unsafe { mem.entry_fn::<extern "C" fn(i64, f64, i64) -> i64>() };
+        assert_eq!(f(7, 0.5, 35), 42);
+    }
+
     #[test]
     fn jit_host_exec_i32_sub_immediates() {
         let Some(got) = exec_host_i32(&module_scalar_binop(
