@@ -1037,6 +1037,25 @@ mod jit_host_exec_tests {
     }
 
     #[test]
+    fn jit_host_exec_float_to_i8_saturates() {
+        let module = module_with_body("f2i8", &[ScalarType::F64], ScalarType::I64, |p, out| {
+            Instruction::FloatToInt {
+                from: MirType::Scalar(ScalarType::F64),
+                to: MirType::Scalar(ScalarType::I8),
+                signed: true,
+                dst: out,
+                src: p[0].clone(),
+            }
+        });
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(f64) -> i64>(&module) else {
+            return;
+        };
+        assert_eq!(f(128.0), 127);
+        assert_eq!(f(-128.9), -128);
+        assert_eq!(f(2.5), 2);
+    }
+
+    #[test]
     fn jit_host_exec_stack_region_round_trips_words() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
         let at = |offset: i16| AddressMode::BaseOffset {
