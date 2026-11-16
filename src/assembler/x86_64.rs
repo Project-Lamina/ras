@@ -22,7 +22,12 @@ pub fn compile_mir_x86_64_function(
     let abi = X86ABI::new(assembler.target_os);
     let mut code = Vec::new();
     let mut function_offsets: HashMap<String, usize> = HashMap::new();
-    let internal_names: HashSet<String> = module.functions.keys().cloned().collect();
+    let internal_names: HashSet<String> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| !f.blocks.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
     let mut call_fixups: Vec<(usize, String)> = Vec::new();
 
     let functions_to_compile: Vec<(String, &lamina_mir::Function)> =
@@ -57,6 +62,9 @@ pub fn compile_mir_x86_64_function(
     code.reserve(reserve_hint);
 
     for (func_name, func) in functions_to_compile {
+        if func.blocks.is_empty() {
+            continue;
+        }
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             match &inst.instr {
                 lamina_mir::Instruction::TailCall { .. } => {
@@ -297,6 +305,7 @@ impl CallEnv<'_> {
 fn is_lamina_io_intrinsic(name: &str, args: &[lamina_mir::Operand]) -> bool {
     (name == "lamina.writebyte" && args.len() == 1)
         || (name == "lamina.readbyte" && args.is_empty())
+        || ((name == "lamina.write" || name == "lamina.read") && args.len() == 2)
 }
 
 fn operand_is_float(op: &lamina_mir::Operand) -> bool {
@@ -1458,12 +1467,50 @@ fn encode_mir_instruction_x86_64(
             Ok(code)
         }
         lamina_mir::Instruction::Unreachable => Ok(vec![0x0F, 0x0B]),
+        lamina_mir::Instruction::Bitcast { dst, src, .. } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for Bitcast not supported".into(),
+                ));
+            };
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
         lamina_mir::Instruction::Call { name, args, ret } if is_lamina_io_intrinsic(name, args) => {
             if calls.windows {
                 return Err(RasError::EncodingError(format!(
                     "x86_64 JIT encoder: {} is not available on Windows",
                     name
                 )));
+            }
+            if name == "lamina.write" || name == "lamina.read" {
+                let writing = name == "lamina.write";
+                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, &args[0], "rax")?);
+                code.extend_from_slice(&[0x49, 0x89, 0xC2]);
+                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, &args[1], "rax")?);
+                let fd = if writing { 1u32 } else { 0 };
+                let mut transfer = vec![0x48, 0x89, 0xC2, 0x4C, 0x89, 0xD6, 0xBF];
+                transfer.extend_from_slice(&fd.to_le_bytes());
+                let syscall = if writing { 1u32 } else { 0 };
+                transfer.push(0xB8);
+                transfer.extend_from_slice(&syscall.to_le_bytes());
+                transfer.extend_from_slice(&[0x0F, 0x05]);
+                transfer.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                transfer.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFE, 0xFF, 0xFF, 0xFF]);
+                transfer.extend_from_slice(&[0x48, 0x0F, 0x48, 0xC1]);
+                if !writing {
+                    transfer.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                    transfer.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]);
+                    transfer.extend_from_slice(&[0x48, 0x0F, 0x44, 0xC1]);
+                    code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x84]);
+                    code.extend_from_slice(&(transfer.len() as u32).to_le_bytes());
+                }
+                code.extend_from_slice(&transfer);
+                if let Some(Register::Virtual(dst_v)) = ret {
+                    code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+                }
+                return Ok(code);
             }
             if name == "lamina.writebyte" {
                 code.extend_from_slice(&materialize_operand_to_reg(stack_slots, &args[0], "rax")?);
@@ -2028,10 +2075,10 @@ fn encode_mir_instruction_x86_64(
         }
         lamina_mir::Instruction::FloatToInt {
             from,
+            to,
             signed,
             dst,
             src,
-            ..
         } => {
             let Register::Virtual(dst_v) = dst else {
                 return Err(RasError::EncodingError(
@@ -2046,7 +2093,8 @@ fn encode_mir_instruction_x86_64(
             let from_double = float_is_double(from)?;
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
             code.extend_from_slice(&encode_gp_to_xmm_x86_64(0, 0, from_double));
-            // cvttsd2si / cvttss2si with a 64-bit destination.
+            // cvttsd2si / cvttss2si with a 64-bit destination, then saturate to the
+            // target width the way the other backends do.
             code.extend_from_slice(&[
                 if from_double { 0xF2 } else { 0xF3 },
                 0x48,
@@ -2054,6 +2102,16 @@ fn encode_mir_instruction_x86_64(
                 0x2C,
                 0xC0,
             ]);
+            let bits = to.size_bytes(X86_64_POINTER) * 8;
+            if bits < 64 {
+                let max = (1i64 << (bits - 1)) - 1;
+                let min = -(1i64 << (bits - 1));
+                for (bound, cmov) in [(max, 0x4Fu8), (min, 0x4C)] {
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+                    code.extend_from_slice(&(bound as i32).to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, cmov, 0xC1]);
+                }
+            }
             code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
         }
