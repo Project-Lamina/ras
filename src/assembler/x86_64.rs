@@ -2102,6 +2102,23 @@ fn encode_mir_instruction_x86_64(
                 0x2C,
                 0xC0,
             ]);
+            // The hardware gives 2^63 for NaN and for anything at or past 2^63, so a
+            // value there becomes i64::MAX, and NaN becomes zero, before the clamp.
+            let two_pow_63 = if from_double {
+                0x43E0_0000_0000_0000i64
+            } else {
+                i64::from(0x5F00_0000u32)
+            };
+            code.extend_from_slice(&mov_imm64(2, i64::MAX));
+            code.extend_from_slice(&mov_imm64(1, two_pow_63));
+            code.extend_from_slice(&encode_gp_to_xmm_x86_64(1, 1, from_double));
+            if from_double {
+                code.push(0x66);
+            }
+            code.extend_from_slice(&[0x0F, 0x2E, 0xC1]);
+            code.extend_from_slice(&[0x48, 0x0F, 0x43, 0xC2]);
+            code.extend_from_slice(&[0xB9, 0, 0, 0, 0]);
+            code.extend_from_slice(&[0x48, 0x0F, 0x4A, 0xC1]);
             let bits = to.size_bytes(X86_64_POINTER) * 8;
             if bits < 64 {
                 let max = (1i64 << (bits - 1)) - 1;
