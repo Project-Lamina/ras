@@ -486,7 +486,7 @@ mod jit_host_exec_tests {
         function::{Function, Parameter, Signature},
         instruction::{
             AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp,
-            IntCmpOp, IntOverflowOp, MemoryAttrs, Operand,
+            IntCmpOp, IntOverflowOp, IntUnOp, MemoryAttrs, Operand,
         },
         module::Module,
         register::{Register, VirtualReg},
@@ -2201,6 +2201,89 @@ mod jit_host_exec_tests {
             err.to_string().contains("by-value aggregate argument"),
             "{err}"
         );
+    }
+
+    fn popcount_of_i64_param(ty: ScalarType) -> Module {
+        let mut module = Module::new("popcount");
+        module.add_function(function_with_body(
+            "pop",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::IntUnary {
+                    op: IntUnOp::Popcount,
+                    ty: MirType::Scalar(ty),
+                    dst: vreg(1),
+                    src: reg_op(0),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        ));
+        module
+    }
+
+    fn popcount_samples() -> Vec<i64> {
+        let mut values = vec![
+            0,
+            1,
+            -1,
+            i64::MIN,
+            i64::MAX,
+            0x5555_5555_5555_5555,
+            0x0F0F_0F0F_0F0F_0F0F,
+            0x0123_4567_89AB_CDEF,
+            0xFFFF_0000_FFFF_0000u64 as i64,
+            0x1_0000_0001,
+            0x8000_0000,
+            0x7F,
+        ];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..256 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            values.push(x as i64);
+        }
+        values
+    }
+
+    #[test]
+    fn jit_host_exec_popcount_counts_every_bit_of_an_i64() {
+        let module = popcount_of_i64_param(ScalarType::I64);
+        let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(i64) -> i64>(&module, "pop")
+        else {
+            return;
+        };
+        for v in popcount_samples() {
+            assert_eq!(f(v), i64::from(v.count_ones()), "popcount of {v:#x}");
+        }
+    }
+
+    #[test]
+    fn jit_host_exec_popcount_ignores_bits_above_its_width() {
+        let samples = popcount_samples();
+        for (ty, mask_bits) in [
+            (ScalarType::I1, 1u32),
+            (ScalarType::I8, 8),
+            (ScalarType::I16, 16),
+            (ScalarType::I32, 32),
+        ] {
+            let module = popcount_of_i64_param(ty);
+            let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(i64) -> i64>(&module, "pop")
+            else {
+                return;
+            };
+            for &v in &samples {
+                let low = (v as u64) & ((1u64 << mask_bits) - 1);
+                assert_eq!(
+                    f(v),
+                    i64::from(low.count_ones()),
+                    "popcount of the low {mask_bits} bits of {v:#x}"
+                );
+            }
+        }
     }
 
     #[test]
