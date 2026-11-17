@@ -2,6 +2,7 @@
 //!
 //! This module handles compilation of MIR to x86_64 binary machine code.
 
+use crate::assembler::is_wide_integer_helper;
 use crate::{assembler::core::RasAssembler, error::RasError};
 use lamina_mir::{MirType, ScalarType};
 use lamina_platform::{PointerWidth, TargetArchitecture, TargetOperatingSystem};
@@ -451,27 +452,6 @@ impl CallEnv<'_> {
     fn global_name(&self, name: &str) -> Option<String> {
         name_variants(name).find(|candidate| self.defined_globals.contains(candidate))
     }
-}
-
-/// The compiler-runtime routines lamina calls for 128-bit arithmetic and conversions.
-/// Lamina's module declares them with pointer operands, while a host runtime exports
-/// them with the by-value 128-bit ABI, so the JIT must not call the host copy.
-fn is_wide_integer_helper(name: &str) -> bool {
-    matches!(
-        name,
-        "__divti3"
-            | "__modti3"
-            | "__udivti3"
-            | "__umodti3"
-            | "__fixdfti"
-            | "__fixunsdfti"
-            | "__fixsfti"
-            | "__fixunssfti"
-            | "__floattidf"
-            | "__floatuntidf"
-            | "__floattisf"
-            | "__floatuntisf"
-    )
 }
 
 /// Why the JIT cannot honour the C ABI of `func`, if it cannot. Lamina passes aggregates
