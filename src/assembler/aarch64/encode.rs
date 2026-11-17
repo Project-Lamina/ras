@@ -720,32 +720,42 @@ pub(super) fn encode_extern_call(
             "AArch64 JIT: extern call to @{name}: {what}"
         )))
     };
-    let Some(func) = module
+    // A C symbol the module never declares is called from the operands alone: every
+    // lamina call to one passes scalars, and the float file is the only split the call
+    // has to get right.
+    let sig = module
         .functions
         .get(name)
         .or_else(|| module.functions.get(name.trim_start_matches('@')))
-    else {
-        return refuse("no declaration in this module");
-    };
-    let sig = &func.sig;
-    if sig.variadic && assembler.target_os != lamina_platform::TargetOperatingSystem::MacOS {
-        return refuse("variadic call is only written for Darwin");
+        .map(|func| &func.sig);
+    if let Some(sig) = sig {
+        if sig.variadic && assembler.target_os != lamina_platform::TargetOperatingSystem::MacOS {
+            return refuse("variadic call is only written for Darwin");
+        }
+        let fixed = sig.params.len();
+        if args.len() < fixed || (!sig.variadic && args.len() != fixed) {
+            return refuse("argument count does not match the declaration");
+        }
+        if sig.params.iter().any(|p| p.ty.is_vector()) || sig.ret_ty.is_some_and(|t| t.is_vector())
+        {
+            return refuse("vector values not supported");
+        }
     }
-    let fixed = sig.params.len();
-    if args.len() < fixed || (!sig.variadic && args.len() != fixed) {
-        return refuse("argument count does not match the declaration");
-    }
-    if sig.params.iter().any(|p| p.ty.is_vector()) || sig.ret_ty.is_some_and(|t| t.is_vector()) {
-        return refuse("vector values not supported");
-    }
+    let fixed = sig.map_or(args.len(), |sig| sig.params.len());
 
     let (mut next_general, mut next_float) = (0u8, 0u8);
-    for (param, arg) in sig.params.iter().zip(args) {
-        if param.ty.is_float() {
+    for (index, arg) in args.iter().take(fixed).enumerate() {
+        let declared = sig.and_then(|sig| sig.params.get(index)).map(|p| p.ty);
+        let float = declared.map_or_else(|| operand_is_float(arg), |ty| ty.is_float());
+        if float {
             if next_float == 8 {
                 return refuse("float stack arguments not supported");
             }
-            let prefix = float_register_prefix(&param.ty)?;
+            let prefix = match declared {
+                Some(ty) => float_register_prefix(&ty)?,
+                None if matches!(arg, Operand::Immediate(Immediate::F32(_))) => "s",
+                None => "d",
+            };
             materialize_operand(assembler, arg, 16, stack_slots, reg_alloc, code, stack_size)?;
             encode_float_in(assembler, code, prefix, next_float, 16)?;
             next_float += 1;
@@ -798,7 +808,7 @@ pub(super) fn encode_extern_call(
     }
 
     if let Some(dst) = ret {
-        match sig.ret_ty {
+        match sig.and_then(|sig| sig.ret_ty) {
             Some(ty) if ty.is_float() => {
                 let prefix = float_register_prefix(&ty)?;
                 encode_float_out(assembler, code, prefix, 0)?;
@@ -815,6 +825,76 @@ pub(super) fn encode_extern_call(
         store_to_slot(code, "x0", dst, stack_slots)?;
     }
     Ok(())
+}
+
+/// Which arguments of a call travel in floating-point registers. The callee's declaration
+/// says so where this module has one; otherwise the operand does, as a float literal or a
+/// value the register allocator put in the float file.
+#[cfg(feature = "encoder")]
+pub(super) fn callee_float_arguments(
+    assembler: &RasAssembler,
+    name: &str,
+    args: &[Operand],
+) -> Result<Vec<bool>, RasError> {
+    let declared = callee_signature(assembler, name);
+    Ok(args
+        .iter()
+        .enumerate()
+        .map(
+            |(index, arg)| match declared.and_then(|sig| sig.params.get(index)) {
+                Some(param) => param.ty.is_float(),
+                None => operand_is_float(arg),
+            },
+        )
+        .collect())
+}
+
+/// `s` or `d` for a float argument, from the callee's declaration where there is one and
+/// from the literal's own width otherwise.
+#[cfg(feature = "encoder")]
+pub(super) fn float_argument_prefix(
+    assembler: &RasAssembler,
+    name: &str,
+    arg: &Operand,
+) -> Result<&'static str, RasError> {
+    if let Some(sig) = callee_signature(assembler, name)
+        && let Some(param) = sig.params.iter().find(|param| param.ty.is_float())
+    {
+        return float_register_prefix(&param.ty);
+    }
+    Ok(match arg {
+        Operand::Immediate(Immediate::F32(_)) => "s",
+        _ => "d",
+    })
+}
+
+#[cfg(feature = "encoder")]
+fn callee_signature<'a>(
+    assembler: &'a RasAssembler,
+    name: &str,
+) -> Option<&'a lamina_mir::Signature> {
+    let module = assembler.current_module?;
+    // SAFETY: compile_mir_to_binary_function sets this from the module it is still borrowing.
+    let module = unsafe { &*module };
+    module
+        .functions
+        .get(name)
+        .or_else(|| module.functions.get(name.trim_start_matches('@')))
+        .or_else(|| {
+            module
+                .functions
+                .get(&format!("@{}", name.trim_start_matches('@')))
+        })
+        .map(|func| &func.sig)
+}
+
+#[cfg(feature = "encoder")]
+fn operand_is_float(arg: &Operand) -> bool {
+    match arg {
+        Operand::Immediate(Immediate::F32(_) | Immediate::F64(_)) => true,
+        Operand::Register(Register::Virtual(v)) => v.class == lamina_mir::RegisterClass::Fpr,
+        _ => false,
+    }
 }
 
 /// The address of a C symbol loaded in this process.
@@ -961,12 +1041,32 @@ pub(super) fn encode_float_out(
     prefix: &str,
     general: u8,
 ) -> Result<(), RasError> {
+    encode_float_out_from(assembler, code, prefix, 0, general)
+}
+
+/// Move float bits from `s<index>` or `d<index>` back to a general register.
+#[cfg(feature = "encoder")]
+pub(super) fn encode_float_out_from(
+    assembler: &mut RasAssembler,
+    code: &mut Vec<u8>,
+    prefix: &str,
+    index: u8,
+    general: u8,
+) -> Result<(), RasError> {
     let target = if prefix == "s" { "w" } else { "x" };
     encode_text(
         assembler,
         code,
-        &format!("fmov {target}{general}, {prefix}0"),
+        &format!("fmov {target}{general}, {prefix}{index}"),
     )
+}
+
+/// Whether a parameter travels in a floating-point register. The type says so, and the
+/// register class says so for a value the signature gives no scalar type.
+#[cfg(feature = "encoder")]
+pub(super) fn is_float_parameter(param: &lamina_mir::Parameter) -> bool {
+    matches!(param.ty, MirType::Scalar(ScalarType::F32 | ScalarType::F64))
+        || matches!(&param.reg, Register::Virtual(v) if v.class == lamina_mir::RegisterClass::Fpr)
 }
 
 pub(super) fn parse_register(reg: &str) -> Result<u8, RasError> {

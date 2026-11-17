@@ -123,26 +123,63 @@ pub fn compile_mir_aarch64_function(
         // argument registers have to be spilled to those slots first.
         if !func.sig.params.is_empty() {
             let arg_regs = AArch64ABI::ARG_REGISTERS;
+            // AAPCS64 counts the two register files apart: integers fill x0-x7 and floats
+            // d0-d7, each in its own order, and whichever file runs out sends the rest of
+            // its arguments to the stack. A float lands in its slot as the bits it holds,
+            // which is the shape the rest of this encoder reads it in.
+            let mut next_int = 0usize;
+            let mut next_float = 0usize;
+            let mut next_stack = 0usize;
 
-            for (index, param) in func.sig.params.iter().enumerate() {
-                if let Register::Virtual(vreg) = &param.reg
-                    && let Some(slot_off) = stack_slots.get(vreg)
-                {
-                    if index < arg_regs.len() {
-                        let str_bytes =
-                            encode_str(arg_regs[index], 29 /* x29 (FP) */, *slot_off)?;
-                        code.extend_from_slice(&str_bytes);
-                    } else {
-                        // Handle stack arguments (AAPCS64: stack args start at caller's [sp, #0])
-                        // After prologue: stp x29,x30,[sp,#-16]! then mov x29,sp
-                        // Caller's stack args are now at [x29, #16] (16 bytes for saved fp/lr)
-                        // First stack arg (arg8) is at [x29, #16], second at [x29, #24], etc.
-                        let stack_arg_index = index - arg_regs.len();
-                        let caller_off = (16 + stack_arg_index * 8) as i32; // 16 for saved fp/lr
-                        let ldr1 = encode_ldr("x10", 29, caller_off)?;
-                        code.extend_from_slice(&ldr1);
-                        let str1 = encode_str("x10", 29, *slot_off)?;
-                        code.extend_from_slice(&str1);
+            for param in &func.sig.params {
+                let float = is_float_parameter(param);
+                let taken = if float { next_float } else { next_int };
+                let in_register = taken < arg_regs.len();
+                if float {
+                    next_float += 1;
+                } else {
+                    next_int += 1;
+                }
+                let stack_index = if in_register {
+                    None
+                } else {
+                    let index = next_stack;
+                    next_stack += 1;
+                    Some(index)
+                };
+
+                let Register::Virtual(vreg) = &param.reg else {
+                    continue;
+                };
+                let Some(slot_off) = stack_slots.get(vreg).copied() else {
+                    continue;
+                };
+
+                match stack_index {
+                    None if float => {
+                        let prefix = float_register_prefix(&param.ty).unwrap_or("d");
+                        encode_float_out_from(
+                            assembler,
+                            &mut code,
+                            prefix,
+                            taken as u8,
+                            10, /* x10 */
+                        )?;
+                        code.extend_from_slice(&encode_str("x10", 29, slot_off)?);
+                    }
+                    None => {
+                        code.extend_from_slice(&encode_str(
+                            arg_regs[taken],
+                            29, /* x29 (FP) */
+                            slot_off,
+                        )?);
+                    }
+                    // AAPCS64 puts the overflow arguments above the caller's frame, and the
+                    // prologue saved x29 and x30 below them.
+                    Some(index) => {
+                        let caller_off = (16 + index * 8) as i32;
+                        code.extend_from_slice(&encode_ldr("x10", 29, caller_off)?);
+                        code.extend_from_slice(&encode_str("x10", 29, slot_off)?);
                     }
                 }
             }
@@ -662,7 +699,6 @@ fn encode_mir_instruction_with_context(
             let dst_reg = parse_register(dst_reg_str)?;
 
             let unsigned_atom = matches!(op, IntBinOp::UDiv | IntBinOp::URem);
-
             match ty {
                 MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => {
                     materialize_operand(
@@ -1476,21 +1512,66 @@ fn encode_mir_instruction_with_context(
             }
 
             let arg_regs = AArch64ABI::ARG_REGISTERS;
-            for (i, arg) in args.iter().enumerate().take(8) {
-                let arg_reg_str = arg_regs[i];
-                let arg_reg = parse_register(arg_reg_str)?;
-                materialize_operand(
-                    assembler,
-                    arg,
-                    arg_reg,
-                    stack_slots,
-                    reg_alloc,
-                    &mut code,
-                    stack_size,
-                )?;
+            let floats = callee_float_arguments(assembler, name, args)?;
+            let any_float = floats.iter().any(|float| *float);
+            if any_float {
+                // Each file holds eight, and a call that spills one of them needs the
+                // packing rules the stack path below does not keep apart.
+                let float_count = floats.iter().filter(|float| **float).count();
+                if float_count > 8 || args.len() - float_count > 8 {
+                    return Err(RasError::EncodingError(format!(
+                        "AArch64 JIT: call to '{name}' passes floats and stack arguments together, not supported"
+                    )));
+                }
+                let (mut next_int, mut next_float) = (0u8, 0u8);
+                for (arg, float) in args.iter().zip(&floats) {
+                    if *float {
+                        materialize_operand(
+                            assembler,
+                            arg,
+                            16,
+                            stack_slots,
+                            reg_alloc,
+                            &mut code,
+                            stack_size,
+                        )?;
+                        let prefix = float_argument_prefix(assembler, name, arg)?;
+                        encode_float_in(assembler, &mut code, prefix, next_float, 16)?;
+                        next_float += 1;
+                    } else {
+                        materialize_operand(
+                            assembler,
+                            arg,
+                            next_int,
+                            stack_slots,
+                            reg_alloc,
+                            &mut code,
+                            stack_size,
+                        )?;
+                        next_int += 1;
+                    }
+                }
+            } else {
+                for (i, arg) in args.iter().enumerate().take(8) {
+                    let arg_reg_str = arg_regs[i];
+                    let arg_reg = parse_register(arg_reg_str)?;
+                    materialize_operand(
+                        assembler,
+                        arg,
+                        arg_reg,
+                        stack_slots,
+                        reg_alloc,
+                        &mut code,
+                        stack_size,
+                    )?;
+                }
             }
 
-            let stack_args = if args.len() > 8 { &args[8..] } else { &[] };
+            let stack_args = if args.len() > 8 && !any_float {
+                &args[8..]
+            } else {
+                &[][..]
+            };
             let stack_space = (stack_args.len() * 8 + 15) & !15;
             if stack_space > 0 {
                 if stack_space > 0xFFF {
@@ -2419,6 +2500,40 @@ mod aarch64_jit_tail_call_tests {
         let err = compile_mir_aarch64_function(&mut asm, &m, None)
             .expect_err("physical register operand must not encode");
         assert!(format!("{err:?}").contains("Physical register"));
+    }
+
+    /// AAPCS64 passes floats in d0-d7 and integers in x0-x7, each counted on its own.
+    #[test]
+    fn compile_mir_aarch64_float_params_come_from_the_float_registers() {
+        let f64_ty = MirType::Scalar(ScalarType::F64);
+        let i64_ty = MirType::Scalar(ScalarType::I64);
+        let first = Register::Virtual(VirtualReg::fpr(0));
+        let second = Register::Virtual(VirtualReg::fpr(1));
+        let whole = Register::Virtual(VirtualReg::gpr(2));
+        let sig = Signature::new("floats_first")
+            .with_params(vec![
+                Parameter::new(first.clone(), f64_ty),
+                Parameter::new(second.clone(), f64_ty),
+                Parameter::new(whole.clone(), i64_ty),
+            ])
+            .with_return(i64_ty);
+        let mut f = Function::new(sig);
+        let mut entry = Block::new("entry");
+        entry.push(Instruction::Ret {
+            value: Some(Operand::Register(whole.clone())),
+        });
+        f.add_block(entry);
+        let mut module = Module::new("float_params");
+        module.add_function(f);
+
+        let mut asm = RasAssembler::new(TargetArchitecture::Aarch64, TargetOperatingSystem::Linux)
+            .expect("assembler");
+        let (code, _) = compile_mir_aarch64_function(&mut asm, &module, None).expect("compile");
+        // fmov x10, d0 and fmov x10, d1
+        assert!(subslice_present(&code, &0x9e66_000au32.to_le_bytes()));
+        assert!(subslice_present(&code, &0x9e66_002au32.to_le_bytes()));
+        // the integer parameter is the first of its own file, so it arrives in x0
+        assert!(!subslice_present(&code, &0x9e66_004au32.to_le_bytes()));
     }
 
     #[test]
