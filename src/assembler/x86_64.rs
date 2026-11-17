@@ -2304,6 +2304,38 @@ fn encode_mir_instruction_x86_64(
             code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
         }
+        lamina_mir::Instruction::AtomicLoad { ty, dst, addr, .. } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for AtomicLoad not supported".into(),
+                ));
+            };
+            atomic_width_x86_64(ty)?;
+            let kind = mir_ty_x86_gp_load_kind(ty)?;
+            let (addr_code, disp) = materialize_atomic_address(stack_slots, addr)?;
+            code.extend_from_slice(&addr_code);
+            code.extend_from_slice(&encode_gp_load_membase_x86_64(0, 2, disp, kind)?);
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::AtomicStore { ty, src, addr, .. } => {
+            let bits = atomic_width_x86_64(ty)?;
+            let (addr_code, disp) = materialize_atomic_address(stack_slots, addr)?;
+            code.extend_from_slice(&addr_code);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rcx")?);
+            // xchg with memory is implicitly locked, so the store is not reordered
+            // after a later load in any ordering.
+            code.extend_from_slice(&encode_locked_mem_x86_64(
+                bits,
+                1,
+                2,
+                disp,
+                true,
+                if bits == 8 { &[0x86] } else { &[0x87] },
+            ));
+            Ok(code)
+        }
+        lamina_mir::Instruction::Fence { .. } => Ok(vec![0x0F, 0xAE, 0xF0]),
         lamina_mir::Instruction::Jmp { target } => {
             push_jmp_rel32(&mut code, fixups, target);
             Ok(code)
