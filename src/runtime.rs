@@ -1459,6 +1459,9 @@ mod jit_host_exec_tests {
         assert_eq!(g(), 1);
     }
 
+    /// Only the x86_64 encoder refuses: the aarch64 one keeps i1 a byte wide and lands on
+    /// the AOT result, which `bool_arithmetic_is_byte_wide_like_the_aot_backend` pins down.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn jit_refuses_i1_wrap_around_arithmetic() {
         let Some((arch, os)) = host_jit_pair() else {
