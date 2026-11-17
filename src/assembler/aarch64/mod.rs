@@ -1476,7 +1476,7 @@ fn encode_mir_instruction_with_context(
             reg_alloc.free_scratch(rhs_reg_str);
             reg_alloc.free_scratch(dst_reg_str);
         }
-        lamina_mir::Instruction::Call { name, args, ret } => {
+        lamina_mir::Instruction::Call { name, args, ret, .. } => {
             if assembler.target_os == lamina_platform::TargetOperatingSystem::MacOS
                 && encode_macos_io(
                     assembler,
@@ -2378,6 +2378,7 @@ mod aarch64_jit_tail_call_tests {
             name: "sink".to_string(),
             args,
             ret: Some(Register::Virtual(VirtualReg::gpr(200))),
+            ret_ty: Some(MirType::Scalar(ScalarType::I64)),
         });
         caller_entry.push(Instruction::Ret {
             value: Some(Operand::Register(Register::Virtual(VirtualReg::gpr(200)))),

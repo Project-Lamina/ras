@@ -1530,6 +1530,7 @@ mod jit_host_exec_tests {
                     name: "__divti3".into(),
                     args: vec![reg_op(0), reg_op(1)],
                     ret: Some(vreg(2)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::Ptr)),
                 },
                 Instruction::Ret {
                     value: Some(reg_op(2)),
@@ -1679,11 +1680,13 @@ mod jit_host_exec_tests {
                     name: "inc".into(),
                     args: vec![reg_op(0)],
                     ret: Some(vreg(1)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::I64)),
                 },
                 Instruction::Call {
                     name: "inc".into(),
                     args: vec![reg_op(1)],
                     ret: Some(vreg(2)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::I64)),
                 },
                 Instruction::Ret {
                     value: Some(reg_op(2)),
@@ -1729,11 +1732,13 @@ mod jit_host_exec_tests {
                     name: "half".into(),
                     args: vec![reg_op(0)],
                     ret: Some(vreg(1)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::F64)),
                 },
                 Instruction::Call {
                     name: "half".into(),
                     args: vec![reg_op(1)],
                     ret: Some(vreg(2)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::F64)),
                 },
                 Instruction::Ret {
                     value: Some(reg_op(2)),
@@ -1777,6 +1782,7 @@ mod jit_host_exec_tests {
                     name: "sum8".into(),
                     args: (0..8).map(reg_op).collect(),
                     ret: Some(vreg(8)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::I64)),
                 },
                 Instruction::Ret {
                     value: Some(reg_op(8)),
@@ -1810,6 +1816,7 @@ mod jit_host_exec_tests {
                         name: "llabs".into(),
                         args: vec![reg_op(0)],
                         ret: Some(vreg(1)),
+                        ret_ty: Some(MirType::Scalar(ScalarType::I64)),
                     },
                     Instruction::IntBinary {
                         op: IntBinOp::Add,

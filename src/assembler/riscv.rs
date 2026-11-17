@@ -672,7 +672,7 @@ fn encode_instruction(
             branch_fixups.push((jal_abs, false_target.clone(), BranchFixupOp::Jal));
         }
 
-        Instruction::Call { name, args, ret } => {
+        Instruction::Call { name, args, ret, .. } => {
             for (i, arg) in args.iter().enumerate() {
                 if i >= ARG_REGS.len() {
                     return Err(RasError::EncodingError(
@@ -1016,6 +1016,7 @@ mod mir_call_tests {
             name: "helper".to_string(),
             args: Vec::new(),
             ret: None,
+            ret_ty: None,
         });
         entry.push(Instruction::Ret { value: None });
         caller.add_block(entry);

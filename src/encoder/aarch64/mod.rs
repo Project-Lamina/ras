@@ -3214,6 +3214,7 @@ mod tests {
                 name: "callee".to_string(),
                 args: (0..10).map(|n| imm(n + 500)).collect(),
                 ret: Some(v(0)),
+                ret_ty: Some(MirType::Scalar(ScalarType::I64)),
             });
             caller_entry.push(Instruction::Ret {
                 value: Some(reg(0)),
@@ -3360,6 +3361,7 @@ mod tests {
                 name: "lamina.writebyte".to_string(),
                 args: vec![imm(10)],
                 ret: Some(v(0)),
+                ret_ty: Some(MirType::Scalar(ScalarType::I64)),
             });
             entry.push(Instruction::Ret {
                 value: Some(reg(0)),
@@ -3406,6 +3408,7 @@ mod tests {
                 name: "labs".to_string(),
                 args: vec![imm(-42)],
                 ret: Some(v(0)),
+                ret_ty: Some(MirType::Scalar(ScalarType::I64)),
             });
             entry.push(Instruction::Ret {
                 value: Some(reg(0)),
@@ -3428,6 +3431,7 @@ mod tests {
                 name: "abs".to_string(),
                 args: vec![imm(-7)],
                 ret: Some(v(0)),
+                ret_ty: Some(MirType::Scalar(ScalarType::I32)),
             });
             entry.push(Instruction::Ret {
                 value: Some(reg(0)),
@@ -3581,6 +3585,7 @@ mod tests {
                 name: "inner".to_string(),
                 args: Vec::new(),
                 ret: Some(v(1)),
+                ret_ty: Some(MirType::Scalar(ScalarType::I64)),
             });
             again.push(Instruction::IntBinary {
                 op: IntBinOp::Add,
@@ -3849,6 +3854,7 @@ mod tests {
                 name: "ldexp".to_string(),
                 args: vec![f64_imm(1.5), imm(3)],
                 ret: Some(v(0)),
+                ret_ty: Some(MirType::Scalar(ScalarType::F64)),
             });
             ret(&mut entry, 0);
             let mut main = Function::new(Signature::new("main").with_return(I64));
@@ -3885,6 +3891,7 @@ mod tests {
                 name: "snprintf".to_string(),
                 args: vec![reg(1), imm(32), reg(2), imm(123), imm(-45)],
                 ret: Some(v(3)),
+                ret_ty: Some(MirType::Scalar(ScalarType::I32)),
             });
             ret(&mut entry, 3);
             let mut main = Function::new(Signature::new("main").with_return(I64));
@@ -5514,6 +5521,7 @@ mod tests {
                 name: "takes".to_string(),
                 args: vec![reg(1)],
                 ret: None,
+                ret_ty: None,
             });
             main_entry.push(Instruction::Ret { value: None });
             let mut main = Function::new(Signature::new("main"));
@@ -5819,6 +5827,7 @@ mod tests {
                 name: "add_half".to_string(),
                 args: vec![f64_operand(2.25f64.to_bits())],
                 ret: Some(v(1)),
+                ret_ty: Some(MirType::Scalar(ScalarType::F64)),
             });
             entry.push(Instruction::Bitcast {
                 from: F64_TY,
