@@ -22,8 +22,11 @@ path = "src/lib.rs"
 lamina-platform = "0.2.1"
 lamina-mir = { version = "0.2.1", optional = true }
 lamina-codegen = "0.2.1"
-libc = "0.2"
 log = "0.4"
+
+# Only the Unix paths call into it: dlopen, dlsym and mmap.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []
