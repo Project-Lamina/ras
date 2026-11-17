@@ -503,14 +503,11 @@ mod jit_host_exec_tests {
         runtime::{ExecutableMemory, RasRuntime},
     };
 
-    /// The host pair these tests run code on. Only x86_64, because the aarch64 JIT
-    /// encoder has no float path and refuses none of the shapes it cannot encode, so
-    /// running its output proves nothing yet.
     fn host_jit_pair() -> Option<(TargetArchitecture, TargetOperatingSystem)> {
         let arch = TargetArchitecture::from_str(detect_host_architecture_only()).ok()?;
         let os = TargetOperatingSystem::from_str(detect_host_os()).ok()?;
         match arch {
-            TargetArchitecture::X86_64 => Some((arch, os)),
+            TargetArchitecture::X86_64 | TargetArchitecture::Aarch64 => Some((arch, os)),
             _ => None,
         }
     }
