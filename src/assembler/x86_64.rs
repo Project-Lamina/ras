@@ -560,6 +560,78 @@ fn narrow_int_return(scalar: ScalarType) -> Option<(u32, bool)> {
     }
 }
 
+/// ModRM, SIB and displacement bytes for `[base + disp]` with `reg` in the reg field.
+fn membase_operand_x86_64(reg: u8, base: u8, disp: i32) -> Vec<u8> {
+    let base_low = base & 7;
+    let need_sib = base_low == 4;
+    let (mod_bits, disp_bytes): (u8, Vec<u8>) = if disp == 0 && base_low != 5 {
+        (0b00, vec![])
+    } else if (-128..=127).contains(&disp) {
+        (0b01, vec![disp as u8])
+    } else {
+        (0b10, disp.to_le_bytes().to_vec())
+    };
+    let mut code = vec![modrm(mod_bits, reg, if need_sib { 4 } else { base_low })];
+    if need_sib {
+        code.push(0x24);
+    }
+    code.extend_from_slice(&disp_bytes);
+    code
+}
+
+/// A locked read-modify-write on `[base + disp]` of `bits` width. `opcode` is the
+/// opcode after the prefixes, with the byte or word/long/quad form already chosen.
+fn encode_locked_mem_x86_64(
+    bits: u32,
+    reg: u8,
+    base: u8,
+    disp: i32,
+    lock: bool,
+    opcode: &[u8],
+) -> Vec<u8> {
+    let mut code = Vec::new();
+    if bits == 16 {
+        code.push(0x66);
+    }
+    if lock {
+        code.push(0xF0);
+    }
+    let rex = 0x40 | (u8::from(bits == 64) << 3) | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
+    if rex != 0x40 || (bits == 8 && reg >= 4) {
+        code.push(rex);
+    }
+    code.extend_from_slice(opcode);
+    code.extend(membase_operand_x86_64(reg, base, disp));
+    code
+}
+
+/// Moves the low `bits` of `src` into rax, sign-extended to 64 bits.
+fn sign_extend_to_rax_x86_64(src: u8, bits: u32) -> Vec<u8> {
+    if bits == 64 {
+        alu_rr64_x86_64(0x89, src, 0)
+    } else {
+        extend_low_bits_x86_64(0, src, bits, true)
+    }
+}
+
+/// Two-register ALU form `op r/m64, r64`: `rm` is the destination.
+fn alu_rr64_x86_64(opcode: u8, reg: u8, rm: u8) -> Vec<u8> {
+    vec![rex_w_r_b(true, reg, rm), opcode, modrm(0b11, reg, rm)]
+}
+
+/// Bit width of an integer type an atomic operation can access.
+fn atomic_width_x86_64(ty: &MirType) -> Result<u32, RasError> {
+    match ty {
+        MirType::Scalar(ScalarType::I8) => Ok(8),
+        MirType::Scalar(ScalarType::I16) => Ok(16),
+        MirType::Scalar(ScalarType::I32) => Ok(32),
+        MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => Ok(64),
+        _ => Err(RasError::EncodingError(
+            "x86_64 JIT encoder: atomic operation on a non-integer type".into(),
+        )),
+    }
+}
+
 /// Population count of the low `bits` bits of rax, left in rax. Bit-twiddling, so it
 /// needs nothing beyond the base x86_64 ISA. Clobbers rcx and rdx.
 #[cfg(feature = "encoder")]
@@ -1594,6 +1666,46 @@ fn encode_mir_instruction_x86_64(
             .count() as u32)
     }
 
+    /// Puts the address in rdx (index in rsi) and returns the displacement from rdx.
+    fn materialize_atomic_address(
+        slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+        addr: &AddressMode,
+    ) -> Result<(Vec<u8>, i32), RasError> {
+        match addr {
+            AddressMode::BaseOffset { base, offset, .. } => Ok((
+                materialize_reg_pointer(slots, base, "rdx")?,
+                i32::from(*offset),
+            )),
+            AddressMode::BaseIndexScale {
+                base,
+                index,
+                scale,
+                offset,
+                ..
+            } => {
+                let sh = match *scale {
+                    1 => 0u8,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
+                    _ => {
+                        return Err(RasError::EncodingError(format!(
+                            "x86_64 JIT: unsupported scale {}",
+                            scale
+                        )));
+                    }
+                };
+                let mut code = materialize_reg_pointer(slots, base, "rdx")?;
+                code.extend_from_slice(&materialize_reg_pointer(slots, index, "rsi")?);
+                if sh > 0 {
+                    code.extend_from_slice(&[0x48, 0xC1, modrm(0b11, 4, 6), sh]);
+                }
+                code.extend_from_slice(&alu_rr64_x86_64(0x01, 6, 2));
+                Ok((code, i32::from(*offset)))
+            }
+        }
+    }
+
     let mut code = Vec::with_capacity(64);
 
     match inst {
@@ -2061,6 +2173,134 @@ fn encode_mir_instruction_x86_64(
             };
             code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
             code.extend_from_slice(&encode_popcount_rax_x86_64(bits));
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::AtomicBinary {
+            op,
+            ty,
+            dst,
+            addr,
+            value,
+            ..
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for AtomicBinary not supported".into(),
+                ));
+            };
+            let bits = atomic_width_x86_64(ty)?;
+            let kind = mir_ty_x86_gp_load_kind(ty)?;
+            let (addr_code, disp) = materialize_atomic_address(stack_slots, addr)?;
+            code.extend_from_slice(&addr_code);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, value, "rcx")?);
+            let old_in = match op {
+                lamina_mir::AtomicBinOp::Add => {
+                    code.extend_from_slice(&encode_locked_mem_x86_64(
+                        bits,
+                        1,
+                        2,
+                        disp,
+                        true,
+                        if bits == 8 {
+                            &[0x0F, 0xC0]
+                        } else {
+                            &[0x0F, 0xC1]
+                        },
+                    ));
+                    1
+                }
+                lamina_mir::AtomicBinOp::Sub => {
+                    code.extend_from_slice(&[0x48, 0xF7, 0xD9]);
+                    code.extend_from_slice(&encode_locked_mem_x86_64(
+                        bits,
+                        1,
+                        2,
+                        disp,
+                        true,
+                        if bits == 8 {
+                            &[0x0F, 0xC0]
+                        } else {
+                            &[0x0F, 0xC1]
+                        },
+                    ));
+                    1
+                }
+                lamina_mir::AtomicBinOp::Exchange => {
+                    code.extend_from_slice(&encode_locked_mem_x86_64(
+                        bits,
+                        1,
+                        2,
+                        disp,
+                        true,
+                        if bits == 8 { &[0x86] } else { &[0x87] },
+                    ));
+                    1
+                }
+                lamina_mir::AtomicBinOp::And
+                | lamina_mir::AtomicBinOp::Or
+                | lamina_mir::AtomicBinOp::Xor => {
+                    let alu_opcode = match op {
+                        lamina_mir::AtomicBinOp::And => 0x21,
+                        lamina_mir::AtomicBinOp::Or => 0x09,
+                        _ => 0x31,
+                    };
+                    code.extend_from_slice(&encode_gp_load_membase_x86_64(0, 2, disp, kind)?);
+                    let mut body = alu_rr64_x86_64(0x89, 0, 6);
+                    body.extend_from_slice(&alu_rr64_x86_64(alu_opcode, 1, 6));
+                    body.extend_from_slice(&encode_locked_mem_x86_64(
+                        bits,
+                        6,
+                        2,
+                        disp,
+                        true,
+                        if bits == 8 {
+                            &[0x0F, 0xB0]
+                        } else {
+                            &[0x0F, 0xB1]
+                        },
+                    ));
+                    code.extend_from_slice(&body);
+                    code.extend_from_slice(&[0x75, (-(body.len() as i32 + 2)) as u8]);
+                    0
+                }
+            };
+            code.extend_from_slice(&sign_extend_to_rax_x86_64(old_in, bits));
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            Ok(code)
+        }
+        lamina_mir::Instruction::AtomicCompareExchange {
+            ty,
+            dst,
+            addr,
+            expected,
+            desired,
+            ..
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for AtomicCompareExchange not supported"
+                        .into(),
+                ));
+            };
+            let bits = atomic_width_x86_64(ty)?;
+            let (addr_code, disp) = materialize_atomic_address(stack_slots, addr)?;
+            code.extend_from_slice(&addr_code);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, expected, "rax")?);
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, desired, "rcx")?);
+            code.extend_from_slice(&encode_locked_mem_x86_64(
+                bits,
+                1,
+                2,
+                disp,
+                true,
+                if bits == 8 {
+                    &[0x0F, 0xB0]
+                } else {
+                    &[0x0F, 0xB1]
+                },
+            ));
+            code.extend_from_slice(&sign_extend_to_rax_x86_64(0, bits));
             code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
         }
