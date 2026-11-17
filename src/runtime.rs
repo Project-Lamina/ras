@@ -1830,6 +1830,379 @@ mod jit_host_exec_tests {
         assert_eq!(f(-40), 42);
     }
 
+    fn symbol_address(dst: u32, symbol: &str) -> Instruction {
+        Instruction::SymbolAddress {
+            dst: vreg(dst),
+            symbol: symbol.into(),
+        }
+    }
+
+    fn call_pointer(
+        target: u32,
+        arg_types: &[ScalarType],
+        args: Vec<Operand>,
+        ret: u32,
+        ret_ty: ScalarType,
+    ) -> Instruction {
+        Instruction::CallIndirect {
+            target: reg_op(target),
+            arg_types: arg_types.iter().map(|t| MirType::Scalar(*t)).collect(),
+            args,
+            variadic_fixed: None,
+            ret: Some(vreg(ret)),
+            ret_ty: Some(MirType::Scalar(ret_ty)),
+            ret_aggregate: None,
+            arg_aggregates: vec![None; arg_types.len()],
+        }
+    }
+
+    #[test]
+    fn jit_host_exec_indirect_call_to_module_function() {
+        let inc = function_with_body(
+            "inc",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::IntBinary {
+                    op: IntBinOp::Add,
+                    ty: MirType::Scalar(ScalarType::I64),
+                    dst: vreg(1),
+                    lhs: reg_op(0),
+                    rhs: ii64(1),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let bump = function_with_body(
+            "bump",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                symbol_address(1, "inc"),
+                call_pointer(1, &[ScalarType::I64], vec![reg_op(0)], 2, ScalarType::I64),
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut module = Module::new("indirect_call");
+        module.add_function(inc);
+        module.add_function(bump);
+        let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(i64) -> i64>(&module, "bump")
+        else {
+            return;
+        };
+        assert_eq!(f(41), 42);
+    }
+
+    #[test]
+    fn jit_host_exec_indirect_call_passes_float_and_integer_arguments() {
+        let gap = function_with_body(
+            "gap",
+            &[ScalarType::I64, ScalarType::F64, ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::IntBinary {
+                    op: IntBinOp::Mul,
+                    ty: MirType::Scalar(ScalarType::I64),
+                    dst: vreg(3),
+                    lhs: reg_op(0),
+                    rhs: ii64(1000),
+                },
+                Instruction::IntBinary {
+                    op: IntBinOp::Add,
+                    ty: MirType::Scalar(ScalarType::I64),
+                    dst: vreg(4),
+                    lhs: reg_op(3),
+                    rhs: reg_op(2),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(4)),
+                },
+            ],
+        );
+        let call_gap = function_with_body(
+            "call_gap",
+            &[ScalarType::I64, ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                symbol_address(2, "gap"),
+                Instruction::CallIndirect {
+                    target: reg_op(2),
+                    arg_types: vec![
+                        MirType::Scalar(ScalarType::I64),
+                        MirType::Scalar(ScalarType::F64),
+                        MirType::Scalar(ScalarType::I64),
+                    ],
+                    args: vec![
+                        reg_op(0),
+                        Operand::Immediate(Immediate::F64(2.5)),
+                        reg_op(1),
+                    ],
+                    variadic_fixed: None,
+                    ret: Some(vreg(3)),
+                    ret_ty: Some(MirType::Scalar(ScalarType::I64)),
+                    ret_aggregate: None,
+                    arg_aggregates: vec![None; 3],
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(3)),
+                },
+            ],
+        );
+        let mut module = Module::new("indirect_mixed");
+        module.add_function(gap);
+        module.add_function(call_gap);
+        let Some((_mem, f)) =
+            jit_host_entry_named::<extern "C" fn(i64, i64) -> i64>(&module, "call_gap")
+        else {
+            return;
+        };
+        assert_eq!(f(3, 7), 3007);
+    }
+
+    #[test]
+    fn jit_host_exec_indirect_call_returns_and_takes_f64_and_f32() {
+        let half = function_with_body(
+            "half",
+            &[ScalarType::F64],
+            ScalarType::F64,
+            vec![
+                Instruction::FloatBinary {
+                    op: FloatBinOp::FMul,
+                    ty: MirType::Scalar(ScalarType::F64),
+                    dst: vreg(1),
+                    lhs: reg_op(0),
+                    rhs: Operand::Immediate(Immediate::F64(0.5)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let quarter = function_with_body(
+            "quarter",
+            &[ScalarType::F64],
+            ScalarType::F64,
+            vec![
+                symbol_address(1, "half"),
+                call_pointer(1, &[ScalarType::F64], vec![reg_op(0)], 2, ScalarType::F64),
+                call_pointer(1, &[ScalarType::F64], vec![reg_op(2)], 3, ScalarType::F64),
+                Instruction::Ret {
+                    value: Some(reg_op(3)),
+                },
+            ],
+        );
+        let halve32 = function_with_body(
+            "halve32",
+            &[ScalarType::F32],
+            ScalarType::F32,
+            vec![
+                Instruction::FloatBinary {
+                    op: FloatBinOp::FMul,
+                    ty: MirType::Scalar(ScalarType::F32),
+                    dst: vreg(1),
+                    lhs: reg_op(0),
+                    rhs: Operand::Immediate(Immediate::F32(0.5)),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let outer32 = function_with_body(
+            "outer32",
+            &[ScalarType::F32],
+            ScalarType::F32,
+            vec![
+                symbol_address(1, "halve32"),
+                call_pointer(1, &[ScalarType::F32], vec![reg_op(0)], 2, ScalarType::F32),
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut module = Module::new("indirect_float");
+        module.add_function(half);
+        module.add_function(quarter);
+        module.add_function(halve32);
+        module.add_function(outer32);
+        let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(f64) -> f64>(&module, "quarter")
+        else {
+            return;
+        };
+        assert_eq!(f(10.0), 2.5);
+        let Some((_mem32, g)) =
+            jit_host_entry_named::<extern "C" fn(f32) -> f32>(&module, "outer32")
+        else {
+            return;
+        };
+        assert_eq!(g(10.0), 5.0);
+    }
+
+    #[test]
+    fn jit_host_exec_indirect_call_passes_stack_arguments() {
+        let eight = [ScalarType::I64; 8];
+        let mut sum_body = Vec::new();
+        let mut acc = ii64(0);
+        for i in 0..8u32 {
+            sum_body.push(Instruction::IntBinary {
+                op: IntBinOp::Add,
+                ty: MirType::Scalar(ScalarType::I64),
+                dst: vreg(8 + i),
+                lhs: acc.clone(),
+                rhs: reg_op(i),
+            });
+            acc = reg_op(8 + i);
+        }
+        sum_body.push(Instruction::Ret { value: Some(acc) });
+        let sum8 = function_with_body("sum8", &eight, ScalarType::I64, sum_body);
+        let forward = function_with_body(
+            "forward",
+            &eight,
+            ScalarType::I64,
+            vec![
+                symbol_address(8, "sum8"),
+                call_pointer(8, &eight, (0..8).map(reg_op).collect(), 9, ScalarType::I64),
+                Instruction::Ret {
+                    value: Some(reg_op(9)),
+                },
+            ],
+        );
+        let mut module = Module::new("indirect_stack_calls");
+        module.add_function(sum8);
+        module.add_function(forward);
+        let Some((_mem, f)) = jit_host_entry_named::<
+            extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+        >(&module, "forward") else {
+            return;
+        };
+        assert_eq!(f(1, 2, 3, 4, 5, 6, 7, 8), 36);
+    }
+
+    #[test]
+    fn jit_host_exec_indirect_call_widens_a_narrow_return() {
+        let neg32 = function_with_body(
+            "neg32",
+            &[ScalarType::I32],
+            ScalarType::I32,
+            vec![
+                Instruction::IntBinary {
+                    op: IntBinOp::Sub,
+                    ty: MirType::Scalar(ScalarType::I32),
+                    dst: vreg(1),
+                    lhs: ii32(0),
+                    rhs: reg_op(0),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(1)),
+                },
+            ],
+        );
+        let negate = function_with_body(
+            "negate",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                symbol_address(1, "neg32"),
+                call_pointer(1, &[ScalarType::I32], vec![reg_op(0)], 2, ScalarType::I32),
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let mut module = Module::new("indirect_narrow");
+        module.add_function(neg32);
+        module.add_function(negate);
+        let Some((_mem, f)) = jit_host_entry_named::<extern "C" fn(i64) -> i64>(&module, "negate")
+        else {
+            return;
+        };
+        assert_eq!(f(5), -5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jit_host_exec_indirect_call_to_libc_symbol() {
+        let by_pointer = function_with_body(
+            "llabs_by_pointer",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                symbol_address(1, "llabs"),
+                call_pointer(1, &[ScalarType::I64], vec![reg_op(0)], 2, ScalarType::I64),
+                Instruction::IntBinary {
+                    op: IntBinOp::Add,
+                    ty: MirType::Scalar(ScalarType::I64),
+                    dst: vreg(3),
+                    lhs: reg_op(2),
+                    rhs: ii64(2),
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(3)),
+                },
+            ],
+        );
+        let mut module = Module::new("indirect_libc");
+        module.add_function(by_pointer);
+        let Some((_mem, f)) =
+            jit_host_entry_named::<extern "C" fn(i64) -> i64>(&module, "llabs_by_pointer")
+        else {
+            return;
+        };
+        assert_eq!(f(-40), 42);
+    }
+
+    #[test]
+    fn jit_refuses_indirect_call_with_by_value_aggregate_argument() {
+        let Some((arch, os)) = host_jit_pair() else {
+            return;
+        };
+        let wide = lamina_mir::Aggregate {
+            size: 16,
+            align: 8,
+            class: lamina_mir::AggregateClass::Integer,
+            shape: lamina_mir::AggregateShape::Composite,
+        };
+        let mut call = call_pointer(1, &[ScalarType::I64], vec![reg_op(0)], 2, ScalarType::I64);
+        if let Instruction::CallIndirect { arg_aggregates, .. } = &mut call {
+            arg_aggregates[0] = Some(wide);
+        }
+        let body = function_with_body(
+            "by_pointer_aggregate",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                symbol_address(1, "inc"),
+                call,
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        );
+        let inc = function_with_body(
+            "inc",
+            &[ScalarType::I64],
+            ScalarType::I64,
+            vec![Instruction::Ret {
+                value: Some(reg_op(0)),
+            }],
+        );
+        let mut module = Module::new("indirect_aggregate");
+        module.add_function(inc);
+        module.add_function(body);
+        let err = RasRuntime::new(arch, os)
+            .compile_with_offsets(&module)
+            .err()
+            .expect("the JIT must refuse a by-value aggregate argument to a pointer call");
+        assert!(
+            err.to_string().contains("by-value aggregate argument"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn jit_host_exec_ints_after_leading_float_param() {
         let Some((arch, os)) = host_jit_pair() else {
