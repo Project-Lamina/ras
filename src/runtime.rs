@@ -1422,6 +1422,9 @@ mod jit_host_exec_tests {
         assert_eq!(g(), 42);
     }
 
+    /// Only where the JIT can resolve a host symbol: that is `dlsym`, and the Windows
+    /// encoder has no counterpart yet.
+    #[cfg(unix)]
     #[test]
     fn jit_host_exec_external_symbol_address_is_nonzero() {
         let f = function_with_body(
@@ -1786,6 +1789,9 @@ mod jit_host_exec_tests {
         assert_eq!(f(1, 2, 3, 4, 5, 6, 7, 8), 36);
     }
 
+    /// Only where the JIT can resolve a host symbol: that is `dlsym`, and the Windows
+    /// encoder has no counterpart yet.
+    #[cfg(unix)]
     #[test]
     fn jit_host_exec_call_to_libc_symbol() {
         let i64_ty = MirType::Scalar(ScalarType::I64);
