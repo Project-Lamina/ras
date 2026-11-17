@@ -16,7 +16,7 @@ pub fn compile_mir_x86_64_function(
     module: &lamina_mir::Module,
     function_name: Option<&str>,
 ) -> Result<(Vec<u8>, HashMap<String, usize>), RasError> {
-    use lamina_codegen::x86_64::{X64RegAlloc, X86ABI, X86Frame};
+    use lamina_codegen::x86_64::{X86ABI, X86Frame};
     use lamina_mir::Register;
 
     let abi = X86ABI::new(assembler.target_os);
@@ -84,20 +84,16 @@ pub fn compile_mir_x86_64_function(
             )));
         }
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-            match &inst.instr {
-                lamina_mir::Instruction::TailCall { .. } => {
-                    return Err(RasError::EncodingError(format!(
-                        "x86_64 JIT encoder does not yet support control-flow/calls in '{}': {:?}",
-                        func_name, inst
-                    )));
-                }
-                _ => {}
+            if let lamina_mir::Instruction::TailCall { .. } = &inst.instr {
+                return Err(RasError::EncodingError(format!(
+                    "x86_64 JIT encoder does not yet support control-flow/calls in '{}': {:?}",
+                    func_name, inst
+                )));
             }
         }
 
         function_offsets.insert(func_name.clone(), code.len());
 
-        let mut reg_alloc = X64RegAlloc::new(assembler.target_os);
         let mut stack_slots: std::collections::HashMap<lamina_mir::VirtualReg, i32> =
             std::collections::HashMap::new();
         let mut def_regs: std::collections::HashSet<lamina_mir::VirtualReg> =
@@ -239,10 +235,7 @@ pub fn compile_mir_x86_64_function(
                 let mut local_fixups = Vec::new();
                 let inst_bytes = encode_mir_instruction_x86_64(
                     inst,
-                    &mut reg_alloc,
                     &stack_slots,
-                    aligned_stack_size,
-                    &func_name,
                     &func.sig,
                     &call_env,
                     &mut local_fixups,
@@ -1385,10 +1378,7 @@ fn rex_w_r_b(w: bool, reg: u8, rm: u8) -> u8 {
 #[cfg(feature = "encoder")]
 fn encode_mir_instruction_x86_64(
     inst: &lamina_mir::Instruction,
-    _reg_alloc: &mut lamina_codegen::x86_64::X64RegAlloc,
     stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
-    _stack_size: usize,
-    _func_name: &str,
     func_sig: &lamina_mir::Signature,
     calls: &CallEnv,
     fixups: &mut Vec<(usize, String)>,
