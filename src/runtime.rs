@@ -485,8 +485,8 @@ mod jit_host_exec_tests {
         block::Block,
         function::{Function, Parameter, Signature},
         instruction::{
-            AddressMode, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction, IntBinOp,
-            IntCmpOp, IntOverflowOp, IntUnOp, MemoryAttrs, Operand,
+            AddressMode, AtomicBinOp, FloatBinOp, FloatCmpOp, FloatUnOp, Immediate, Instruction,
+            IntBinOp, IntCmpOp, IntOverflowOp, IntUnOp, MemoryAttrs, Operand,
         },
         module::Module,
         register::{Register, VirtualReg},
@@ -2284,6 +2284,228 @@ mod jit_host_exec_tests {
                 );
             }
         }
+    }
+
+    fn atomic_ty(bits: u32) -> ScalarType {
+        match bits {
+            8 => ScalarType::I8,
+            16 => ScalarType::I16,
+            32 => ScalarType::I32,
+            _ => ScalarType::I64,
+        }
+    }
+
+    fn sign_extend_bits(value: u64, bits: u32) -> i64 {
+        ((value << (64 - bits)) as i64) >> (64 - bits)
+    }
+
+    fn atomic_entry(bits: u32, body: Vec<Instruction>) -> Module {
+        let mut module = Module::new("atomic");
+        module.add_function(function_with_body(
+            "atom",
+            &[ScalarType::I64, ScalarType::I64],
+            ScalarType::I64,
+            body,
+        ));
+        let _ = bits;
+        module
+    }
+
+    fn atomic_rmw_entry(op: AtomicBinOp, bits: u32) -> Module {
+        atomic_entry(
+            bits,
+            vec![
+                Instruction::AtomicBinary {
+                    op,
+                    ty: MirType::Scalar(atomic_ty(bits)),
+                    dst: vreg(2),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        offset: 0,
+                    },
+                    value: reg_op(1),
+                    ordering: lamina_platform::MemoryOrdering::SeqCst,
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(2)),
+                },
+            ],
+        )
+    }
+
+    fn atomic_cmpxchg_entry(bits: u32) -> Module {
+        let mut module = Module::new("atomic_cas");
+        module.add_function(function_with_body(
+            "cas",
+            &[ScalarType::I64, ScalarType::I64, ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::AtomicCompareExchange {
+                    ty: MirType::Scalar(atomic_ty(bits)),
+                    dst: vreg(3),
+                    addr: AddressMode::BaseOffset {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        offset: 0,
+                    },
+                    expected: reg_op(1),
+                    desired: reg_op(2),
+                    success_ordering: lamina_platform::MemoryOrdering::SeqCst,
+                    failure_ordering: lamina_platform::MemoryOrdering::SeqCst,
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(3)),
+                },
+            ],
+        ));
+        module
+    }
+
+    /// Bits above the cell's width, which an atomic access must leave alone.
+    const ATOMIC_GUARD: u64 = 0xDEAD_BEEF_0000_0000;
+
+    #[test]
+    fn jit_host_exec_atomic_rmw_updates_each_width_and_returns_old() {
+        let ops = [
+            AtomicBinOp::Add,
+            AtomicBinOp::Sub,
+            AtomicBinOp::And,
+            AtomicBinOp::Or,
+            AtomicBinOp::Xor,
+            AtomicBinOp::Exchange,
+        ];
+        let olds = [
+            0u64,
+            1,
+            0x7F,
+            0x80,
+            0xFF,
+            0x8000_0000,
+            0x1234_5678_9ABC_DEF0,
+        ];
+        let vals = [1u64, 0xFF, 0x0F0F, 0x8000_0001, u64::MAX];
+        for bits in [8u32, 16, 32, 64] {
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let guard = ATOMIC_GUARD & !mask;
+            for op in ops {
+                let module = atomic_rmw_entry(op, bits);
+                let Some((_mem, f)) =
+                    jit_host_entry_named::<extern "C" fn(i64, i64) -> i64>(&module, "atom")
+                else {
+                    return;
+                };
+                for old in olds {
+                    for v in vals {
+                        let mut cell: u64 = guard | (old & mask);
+                        let ret = f(&mut cell as *mut u64 as i64, v as i64);
+                        let (low, vm) = (old & mask, v & mask);
+                        let new = match op {
+                            AtomicBinOp::Add => low.wrapping_add(vm),
+                            AtomicBinOp::Sub => low.wrapping_sub(vm),
+                            AtomicBinOp::And => low & vm,
+                            AtomicBinOp::Or => low | vm,
+                            AtomicBinOp::Xor => low ^ vm,
+                            AtomicBinOp::Exchange => vm,
+                        } & mask;
+                        let what = format!("{op:?} i{bits} old {old:#x} value {v:#x}");
+                        assert_eq!(cell & mask, new, "memory after {what}");
+                        assert_eq!(cell & !mask, guard, "bits above the cell after {what}");
+                        assert_eq!(ret, sign_extend_bits(low, bits), "old value of {what}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jit_host_exec_atomic_cmpxchg_stores_only_on_a_match() {
+        let olds = [
+            0u64,
+            1,
+            0x7F,
+            0x80,
+            0xFF,
+            0x8000_0000,
+            0x1234_5678_9ABC_DEF0,
+        ];
+        for bits in [8u32, 16, 32, 64] {
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let guard = ATOMIC_GUARD & !mask;
+            let module = atomic_cmpxchg_entry(bits);
+            let Some((_mem, f)) =
+                jit_host_entry_named::<extern "C" fn(i64, i64, i64) -> i64>(&module, "cas")
+            else {
+                return;
+            };
+            for old in olds {
+                for expected in [old, old ^ 1] {
+                    let desired = 0x5A_u64;
+                    let mut cell: u64 = guard | (old & mask);
+                    let ret = f(
+                        &mut cell as *mut u64 as i64,
+                        expected as i64,
+                        desired as i64,
+                    );
+                    let matched = (old & mask) == (expected & mask);
+                    let new = if matched { desired & mask } else { old & mask };
+                    let what = format!("cmpxchg i{bits} old {old:#x} expected {expected:#x}");
+                    assert_eq!(cell & mask, new, "memory after {what}");
+                    assert_eq!(cell & !mask, guard, "bits above the cell after {what}");
+                    assert_eq!(
+                        ret,
+                        sign_extend_bits(old & mask, bits),
+                        "old value of {what}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jit_host_exec_atomic_add_on_an_indexed_element() {
+        let mut module = Module::new("atomic_index");
+        module.add_function(function_with_body(
+            "bump",
+            &[ScalarType::I64, ScalarType::I64, ScalarType::I64],
+            ScalarType::I64,
+            vec![
+                Instruction::AtomicBinary {
+                    op: AtomicBinOp::Add,
+                    ty: MirType::Scalar(ScalarType::I32),
+                    dst: vreg(3),
+                    addr: AddressMode::BaseIndexScale {
+                        address_space: AddressSpace::default(),
+                        base: vreg(0),
+                        index: vreg(1),
+                        scale: 4,
+                        offset: 0,
+                    },
+                    value: reg_op(2),
+                    ordering: lamina_platform::MemoryOrdering::SeqCst,
+                },
+                Instruction::Ret {
+                    value: Some(reg_op(3)),
+                },
+            ],
+        ));
+        let Some((_mem, f)) =
+            jit_host_entry_named::<extern "C" fn(i64, i64, i64) -> i64>(&module, "bump")
+        else {
+            return;
+        };
+        let mut cells = [10i32, 20, 30, 40];
+        let ret = f(cells.as_mut_ptr() as i64, 2, -7);
+        assert_eq!(ret, 30);
+        assert_eq!(cells, [10, 20, 23, 40]);
     }
 
     #[test]
