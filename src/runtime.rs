@@ -2471,6 +2471,77 @@ mod jit_host_exec_tests {
     }
 
     #[test]
+    fn jit_host_exec_atomic_store_then_load_round_trips_each_width() {
+        let samples = [
+            0u64,
+            1,
+            0x7F,
+            0x80,
+            0xFF,
+            0x8000_0000,
+            0x1234_5678_9ABC_DEF0,
+        ];
+        for bits in [8u32, 16, 32, 64] {
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let guard = ATOMIC_GUARD & !mask;
+            let mut module = Module::new("atomic_store_load");
+            module.add_function(function_with_body(
+                "round",
+                &[ScalarType::I64, ScalarType::I64],
+                ScalarType::I64,
+                vec![
+                    Instruction::AtomicStore {
+                        ty: MirType::Scalar(atomic_ty(bits)),
+                        src: reg_op(1),
+                        addr: AddressMode::BaseOffset {
+                            address_space: AddressSpace::default(),
+                            base: vreg(0),
+                            offset: 0,
+                        },
+                        ordering: lamina_platform::MemoryOrdering::Release,
+                    },
+                    Instruction::Fence {
+                        ordering: lamina_platform::MemoryOrdering::SeqCst,
+                    },
+                    Instruction::AtomicLoad {
+                        ty: MirType::Scalar(atomic_ty(bits)),
+                        dst: vreg(2),
+                        addr: AddressMode::BaseOffset {
+                            address_space: AddressSpace::default(),
+                            base: vreg(0),
+                            offset: 0,
+                        },
+                        ordering: lamina_platform::MemoryOrdering::Acquire,
+                    },
+                    Instruction::Ret {
+                        value: Some(reg_op(2)),
+                    },
+                ],
+            ));
+            let Some((_mem, f)) =
+                jit_host_entry_named::<extern "C" fn(i64, i64) -> i64>(&module, "round")
+            else {
+                return;
+            };
+            for v in samples {
+                let mut cell: u64 = guard;
+                let ret = f(&mut cell as *mut u64 as i64, v as i64);
+                assert_eq!(cell & mask, v & mask, "stored i{bits} of {v:#x}");
+                assert_eq!(cell & !mask, guard, "bits above the i{bits} cell");
+                assert_eq!(
+                    ret,
+                    sign_extend_bits(v & mask, bits),
+                    "loaded i{bits} of {v:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn jit_host_exec_atomic_add_on_an_indexed_element() {
         let mut module = Module::new("atomic_index");
         module.add_function(function_with_body(
