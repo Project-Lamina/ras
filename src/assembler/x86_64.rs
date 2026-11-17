@@ -560,6 +560,41 @@ fn narrow_int_return(scalar: ScalarType) -> Option<(u32, bool)> {
     }
 }
 
+/// Population count of the low `bits` bits of rax, left in rax. Bit-twiddling, so it
+/// needs nothing beyond the base x86_64 ISA. Clobbers rcx and rdx.
+#[cfg(feature = "encoder")]
+fn encode_popcount_rax_x86_64(bits: u32) -> Vec<u8> {
+    let mut code = Vec::new();
+    match bits {
+        1 => code.extend_from_slice(&[0x83, modrm(0b11, 4, 0), 0x01]),
+        8 | 16 | 32 => code.extend_from_slice(&extend_low_bits_x86_64(0, 0, bits, false)),
+        _ => {}
+    }
+    let alu =
+        |opcode: u8, reg: u8, rm: u8| vec![rex_w_r_b(true, reg, rm), opcode, modrm(0b11, reg, rm)];
+    let shr = |reg: u8, count: u8| vec![rex_w_r_b(true, 0, reg), 0xC1, modrm(0b11, 5, reg), count];
+    code.extend(alu(0x89, 0, 1));
+    code.extend(shr(1, 1));
+    code.extend(mov_imm64_reg_x86_64(2, 0x5555_5555_5555_5555));
+    code.extend(alu(0x21, 2, 1));
+    code.extend(alu(0x29, 1, 0));
+    code.extend(mov_imm64_reg_x86_64(2, 0x3333_3333_3333_3333));
+    code.extend(alu(0x89, 0, 1));
+    code.extend(shr(1, 2));
+    code.extend(alu(0x21, 2, 1));
+    code.extend(alu(0x21, 2, 0));
+    code.extend(alu(0x01, 1, 0));
+    code.extend(alu(0x89, 0, 1));
+    code.extend(shr(1, 4));
+    code.extend(alu(0x01, 1, 0));
+    code.extend(mov_imm64_reg_x86_64(2, 0x0F0F_0F0F_0F0F_0F0F));
+    code.extend(alu(0x21, 2, 0));
+    code.extend(mov_imm64_reg_x86_64(2, 0x0101_0101_0101_0101));
+    code.extend_from_slice(&[rex_w_r_b(true, 0, 2), 0x0F, 0xAF, modrm(0b11, 0, 2)]);
+    code.extend(shr(0, 56));
+    code
+}
+
 /// Address of a symbol in the running process, when the process has one.
 #[cfg(unix)]
 fn resolve_host_symbol(name: &str) -> Option<usize> {
@@ -1999,6 +2034,34 @@ fn encode_mir_instruction_x86_64(
                 }
                 code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             }
+            Ok(code)
+        }
+        lamina_mir::Instruction::IntUnary {
+            op: lamina_mir::IntUnOp::Popcount,
+            ty,
+            dst,
+            src,
+        } => {
+            let Register::Virtual(dst_v) = dst else {
+                return Err(RasError::EncodingError(
+                    "x86_64 JIT encoder: physical dst for IntUnary not supported".into(),
+                ));
+            };
+            let bits = match ty {
+                MirType::Scalar(ScalarType::I1) => 1,
+                MirType::Scalar(ScalarType::I8) => 8,
+                MirType::Scalar(ScalarType::I16) => 16,
+                MirType::Scalar(ScalarType::I32) => 32,
+                MirType::Scalar(ScalarType::I64 | ScalarType::Ptr) => 64,
+                _ => {
+                    return Err(RasError::EncodingError(
+                        "x86_64 JIT encoder: popcount of a non-integer type".into(),
+                    ));
+                }
+            };
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, src, "rax")?);
+            code.extend_from_slice(&encode_popcount_rax_x86_64(bits));
+            code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             Ok(code)
         }
         lamina_mir::Instruction::Jmp { target } => {
