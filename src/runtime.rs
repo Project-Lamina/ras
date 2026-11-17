@@ -205,6 +205,7 @@ impl ExecutableMemory {
 
     /// Writes `bytes` at `offset`, for load-time values of a JIT image. Call before
     /// `make_executable`, while the mapping is still writable.
+    #[cfg(feature = "encoder")]
     pub(crate) fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<(), RasError> {
         if offset
             .checked_add(bytes.len())
@@ -222,6 +223,7 @@ impl ExecutableMemory {
 
     /// Makes the pages from `offset` to the end readable and writable, not executable.
     /// `offset` must be a page boundary.
+    #[cfg(feature = "encoder")]
     pub(crate) fn make_writable_from(&mut self, offset: usize) -> Result<(), RasError> {
         if offset >= self.size {
             return Ok(());
