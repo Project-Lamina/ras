@@ -157,14 +157,10 @@ pub fn compile_mir_x86_64_function(
         let mut outgoing_stack_args = 0usize;
         let mut makes_call = false;
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-            let lamina_mir::Instruction::Call { name, args, .. } = &inst.instr else {
+            let Some(floats) = call_arg_floats(&inst.instr)? else {
                 continue;
             };
-            if is_lamina_io_intrinsic(name, args) {
-                continue;
-            }
             makes_call = true;
-            let floats: Vec<bool> = args.iter().map(operand_is_float).collect();
             let stack_args = assign_arg_sources(&floats, abi.arg_registers(), windows, 0)
                 .iter()
                 .filter(|source| matches!(source, ArgSource::Stack(_)))
@@ -486,6 +482,81 @@ fn operand_is_float(op: &lamina_mir::Operand) -> bool {
         Operand::Immediate(Immediate::F32(_) | Immediate::F64(_)) => true,
         Operand::Register(Register::Virtual(v)) => v.class == RegisterClass::Fpr,
         _ => false,
+    }
+}
+
+/// Which arguments of a call travel in XMM registers, for a call the JIT lowers with the
+/// C ABI. `None` for anything that is not such a call.
+fn call_arg_floats(inst: &lamina_mir::Instruction) -> Result<Option<Vec<bool>>, RasError> {
+    use lamina_mir::Instruction;
+    match inst {
+        Instruction::Call { name, args, .. } if !is_lamina_io_intrinsic(name, args) => {
+            Ok(Some(args.iter().map(operand_is_float).collect()))
+        }
+        Instruction::CallIndirect {
+            arg_types,
+            args,
+            ret_ty,
+            arg_aggregates,
+            ret_aggregate,
+            ..
+        } => indirect_call_floats(
+            arg_types,
+            args,
+            ret_ty.as_ref(),
+            arg_aggregates,
+            ret_aggregate.as_ref(),
+        )
+        .map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// The XMM placement of each argument of a call through a pointer, read from the types
+/// the instruction carries. Refuses the shapes the C ABI cannot carry in registers.
+fn indirect_call_floats(
+    arg_types: &[MirType],
+    args: &[lamina_mir::Operand],
+    ret_ty: Option<&MirType>,
+    arg_aggregates: &[Option<lamina_mir::Aggregate>],
+    ret_aggregate: Option<&lamina_mir::Aggregate>,
+) -> Result<Vec<bool>, RasError> {
+    if ret_aggregate.is_some() {
+        return indirect_call_refusal("a by-value aggregate return");
+    }
+    if arg_aggregates.iter().any(Option::is_some) {
+        return indirect_call_refusal("a by-value aggregate argument");
+    }
+    if arg_types.len() != args.len() {
+        return indirect_call_refusal("an argument list that does not match its types");
+    }
+    if ret_ty.is_some_and(|ty| !matches!(ty, MirType::Scalar(_))) {
+        return indirect_call_refusal("a non-scalar return");
+    }
+    arg_types
+        .iter()
+        .map(|ty| match ty {
+            MirType::Scalar(scalar) => Ok(matches!(scalar, ScalarType::F32 | ScalarType::F64)),
+            MirType::Vector(_) => indirect_call_refusal("a non-scalar argument"),
+        })
+        .collect()
+}
+
+fn indirect_call_refusal<T>(what: &str) -> Result<T, RasError> {
+    Err(RasError::EncodingError(format!(
+        "x86_64 JIT refuses a call through a pointer with {what}: lamina passes it by pointer, not by the C ABI"
+    )))
+}
+
+/// The width and signedness a C callee's narrow integer return must be widened by:
+/// the callee may leave the bits above the value undefined.
+fn narrow_int_return(scalar: ScalarType) -> Option<(u32, bool)> {
+    match scalar {
+        ScalarType::I1 => Some((8, false)),
+        ScalarType::I8 => Some((8, true)),
+        ScalarType::I16 => Some((16, true)),
+        ScalarType::I32 => Some((32, true)),
+        _ => None,
     }
 }
 
@@ -1452,6 +1523,42 @@ fn encode_mir_instruction_x86_64(
         }
     }
 
+    fn encode_call_args(
+        code: &mut Vec<u8>,
+        args: &[Operand],
+        floats: &[bool],
+        stack_slots: &std::collections::HashMap<lamina_mir::VirtualReg, i32>,
+        calls: &CallEnv,
+    ) -> Result<u32, RasError> {
+        let sources = assign_arg_sources(
+            floats,
+            calls.gp_arg_regs,
+            calls.windows,
+            calls.shadow_bytes(),
+        );
+        for (arg, source) in args.iter().zip(&sources) {
+            if let ArgSource::Stack(off) = source {
+                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, "rax")?);
+                code.extend_from_slice(&encode_mov_membase_reg_x86_64(0, 4, *off)?);
+            }
+        }
+        for (arg, source) in args.iter().zip(&sources) {
+            if let ArgSource::Xmm(xmm) = source {
+                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, "rax")?);
+                code.extend_from_slice(&encode_gp_to_xmm_x86_64(*xmm, 0, true));
+            }
+        }
+        for (arg, source) in args.iter().zip(&sources) {
+            if let ArgSource::Gp(reg) = source {
+                code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, reg)?);
+            }
+        }
+        Ok(sources
+            .iter()
+            .filter(|source| matches!(source, ArgSource::Xmm(_)))
+            .count() as u32)
+    }
+
     let mut code = Vec::with_capacity(64);
 
     match inst {
@@ -1818,35 +1925,9 @@ fn encode_mir_instruction_x86_64(
         }
         lamina_mir::Instruction::Call { name, args, ret } => {
             let floats: Vec<bool> = args.iter().map(operand_is_float).collect();
-            let sources = assign_arg_sources(
-                &floats,
-                calls.gp_arg_regs,
-                calls.windows,
-                calls.shadow_bytes(),
-            );
-            for (arg, source) in args.iter().zip(&sources) {
-                if let ArgSource::Stack(off) = source {
-                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, "rax")?);
-                    code.extend_from_slice(&encode_mov_membase_reg_x86_64(0, 4, *off)?);
-                }
-            }
-            for (arg, source) in args.iter().zip(&sources) {
-                if let ArgSource::Xmm(xmm) = source {
-                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, "rax")?);
-                    code.extend_from_slice(&encode_gp_to_xmm_x86_64(*xmm, 0, true));
-                }
-            }
-            for (arg, source) in args.iter().zip(&sources) {
-                if let ArgSource::Gp(reg) = source {
-                    code.extend_from_slice(&materialize_operand_to_reg(stack_slots, arg, reg)?);
-                }
-            }
-            let vector_args = sources
-                .iter()
-                .filter(|source| matches!(source, ArgSource::Xmm(_)))
-                .count();
+            let vector_args = encode_call_args(&mut code, args, &floats, stack_slots, calls)?;
             code.push(0xB8);
-            code.extend_from_slice(&(vector_args as u32).to_le_bytes());
+            code.extend_from_slice(&vector_args.to_le_bytes());
             if let Some(callee) = calls.internal_name(name) {
                 if calls.aggregate_callees.contains(&callee) {
                     return Err(RasError::EncodingError(format!(
@@ -1876,6 +1957,45 @@ fn encode_mir_instruction_x86_64(
             if let Some(Register::Virtual(dst_v)) = ret {
                 if dst_v.class == lamina_mir::RegisterClass::Fpr {
                     code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, true));
+                }
+                code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
+            }
+            Ok(code)
+        }
+        lamina_mir::Instruction::CallIndirect {
+            target,
+            arg_types,
+            args,
+            ret,
+            ret_ty,
+            ret_aggregate,
+            arg_aggregates,
+            ..
+        } => {
+            let floats = indirect_call_floats(
+                arg_types,
+                args,
+                ret_ty.as_ref(),
+                arg_aggregates,
+                ret_aggregate.as_ref(),
+            )?;
+            let vector_args = encode_call_args(&mut code, args, &floats, stack_slots, calls)?;
+            code.push(0xB8);
+            code.extend_from_slice(&vector_args.to_le_bytes());
+            code.extend_from_slice(&materialize_operand_to_reg(stack_slots, target, "r11")?);
+            // call r11: REX.B FF /2
+            code.extend_from_slice(&[0x41, 0xFF, 0xD3]);
+            if let Some(Register::Virtual(dst_v)) = ret {
+                match ret_ty {
+                    Some(MirType::Scalar(ScalarType::F32 | ScalarType::F64)) => {
+                        code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, true));
+                    }
+                    Some(MirType::Scalar(scalar)) => {
+                        if let Some((bits, signed)) = narrow_int_return(*scalar) {
+                            code.extend_from_slice(&extend_low_bits_x86_64(0, 0, bits, signed));
+                        }
+                    }
+                    _ => {}
                 }
                 code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             }
