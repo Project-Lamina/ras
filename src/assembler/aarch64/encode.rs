@@ -667,10 +667,10 @@ pub(super) fn reject_unmodelled_abi(func: &lamina_mir::Function) -> Result<(), R
         )))
     };
     if func.sig.params.iter().any(|p| p.aggregate.is_some()) {
-        return refuse("an aggregate parameter");
+        return refuse("a by-value aggregate parameter");
     }
     if func.sig.ret_aggregate.is_some() || func.sig.sret_claimed {
-        return refuse("an aggregate return");
+        return refuse("a by-value aggregate return");
     }
     if !func.variadic_wide_arguments.is_empty() || !func.variadic_wide_results.is_empty() {
         return refuse("a wide variadic value");
@@ -720,6 +720,11 @@ pub(super) fn encode_extern_call(
             "AArch64 JIT: extern call to @{name}: {what}"
         )))
     };
+    if crate::assembler::is_wide_integer_helper(name) {
+        return Err(RasError::EncodingError(format!(
+            "AArch64 JIT refuses the wide integer helper '{name}': lamina passes i128 values to it by pointer, but the host runtime's routine takes them by value"
+        )));
+    }
     // A C symbol the module never declares is called from the operands alone: every
     // lamina call to one passes scalars, and the float file is the only split the call
     // has to get right.
