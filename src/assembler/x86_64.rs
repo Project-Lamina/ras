@@ -2070,7 +2070,12 @@ fn encode_mir_instruction_x86_64(
             }
             Ok(code)
         }
-        lamina_mir::Instruction::Call { name, args, ret, .. } => {
+        lamina_mir::Instruction::Call {
+            name,
+            args,
+            ret,
+            ret_ty,
+        } => {
             let floats: Vec<bool> = args.iter().map(operand_is_float).collect();
             let vector_args = encode_call_args(&mut code, args, &floats, stack_slots, calls)?;
             code.push(0xB8);
@@ -2104,6 +2109,10 @@ fn encode_mir_instruction_x86_64(
             if let Some(Register::Virtual(dst_v)) = ret {
                 if dst_v.class == lamina_mir::RegisterClass::Fpr {
                     code.extend_from_slice(&encode_xmm_to_gp_x86_64(0, 0, true));
+                } else if let Some(MirType::Scalar(scalar)) = ret_ty
+                    && let Some((bits, signed)) = narrow_int_return(*scalar)
+                {
+                    code.extend_from_slice(&extend_low_bits_x86_64(0, 0, bits, signed));
                 }
                 code.extend_from_slice(&store_reg_to_vreg(stack_slots, dst_v, "rax")?);
             }

@@ -1837,6 +1837,39 @@ mod jit_host_exec_tests {
         assert_eq!(f(-40), 42);
     }
 
+    /// `memcmp` returns an `int` whose upper half of rax is left undefined. The byte
+    /// 0x00 sorts before 0xFF, so the result is negative and must stay negative as i64.
+    #[cfg(unix)]
+    #[test]
+    fn jit_host_exec_widens_narrow_external_return() {
+        let module = module_blocks(
+            "memcmp_call",
+            &[ScalarType::I64, ScalarType::I64],
+            vec![(
+                "entry",
+                vec![
+                    Instruction::Call {
+                        name: "memcmp".into(),
+                        args: vec![reg_op(0), reg_op(1), ii64(1)],
+                        ret: Some(vreg(2)),
+                        ret_ty: Some(MirType::Scalar(ScalarType::I32)),
+                    },
+                    Instruction::Ret {
+                        value: Some(reg_op(2)),
+                    },
+                ],
+            )],
+        );
+        let Some((_mem, f)) = jit_host_entry::<extern "C" fn(i64, i64) -> i64>(&module) else {
+            return;
+        };
+        let zero = [0u8];
+        let high = [0xFFu8];
+        let result = f(zero.as_ptr() as i64, high.as_ptr() as i64);
+        assert!(result < 0, "memcmp result {result} is not negative");
+        assert_eq!(result, i64::from(result as i32));
+    }
+
     fn symbol_address(dst: u32, symbol: &str) -> Instruction {
         Instruction::SymbolAddress {
             dst: vreg(dst),
